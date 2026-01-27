@@ -1,0 +1,48 @@
+{
+  "name": "@salesbinder/cli",
+  "version": "0.1.0",
+  "description": "SalesBinder CLI tool - Command line interface for SalesBinder API",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "salesbinder": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix"
+  },
+  "dependencies": {
+    "@salesbinder/sdk": "workspace:*",
+    "commander": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.11",
+    "@types/node": "^20.10.6",
+    "ts-jest": "^29.1.1",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "salesbinder",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT"
+}
