@@ -30,14 +30,22 @@ Use --full to force complete resync.`)
       let cache: import('@salesbinder/sdk').SQLiteCacheService | null = null;
 
       try {
-        const { SalesBinderClient, DocumentIndexerService, SQLiteCacheService } = await import(
+        const { SalesBinderClient, DocumentIndexerService, SQLiteCacheService, loadPreferences } = await import(
           '@salesbinder/sdk'
         );
 
         const accountName = program.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
         cache = new SQLiteCacheService(accountName);
-        const indexer = new DocumentIndexerService(client, cache, accountName);
+
+        // Load stale threshold from config
+        const prefs = loadPreferences();
+        const indexer = new DocumentIndexerService(
+          client,
+          cache,
+          accountName,
+          prefs?.cacheStaleSeconds
+        );
 
         console.error('Starting cache sync...');
 
@@ -155,7 +163,7 @@ Displays:
       let cache: import('@salesbinder/sdk').SQLiteCacheService | null = null;
 
       try {
-        const { SQLiteCacheService, DocumentIndexerService, SalesBinderClient } = await import(
+        const { SQLiteCacheService, DocumentIndexerService, SalesBinderClient, loadPreferences } = await import(
           '@salesbinder/sdk'
         );
 
@@ -183,7 +191,15 @@ Displays:
 
         cache = new SQLiteCacheService(accountName);
         const client = new SalesBinderClient(accountName);
-        const indexer = new DocumentIndexerService(client, cache, accountName);
+
+        // Load stale threshold from config
+        const prefs = loadPreferences();
+        const indexer = new DocumentIndexerService(
+          client,
+          cache,
+          accountName,
+          prefs?.cacheStaleSeconds
+        );
 
         const state = cache.getCacheState();
         const stale = indexer.isCacheStale();
@@ -203,7 +219,8 @@ Displays:
                 line_item_count: state.itemDocumentCount,
                 schema_version: state.schemaVersion,
                 is_stale: stale,
-                freshness: stale ? 'STALE (>1 hour old)' : 'FRESH',
+                freshness: stale ? 'STALE' : 'FRESH',
+                stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
               }
             : {
                 message: 'Cache exists but no metadata found. May need full sync.',

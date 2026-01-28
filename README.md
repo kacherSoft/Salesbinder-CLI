@@ -62,6 +62,34 @@ salesbinder items list
 
 ## Configuration
 
+### Cache Stale Threshold
+
+Configure when the cache is considered stale (default: 3600 seconds = 1 hour).
+
+**Via config file** (`~/.salesbinder/config.json`):
+```json
+{
+  "defaultAccount": "default",
+  "accounts": {
+    "default": {
+      "subdomain": "acme",
+      "apiKey": "your-key",
+      "apiVersion": "2.0"
+    }
+  },
+  "preferences": {
+    "cacheStaleSeconds": 7200
+  }
+}
+```
+
+**Via environment variable** (overrides config):
+```bash
+export SALESBINDER_CACHE_STALE_SECONDS=7200  # 2 hours
+```
+
+**Priority**: Environment variable > Config file > Default (3600s)
+
 ### Getting Your API Key
 
 1. Login to your SalesBinder account
@@ -262,6 +290,43 @@ node packages/cli/dist/cli.js cache clear
 - Delta sync: <1 minute (changes only)
 - Cached queries: <100ms
 - Cache location: `~/.salesbinder/cache/salesbinder-<account>.db`
+
+## Recommended Workflow
+
+For daily operations involving item sales analytics:
+
+1. **Initial Setup** (one-time):
+   ```bash
+   # Full sync to build cache
+   node packages/cli/dist/cli.js cache sync
+   ```
+
+2. **Daily Analytics** (fast, uses cached data):
+   ```bash
+   # Quick query from cache (auto-syncs if stale >1 hour)
+   node packages/cli/dist/cli.js analytics item-sales <item-id>
+   ```
+
+3. **Weekly Maintenance**:
+   ```bash
+   # Check cache status
+   node packages/cli/dist/cli.js cache status
+
+   # Manual refresh if needed
+   node packages/cli/dist/cli.js cache sync
+   ```
+
+4. **Adjust Stale Threshold** (optional):
+   - Set to 7200 (2 hours) for less frequent syncs
+   - Set to 1800 (30 minutes) for fresher data
+   - Use `SALESBINDER_CACHE_STALE_SECONDS` environment variable for per-session override
+
+**Why this workflow?**
+- Cache sync is the bottleneck (~5-10 minutes for full sync)
+- Cached queries are instant (<100ms)
+- Auto-sync only triggers when cache is stale
+- `--cached` flag skips sync check for fastest queries
+- `--refresh` flag forces fresh data when needed
 
 ## Output Format
 

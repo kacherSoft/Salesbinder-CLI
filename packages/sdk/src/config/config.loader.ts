@@ -87,3 +87,20 @@ export function listAccounts(): string[] {
     return [];
   }
 }
+
+/**
+ * Load preferences from config file
+ */
+export function loadPreferences(): SalesBinderConfig['preferences'] {
+  if (!fs.existsSync(CONFIG_PATH)) {
+    return undefined;
+  }
+
+  try {
+    const content = fs.readFileSync(CONFIG_PATH, 'utf-8');
+    const config = JSON.parse(content) as SalesBinderConfig;
+    return config.preferences;
+  } catch {
+    return undefined;
+  }
+}

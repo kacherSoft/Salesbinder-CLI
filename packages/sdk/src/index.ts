@@ -13,5 +13,8 @@ export * from './types/locations.types.js';
 export * from './types/categories.types.js';
 export * from './config/config.schema.js';
 
+// Export config loader
+export { loadConfig, loadPreferences, listAccounts } from './config/config.loader.js';
+
 // Export cache types and services
 export * from './cache/index.js';

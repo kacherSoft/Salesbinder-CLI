@@ -12,11 +12,20 @@ import type { Document, DocumentListResponse } from '../types/documents.types.js
  * Document indexer service for syncing API data to SQLite cache
  */
 export class DocumentIndexerService {
+  private readonly staleThreshold: number;
+
   constructor(
     private client: SalesBinderClient,
     private cache: SQLiteCacheService,
-    private readonly accountName: string
-  ) {}
+    private readonly accountName: string,
+    staleThresholdSeconds?: number
+  ) {
+    // Priority: env var > config parameter > default (3600s = 1 hour)
+    const envValue = process.env.SALESBINDER_CACHE_STALE_SECONDS;
+    this.staleThreshold = envValue
+      ? parseInt(envValue, 10)
+      : (staleThresholdSeconds ?? 3600);
+  }
 
   /**
    * Perform sync (full or delta based on options and cache state)
@@ -33,13 +42,13 @@ export class DocumentIndexerService {
   }
 
   /**
-   * Check if cache is stale (older than 1 hour)
+   * Check if cache is stale (older than configured threshold)
    */
   isCacheStale(): boolean {
     const state = this.cache.getCacheState();
     if (!state) return true;
-    const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
-    return state.lastSync < oneHourAgo;
+    const staleTime = Math.floor(Date.now() / 1000) - this.staleThreshold;
+    return state.lastSync < staleTime;
   }
 
   /**

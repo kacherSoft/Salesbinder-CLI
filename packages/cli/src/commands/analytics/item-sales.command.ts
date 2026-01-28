@@ -43,12 +43,21 @@ Output includes:
           SQLiteCacheService,
           DocumentIndexerService,
           DocumentContextId,
+          loadPreferences,
         } = await import('@salesbinder/sdk');
 
         const accountName = program.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
         const cache = new SQLiteCacheService(accountName);
-        const indexer = new DocumentIndexerService(client, cache, accountName);
+
+        // Load stale threshold from config
+        const prefs = loadPreferences();
+        const indexer = new DocumentIndexerService(
+          client,
+          cache,
+          accountName,
+          prefs?.cacheStaleSeconds
+        );
 
         // Parse months option
         const periods = options.months

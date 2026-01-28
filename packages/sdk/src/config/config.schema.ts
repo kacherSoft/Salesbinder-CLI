@@ -20,6 +20,8 @@ export interface Preferences {
   defaultLimit?: number;
   /** Request timeout in milliseconds */
   timeout?: number;
+  /** Cache stale threshold in seconds (default: 3600 = 1 hour) */
+  cacheStaleSeconds?: number;
 }
 
 /** Complete configuration file structure */
