@@ -23,6 +23,10 @@ export class DocumentsResource {
    */
   async list(params?: DocumentListParams): Promise<DocumentListResponse> {
     const response = await this.client.get<DocumentListResponse>('/documents.json', { params });
+    // Handle error responses that don't have the expected structure
+    if (!response.data) {
+      throw new Error(`Invalid API response: ${JSON.stringify(response)}`);
+    }
     return response.data;
   }
 
@@ -31,6 +35,10 @@ export class DocumentsResource {
    */
   async get(id: string): Promise<Document> {
     const response = await this.client.get<{ document: Document }>(`/documents/${id}.json`);
+    // Handle error responses that don't have the expected structure
+    if (!response.data?.document) {
+      throw new Error(`Invalid API response for document ${id}: ${JSON.stringify(response.data)}`);
+    }
     return response.data.document;
   }
 

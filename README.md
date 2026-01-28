@@ -5,6 +5,8 @@ Command-line interface for [SalesBinder API](https://www.salesbinder.com/api/) -
 ## Features
 
 - Full CRUD operations for Items, Customers, Documents, Locations, Categories
+- **Sales Analytics** with local SQLite caching for fast queries
+- **Cache Management** with incremental sync and auto-refresh
 - Secure credential storage (0600 permissions)
 - Multiple account support
 - Pagination and search filters
@@ -192,6 +194,75 @@ echo '{"name":"Hand Tools"}' | node packages/cli/dist/cli.js categories update <
 node packages/cli/dist/cli.js categories delete <category-id>
 ```
 
+### Analytics
+
+Generate sales analytics for items using a local SQLite cache for fast queries.
+
+```bash
+# Get item sales analytics (syncs cache if stale)
+node packages/cli/dist/cli.js analytics item-sales <item-id>
+
+# Specify periods to analyze
+node packages/cli/dist/cli.js analytics item-sales <item-id> --months 3,6,12
+
+# Force cache refresh before query
+node packages/cli/dist/cli.js analytics item-sales <item-id> --refresh
+
+# Use cached data only (skip sync check)
+node packages/cli/dist/cli.js analytics item-sales <item-id> --cached
+```
+
+**Output includes:**
+- Current stock quantity (real-time from API)
+- Latest Order Confirmation (Estimate) date
+- Latest Purchase Order date
+- Sold quantities and revenue for 3/6/12 month periods
+- Cache freshness information
+
+**Example output:**
+```json
+{
+  "item_id": "abc123",
+  "item_name": "Product Name",
+  "current_stock": 150,
+  "latest_oc_date": "2026-01-15",
+  "latest_po_date": "2026-01-20",
+  "sales_periods": {
+    "3_months": { "sold": 45, "revenue": 1350.00 },
+    "6_months": { "sold": 120, "revenue": 3600.00 },
+    "12_months": { "sold": 280, "revenue": 8400.00 }
+  },
+  "cache_freshness": {
+    "last_sync": "2026-01-28T20:00:00Z",
+    "stale": false
+  }
+}
+```
+
+### Cache Management
+
+Manage the local SQLite cache for analytics data.
+
+```bash
+# Sync cache (incremental by default)
+node packages/cli/dist/cli.js cache sync
+
+# Force full resync (re-download all documents)
+node packages/cli/dist/cli.js cache sync --full
+
+# Check cache status
+node packages/cli/dist/cli.js cache status
+
+# Delete cache file
+node packages/cli/dist/cli.js cache clear
+```
+
+**Performance:**
+- First sync: 5-10 minutes (~33K documents)
+- Delta sync: <1 minute (changes only)
+- Cached queries: <100ms
+- Cache location: `~/.salesbinder/cache/salesbinder-<account>.db`
+
 ## Output Format
 
 All commands return JSON:
@@ -235,6 +306,9 @@ When using this CLI via AI agents (Claude, ChatGPT, etc.), the CLI provides comp
 | `salesbinder items get <id>` | Get item details |
 | `salesbinder customers list` | Browse customers |
 | `salesbinder documents list` | Browse invoices/estimates |
+| `salesbinder analytics item-sales <id>` | Get item sales analytics |
+| `salesbinder cache sync` | Sync document cache |
+| `salesbinder cache status` | Check cache status |
 | `salesbinder --help` | Show all commands |
 | `salesbinder <command> --help` | Command-specific help |
 
@@ -255,6 +329,15 @@ salesbinder items get <id> | jq '.item_variations[].item_variations_locations'
 **Find customer invoices:**
 ```bash
 salesbinder documents list --context 5 --customer <customer-id>
+```
+
+**Get item sales analytics:**
+```bash
+# Quick analytics from cache
+salesbinder analytics item-sales <item-id> --cached
+
+# Force fresh data
+salesbinder analytics item-sales <item-id> --refresh
 ```
 
 ### Context ID Reference
@@ -294,6 +377,7 @@ salesbinder-cli/
 ├── packages/
 │   ├── sdk/          # API client library
 │   │   ├── src/
+│   │   │   ├── cache/        # SQLite cache service and indexer
 │   │   │   ├── client/       # HTTP client, auth, retry
 │   │   │   ├── config/       # Config loader
 │   │   │   ├── resources/    # API resources (items, customers, etc.)
@@ -302,6 +386,9 @@ salesbinder-cli/
 │   └── cli/          # Command-line interface
 │       ├── src/
 │       │   ├── commands/     # Command implementations
+│       │   │   ├── analytics/  # Sales analytics commands
+│       │   │   ├── cache/      # Cache management commands
+│       │   │   └── ...         # Other resource commands
 │       │   ├── output/       # JSON formatters
 │       │   └── utils/        # Input validation
 │       └── dist/
@@ -337,6 +424,23 @@ chmod 0600 ~/.salesbinder/config.json
 ### Rate limit errors
 
 The CLI handles rate limiting automatically with exponential backoff. Wait and retry.
+
+### Cache sync issues
+
+If cache sync fails or data seems stale:
+
+```bash
+# Check cache status
+node packages/cli/dist/cli.js cache status
+
+# Clear and rebuild cache
+node packages/cli/dist/cli.js cache clear
+node packages/cli/dist/cli.js cache sync --full
+```
+
+### Cache file location
+
+Cache files are stored at `~/.salesbinder/cache/salesbinder-<account>.db`
 
 ## API Reference
 

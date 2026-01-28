@@ -12,3 +12,6 @@ export * from './types/documents.types.js';
 export * from './types/locations.types.js';
 export * from './types/categories.types.js';
 export * from './config/config.schema.js';
+
+// Export cache types and services
+export * from './cache/index.js';
