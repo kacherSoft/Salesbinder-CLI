@@ -13,9 +13,7 @@ interface AnalyticsOptions {
 /**
  * Register item-sales analytics command
  */
-export function registerItemSalesCommand(program: Command): void {
-  const analytics = program.command('analytics').description('Sales analytics and reporting');
-
+export function registerItemSalesCommand(analytics: Command): void {
   analytics
     .command('item-sales <item-id>')
     .description(`Generate sales analytics for a single item
@@ -46,7 +44,8 @@ Output includes:
           loadPreferences,
         } = await import('@salesbinder/sdk');
 
-        const accountName = program.opts().account || 'default';
+        const rootProgram = analytics.parent;
+        const accountName = rootProgram?.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
         const cache = new SQLiteCacheService(accountName);
 
