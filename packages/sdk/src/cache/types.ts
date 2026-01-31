@@ -72,5 +72,38 @@ export interface ItemSalesAnalytics {
   };
 }
 
+/** Item sales grouped by period for analytics */
+export interface ItemSalesByPeriodRow {
+  issue_date: string;
+  quantity: number;
+  price: number;
+}
+
+/** Price distribution for analytics */
+export interface PriceDistributionRow {
+  price: number;
+  total_quantity: number;
+  total_revenue: number;
+}
+
+/** Customer sales data for analytics */
+export interface CustomerSalesData {
+  customer_id: string;
+  quantity: number;
+  revenue: number;
+  order_count: number;
+}
+
+/** Order pattern row for cycle time and win rate analysis */
+export interface OrderPatternRow {
+  doc_id: string;
+  quantity: number;
+  price: number;
+  issue_date: string;
+  customer_id: string;
+  context_id: number;
+  doc_number: number;
+}
+
 // Re-export DocumentContextId from common types for convenience
 export { DocumentContextId } from '../types/common.types.js';

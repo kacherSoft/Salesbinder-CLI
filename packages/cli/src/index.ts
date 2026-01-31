@@ -10,7 +10,15 @@ import { registerCustomersCommands } from './commands/customers/customers.comman
 import { registerDocumentsCommands } from './commands/documents/documents.commands.js';
 import { registerLocationsCommands } from './commands/locations/locations.commands.js';
 import { registerCategoriesCommands } from './commands/categories/categories.commands.js';
-import { registerItemSalesCommand } from './commands/analytics/item-sales.command.js';
+import {
+  registerItemSalesCommand,
+  registerTrendsCommand,
+  registerInventoryCommand,
+  registerPricingCommand,
+  registerCustomersCommand,
+  registerForecastCommand,
+  registerPatternsCommand,
+} from './commands/analytics/index.js';
 import { registerCacheCommands } from './commands/cache/cache.commands.js';
 
 /**
@@ -66,7 +74,14 @@ For more help: https://github.com/yourusername/salesbinder-cli`)
   registerCategoriesCommands(program);
 
   // Register analytics and cache commands
-  registerItemSalesCommand(program);
+  const analytics = program.command('analytics').description('Sales analytics and reporting');
+  registerItemSalesCommand(analytics);
+  registerTrendsCommand(analytics);
+  registerInventoryCommand(analytics);
+  registerPricingCommand(analytics);
+  registerCustomersCommand(analytics);
+  registerForecastCommand(analytics);
+  registerPatternsCommand(analytics);
   registerCacheCommands(program);
 
   return program;

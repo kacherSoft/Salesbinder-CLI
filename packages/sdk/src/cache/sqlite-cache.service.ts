@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 import { mkdirSync, chmodSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import type { DocumentRow, ItemDocumentRow, CacheState, CacheMetaRow } from './types.js';
+import type { DocumentRow, ItemDocumentRow, CacheState, CacheMetaRow, ItemSalesByPeriodRow, PriceDistributionRow, CustomerSalesData } from './types.js';
 
 /**
  * SQLite cache service for local document caching
@@ -285,6 +285,142 @@ export class SQLiteCacheService {
     `);
     const result = stmt.get(itemId, contextId) as { latest_date: string | null } | undefined;
     return result?.latest_date || undefined;
+  }
+
+  /**
+   * Get item sales by period for analytics (raw data with dates)
+   */
+  getItemSalesByPeriod(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): ItemSalesByPeriodRow[] {
+    const stmt = this.db.prepare(`
+      SELECT
+        d.issue_date,
+        id.quantity,
+        id.price
+      FROM item_documents id
+      JOIN documents d ON d.doc_id = id.doc_id
+      WHERE id.item_id = ?
+        AND d.context_id = ?
+        AND d.issue_date BETWEEN ? AND ?
+      ORDER BY d.issue_date ASC
+    `);
+    return stmt.all(itemId, contextId, startDate, endDate) as ItemSalesByPeriodRow[];
+  }
+
+  /**
+   * Get price distribution for analytics
+   */
+  getItemPriceDistribution(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): PriceDistributionRow[] {
+    const stmt = this.db.prepare(`
+      SELECT
+        id.price,
+        SUM(ABS(id.quantity)) as total_quantity,
+        SUM(id.quantity * id.price) as total_revenue
+      FROM item_documents id
+      JOIN documents d ON d.doc_id = id.doc_id
+      WHERE id.item_id = ?
+        AND d.context_id = ?
+        AND d.issue_date BETWEEN ? AND ?
+      GROUP BY id.price
+      ORDER BY id.price ASC
+    `);
+    return stmt.all(itemId, contextId, startDate, endDate) as PriceDistributionRow[];
+  }
+
+  /**
+   * Get item sales aggregated by customer for analytics
+   */
+  getItemSalesByCustomer(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): CustomerSalesData[] {
+    const stmt = this.db.prepare(`
+      SELECT
+        d.customer_id,
+        SUM(ABS(id.quantity)) as quantity,
+        SUM(id.quantity * id.price) as revenue,
+        COUNT(DISTINCT id.doc_id) as order_count
+      FROM item_documents id
+      JOIN documents d ON d.doc_id = id.doc_id
+      WHERE id.item_id = ?
+        AND d.context_id = ?
+        AND d.issue_date BETWEEN ? AND ?
+      GROUP BY d.customer_id
+      ORDER BY revenue DESC
+    `);
+    return stmt.all(itemId, contextId, startDate, endDate) as CustomerSalesData[];
+  }
+
+  /**
+   * Get item sales grouped by month for forecasting
+   */
+  getItemSalesByMonth(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): { month: string; quantity: number; revenue: number }[] {
+    const stmt = this.db.prepare(`
+      SELECT
+        strftime('%Y-%m', d.issue_date) as month,
+        SUM(ABS(id.quantity)) as quantity,
+        SUM(id.quantity * id.price) as revenue
+      FROM item_documents id
+      JOIN documents d ON d.doc_id = id.doc_id
+      WHERE id.item_id = ?
+        AND d.context_id = ?
+        AND d.issue_date BETWEEN ? AND ?
+      GROUP BY month
+      ORDER BY month ASC
+    `);
+    return stmt.all(itemId, contextId, startDate, endDate) as { month: string; quantity: number; revenue: number }[];
+  }
+
+  /**
+   * Get order pattern data (Estimates and Invoices only)
+   * Returns detailed document info for cycle time and win rate analysis
+   */
+  getItemOrderPatterns(
+    itemId: string,
+    startDate: string,
+    endDate: string
+  ): {
+    doc_id: string;
+    quantity: number;
+    price: number;
+    issue_date: string;
+    customer_id: string;
+    context_id: number;
+    doc_number: number;
+  }[] {
+    const stmt = this.db.prepare(`
+      SELECT
+        id.doc_id,
+        id.quantity,
+        id.price,
+        d.issue_date,
+        d.customer_id,
+        d.context_id,
+        d.doc_number
+      FROM item_documents id
+      JOIN documents d ON d.doc_id = id.doc_id
+      WHERE id.item_id = ?
+        AND d.context_id IN (4, 5)
+        AND d.issue_date BETWEEN ? AND ?
+      ORDER BY d.issue_date DESC
+    `);
+    return stmt.all(itemId, startDate, endDate) as any[];
   }
 
   // ============ Cache Metadata Operations ============

@@ -226,26 +226,61 @@ node packages/cli/dist/cli.js categories delete <category-id>
 
 Generate sales analytics for items using a local SQLite cache for fast queries.
 
+#### Basic Sales
+
 ```bash
-# Get item sales analytics (syncs cache if stale)
+# Get item sales analytics
 node packages/cli/dist/cli.js analytics item-sales <item-id>
-
-# Specify periods to analyze
-node packages/cli/dist/cli.js analytics item-sales <item-id> --months 3,6,12
-
-# Force cache refresh before query
-node packages/cli/dist/cli.js analytics item-sales <item-id> --refresh
-
-# Use cached data only (skip sync check)
-node packages/cli/dist/cli.js analytics item-sales <item-id> --cached
 ```
 
-**Output includes:**
-- Current stock quantity (real-time from API)
-- Latest Order Confirmation (Estimate) date
-- Latest Purchase Order date
-- Sold quantities and revenue for 3/6/12 month periods
-- Cache freshness information
+#### Trend Analysis
+
+```bash
+# Analyze sales trends (accelerating, decelerating, stable)
+node packages/cli/dist/cli.js analytics trends <item-id>
+
+# Output includes:
+# - 4-period breakdown (3-month rolling windows)
+# - Trend direction (upward/downward/stable/volatile)
+# - Growth rate percentage
+# - Momentum indicator
+# - Volatility score
+```
+
+**Example output:**
+```json
+{
+  "item_id": "abc123",
+  "item_name": "Product Name",
+  "analysis_period": "12 months",
+  "periods": [
+    { "period": "months_1_3", "quantity_sold": 75, "revenue": 1875, "avg_monthly": 25 },
+    { "period": "months_4_6", "quantity_sold": 60, "revenue": 1500, "avg_monthly": 20 },
+    { "period": "months_7_9", "quantity_sold": 45, "revenue": 1125, "avg_monthly": 15 },
+    { "period": "months_10_12", "quantity_sold": 30, "revenue": 750, "avg_monthly": 10 }
+  ],
+  "trend": {
+    "direction": "downward",
+    "growth_rate": -0.6,
+    "momentum": "accelerating",
+    "volatility_score": 0.15
+  }
+}
+```
+
+#### Inventory Health
+
+```bash
+# Check stock levels and reorder recommendations
+node packages/cli/dist/cli.js analytics inventory <item-id>
+
+# Output includes:
+# - Current stock (real-time from API)
+# - Days of stock remaining
+# - Stock health status (critical/low/adequate/overstock)
+# - Reorder recommendation with urgency
+# - Overstock assessment
+```
 
 **Example output:**
 ```json
@@ -253,18 +288,245 @@ node packages/cli/dist/cli.js analytics item-sales <item-id> --cached
   "item_id": "abc123",
   "item_name": "Product Name",
   "current_stock": 150,
-  "latest_oc_date": "2026-01-15",
-  "latest_po_date": "2026-01-20",
-  "sales_periods": {
-    "3_months": { "sold": 45, "revenue": 1350.00 },
-    "6_months": { "sold": 120, "revenue": 3600.00 },
-    "12_months": { "sold": 280, "revenue": 8400.00 }
+  "stock_health": {
+    "status": "adequate",
+    "days_of_stock": 45,
+    "stock_to_sales_ratio": 1.5,
+    "risk_level": "low"
   },
-  "cache_freshness": {
-    "last_sync": "2026-01-28T20:00:00Z",
-    "stale": false
+  "consumption": {
+    "avg_daily_sales": 3.33,
+    "max_daily_sales": 10,
+    "recent_trend": "stable"
+  },
+  "reorder_recommendation": {
+    "should_reorder": false,
+    "suggested_qty": null,
+    "urgency": null,
+    "rationale": "No reorder needed at this time"
+  },
+  "overstock_assessment": {
+    "is_overstocked": false,
+    "excess_units": 0,
+    "excess_value": 0,
+    "carrying_cost_estimate": null
   }
 }
+```
+
+#### Price Analysis
+
+```bash
+# Analyze price distribution and discounts
+node packages/cli/dist/cli.js analytics pricing <item-id>
+
+# Output includes:
+# - Price statistics (min/max/avg/median/stddev)
+# - Price variance percentage
+# - Price distribution by price point
+# - Discount analysis
+```
+
+**Example output:**
+```json
+{
+  "item_id": "abc123",
+  "item_name": "Product Name",
+  "period": "12 months",
+  "price_stats": {
+    "min": 20.00,
+    "max": 25.00,
+    "avg": 23.33,
+    "median": 22.50,
+    "std_dev": 2.50,
+    "variance_pct": 10.7
+  },
+  "price_distribution": [
+    { "price": 20.00, "quantity": 10, "revenue": 200.00, "frequency_pct": 16.7 },
+    { "price": 25.00, "quantity": 50, "revenue": 1250.00, "frequency_pct": 83.3 }
+  ],
+  "discounts": {
+    "has_discounts": true,
+    "avg_discount_pct": 13.3,
+    "discount_frequency": 0.167
+  }
+}
+```
+
+#### Customer Breakdown
+
+```bash
+# Analyze customer concentration
+node packages/cli/dist/cli.js analytics customers <item-id>
+
+# With customer names (slower, requires API calls)
+node packages/cli/dist/cli.js analytics customers <item-id> --resolve-names
+
+# Output includes:
+# - Total customers and revenue
+# - Top customers by revenue
+# - Concentration metrics (top 3/5 share, Herfindahl index)
+# - Customer segmentation (large/medium/small)
+```
+
+**Example output (with `--resolve-names`):**
+```json
+{
+  "item_id": "abc123",
+  "item_name": "Product Name",
+  "period": "12 months",
+  "total_customers": 2,
+  "total_quantity": 70,
+  "total_revenue": 1750.00,
+  "top_customers": [
+    {
+      "customer_id": "cust-1",
+      "customer_name": "Acme Corporation",
+      "quantity": 30,
+      "revenue": 750.00,
+      "share_pct": 42.9,
+      "order_count": 2,
+      "avg_order_size": 15
+    },
+    {
+      "customer_id": "cust-2",
+      "customer_name": "Beta Industries",
+      "quantity": 40,
+      "revenue": 1000.00,
+      "share_pct": 57.1,
+      "order_count": 3,
+      "avg_order_size": 13.33
+    }
+  ],
+  "concentration": {
+    "top_3_share_pct": 100.0,
+    "top_5_share_pct": 100.0,
+    "herfindahl_index": 0.51
+  },
+  "customer_segments": {
+    "large": 0,
+    "medium": 2,
+    "small": 0
+  }
+}
+```
+
+#### Sales Forecast
+
+```bash
+# Forecast 3-month sales
+node packages/cli/dist/cli.js analytics forecast <item-id>
+
+# Output includes:
+# - 3-month forecast (quantity and revenue)
+# - Confidence level per month
+# - Historical average
+# - Trend adjustment factor
+# - Volatility metric
+```
+
+**Example output:**
+```json
+{
+  "item_id": "abc123",
+  "item_name": "Product Name",
+  "method": "moving_average",
+  "historical_period": "6 months",
+  "forecast": [
+    { "month": "2026-02", "predicted_quantity": 13, "predicted_revenue": 325, "confidence": "medium" },
+    { "month": "2026-03", "predicted_quantity": 14, "predicted_revenue": 350, "confidence": "medium" },
+    { "month": "2026-04", "predicted_quantity": 15, "predicted_revenue": 375, "confidence": "medium" }
+  ],
+  "summary": {
+    "avg_monthly_sales": 12.33,
+    "trend_adjustment": 0.5,
+    "volatility": 0.15
+  }
+}
+```
+
+#### Order Patterns
+
+```bash
+# Analyze order patterns and cycle time
+node packages/cli/dist/cli.js analytics patterns <item-id>
+
+# Output includes:
+# - Order statistics (total, avg size, frequency)
+# - Order size distribution (small/medium/large)
+# - Cycle time (Estimate to Invoice days)
+# - Win/loss metrics (conversion rate)
+```
+
+**Example output:**
+```json
+{
+  "item_id": "abc123",
+  "item_name": "Product Name",
+  "period": "12 months",
+  "order_patterns": {
+    "total_orders": 2,
+    "avg_quantity_per_order": 12.5,
+    "median_quantity_per_order": 12.5,
+    "min_order_size": 10,
+    "max_order_size": 15,
+    "order_frequency_days": 15
+  },
+  "size_distribution": {
+    "small": 0,
+    "medium": 2,
+    "large": 0
+  },
+  "cycle_time": {
+    "avg_estimate_to_invoice_days": 30,
+    "median_days": 30,
+    "conversion_rate": 1.0
+  },
+  "win_loss": {
+    "estimates_created": 1,
+    "converted_to_invoice": 1,
+    "still_open_estimate": 0,
+    "lost_estimate": 0,
+    "win_rate": 1.0
+  }
+}
+```
+
+#### Common Options
+
+All analytics commands support:
+
+```bash
+--refresh         # Force cache refresh before query
+--cached          # Use cache without checking freshness
+--resolve-names   # (customers only) Fetch customer names from API
+```
+
+**Note:** `--resolve-names` makes additional API calls for each customer, which is slower but provides more readable output. Use without the flag for fastest results (customer IDs only).
+
+#### Example Workflow
+
+```bash
+# 1. Initial cache sync (one-time)
+node packages/cli/dist/cli.js cache sync
+
+# 2. Quick trend check
+node packages/cli/dist/cli.js analytics trends <item-id>
+
+# 3. Check inventory health
+node packages/cli/dist/cli.js analytics inventory <item-id>
+
+# 4. See price history
+node packages/cli/dist/cli.js analytics pricing <item-id>
+
+# 5. Analyze customer concentration (with names)
+node packages/cli/dist/cli.js analytics customers <item-id> --resolve-names
+
+# 6. Get sales forecast
+node packages/cli/dist/cli.js analytics forecast <item-id>
+
+# 7. Understand order patterns
+node packages/cli/dist/cli.js analytics patterns <item-id>
 ```
 
 ### Cache Management
