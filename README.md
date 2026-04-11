@@ -5,7 +5,7 @@ Command-line interface for [SalesBinder API](https://www.salesbinder.com/api/) -
 ## Features
 
 - Full CRUD operations for Items, Customers, Documents, Locations, Categories
-- **Sales Analytics** with local SQLite caching for fast queries
+- **Sales Analytics** with pluggable cache backend (SQLite local or PostgreSQL shared)
 - **Cache Management** with incremental sync and auto-refresh
 - Secure credential storage (0600 permissions)
 - Multiple account support
@@ -89,6 +89,24 @@ export SALESBINDER_CACHE_STALE_SECONDS=7200  # 2 hours
 ```
 
 **Priority**: Environment variable > Config file > Default (3600s)
+
+### Cache Backend
+
+By default, the CLI uses a **local SQLite** database for caching. For shared/multi-machine setups, you can switch to **PostgreSQL**:
+
+**Via environment variable:**
+```bash
+export SALESBINDER_DB_URL=postgres://user:pass@host:5432/salesbinder_cache
+```
+
+When `SALESBINDER_DB_URL` is set, the CLI automatically uses PostgreSQL instead of SQLite. The schema is created automatically on first use.
+
+| Feature | SQLite (default) | PostgreSQL |
+|---------|-----------------|------------|
+| Setup | Zero config | Requires connection URL |
+| Storage | `~/.salesbinder/cache/` | Remote database |
+| Sharing | Single machine | Multi-machine / shared |
+| Performance | Fast local reads | Network latency, but shared state |
 
 ### Getting Your API Key
 
@@ -224,7 +242,7 @@ node packages/cli/dist/cli.js categories delete <category-id>
 
 ### Analytics
 
-Generate sales analytics for items using a local SQLite cache for fast queries.
+Generate sales analytics for items using a local cache (SQLite or PostgreSQL) for fast queries.
 
 #### Basic Sales
 
@@ -531,7 +549,7 @@ node packages/cli/dist/cli.js analytics patterns <item-id>
 
 ### Cache Management
 
-Manage the local SQLite cache for analytics data.
+Manage the cache backend (SQLite or PostgreSQL) for analytics data.
 
 ```bash
 # Sync cache (incremental by default)
@@ -540,10 +558,10 @@ node packages/cli/dist/cli.js cache sync
 # Force full resync (re-download all documents)
 node packages/cli/dist/cli.js cache sync --full
 
-# Check cache status
+# Check cache status (shows backend type, document counts, last sync)
 node packages/cli/dist/cli.js cache status
 
-# Delete cache file
+# Clear cache data
 node packages/cli/dist/cli.js cache clear
 ```
 
@@ -551,7 +569,8 @@ node packages/cli/dist/cli.js cache clear
 - First sync: 5-10 minutes (~33K documents)
 - Delta sync: <1 minute (changes only)
 - Cached queries: <100ms
-- Cache location: `~/.salesbinder/cache/salesbinder-<account>.db`
+- SQLite location: `~/.salesbinder/cache/salesbinder-<account>.db`
+- PostgreSQL: set via `SALESBINDER_DB_URL` env var (see [Cache Backend](#cache-backend))
 
 ## Recommended Workflow
 
@@ -704,7 +723,13 @@ salesbinder-cli/
 ├── packages/
 │   ├── sdk/          # API client library
 │   │   ├── src/
-│   │   │   ├── cache/        # SQLite cache service and indexer
+│   │   │   ├── cache/
+│   │   │   │   ├── cache.interface.ts      # Unified CacheService interface
+│   │   │   │   ├── cache.factory.ts        # Auto-selects SQLite or PostgreSQL
+│   │   │   │   ├── sqlite-cache.service.ts # Local SQLite backend
+│   │   │   │   ├── postgres-cache.service.ts # Shared PostgreSQL backend
+│   │   │   │   ├── document-indexer.service.ts
+│   │   │   │   └── cache-analytics.service.ts
 │   │   │   ├── client/       # HTTP client, auth, retry
 │   │   │   ├── config/       # Config loader
 │   │   │   ├── resources/    # API resources (items, customers, etc.)
@@ -765,9 +790,10 @@ node packages/cli/dist/cli.js cache clear
 node packages/cli/dist/cli.js cache sync --full
 ```
 
-### Cache file location
+### Cache location
 
-Cache files are stored at `~/.salesbinder/cache/salesbinder-<account>.db`
+- **SQLite** (default): `~/.salesbinder/cache/salesbinder-<account>.db`
+- **PostgreSQL**: configured via `SALESBINDER_DB_URL` environment variable
 
 ## API Reference
 
