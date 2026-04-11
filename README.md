@@ -92,21 +92,32 @@ export SALESBINDER_CACHE_STALE_SECONDS=7200  # 2 hours
 
 ### Cache Backend
 
-By default, the CLI uses a **local SQLite** database for caching. For shared/multi-machine setups, you can switch to **PostgreSQL**:
+By default, the CLI uses a **local SQLite** database for reads and analytics. For shared/multi-machine setups, you can add a **shared PostgreSQL upstream** via `SALESBINDER_DB_URL`.
 
 **Via environment variable:**
 ```bash
-export SALESBINDER_DB_URL=postgres://user:pass@host:5432/salesbinder_cache
+export SALESBINDER_DB_URL=postgres://user:pass@host:5432/salesbinder
 ```
 
-When `SALESBINDER_DB_URL` is set, the CLI automatically uses PostgreSQL instead of SQLite. The schema is created automatically on first use.
+**Important:** the current shared PostgreSQL database name is **`salesbinder`**.
 
-| Feature | SQLite (default) | PostgreSQL |
-|---------|-----------------|------------|
+When `SALESBINDER_DB_URL` is set, the CLI does **not** switch analytics to query PostgreSQL directly. Instead:
+
+- **Read path / analytics:** always use **local SQLite mirror**
+- **`cache sync`:** SalesBinder API → PostgreSQL → local SQLite mirror
+- **`cache pull`:** PostgreSQL → local SQLite mirror
+- **PostgreSQL:** shared source of truth for cached documents
+- **SQLite:** local mirror for fast/offline-ish reads
+
+The PostgreSQL schema is created automatically on first use.
+
+| Feature | SQLite (local mirror) | PostgreSQL (shared upstream) |
+|---------|------------------------|-------------------------------|
+| Role | Local read cache for analytics | Shared source of truth |
 | Setup | Zero config | Requires connection URL |
 | Storage | `~/.salesbinder/cache/` | Remote database |
 | Sharing | Single machine | Multi-machine / shared |
-| Performance | Fast local reads | Network latency, but shared state |
+| Performance | Fast local reads | Shared state across machines |
 
 ### Getting Your API Key
 
@@ -242,7 +253,7 @@ node packages/cli/dist/cli.js categories delete <category-id>
 
 ### Analytics
 
-Generate sales analytics for items using a local cache (SQLite or PostgreSQL) for fast queries.
+Generate sales analytics for items using the **local SQLite mirror** for fast queries. If `SALESBINDER_DB_URL` is set, PostgreSQL acts as the shared upstream cache, but analytics still read from SQLite.
 
 #### Basic Sales
 
@@ -725,7 +736,7 @@ salesbinder-cli/
 │   │   ├── src/
 │   │   │   ├── cache/
 │   │   │   │   ├── cache.interface.ts      # Unified CacheService interface
-│   │   │   │   ├── cache.factory.ts        # Auto-selects SQLite or PostgreSQL
+│   │   │   │   ├── cache.factory.ts        # Always returns SQLite for reads; optionally auto-pulls from PostgreSQL
 │   │   │   │   ├── sqlite-cache.service.ts # Local SQLite backend
 │   │   │   │   ├── postgres-cache.service.ts # Shared PostgreSQL backend
 │   │   │   │   ├── document-indexer.service.ts
@@ -792,8 +803,9 @@ node packages/cli/dist/cli.js cache sync --full
 
 ### Cache location
 
-- **SQLite** (default): `~/.salesbinder/cache/salesbinder-<account>.db`
-- **PostgreSQL**: configured via `SALESBINDER_DB_URL` environment variable
+- **SQLite local mirror**: `~/.salesbinder/cache/salesbinder-<account>.db`
+- **PostgreSQL shared upstream**: configured via `SALESBINDER_DB_URL`
+- **Current PostgreSQL database name**: `salesbinder`
 
 ## API Reference
 
