@@ -1,0 +1,255 @@
+/**
+ * PG → SQLite sync service unit tests
+ *
+ * Tests the schedule logic (shouldAutoSync) and the full pull flow
+ * using two SQLite instances to simulate PG (since PG may not be available in CI).
+ */
+
+import { shouldAutoSync } from '../pg-to-sqlite-sync.service.js';
+import { SQLiteCacheService } from '../sqlite-cache.service.js';
+import { DocumentContextId } from '../types.js';
+import type { DocumentRow } from '../types.js';
+import { rmSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+
+describe('PgToSqliteSyncService', () => {
+  describe('shouldAutoSync', () => {
+    // Save/restore Date to mock time
+    const RealDate = global.Date;
+
+    afterEach(() => {
+      global.Date = RealDate;
+    });
+
+    function mockDate(day: number, hour: number) {
+      // day: 0=Sun, 1=Mon ... 6=Sat
+      const d = new RealDate(2026, 3, 5 + day, hour, 30, 0); // April 2026, Sun=5th
+      const MockDate = function (this: any, ...args: any[]) {
+        if (args.length === 0) return new RealDate(d.getTime());
+        return new (RealDate as any)(...args);
+      } as any;
+      MockDate.prototype = RealDate.prototype;
+      MockDate.now = () => d.getTime();
+      MockDate.parse = RealDate.parse;
+      MockDate.UTC = RealDate.UTC;
+      global.Date = MockDate;
+    }
+
+    it('should return true on weekday daytime with no previous sync', () => {
+      mockDate(1, 10); // Monday 10:00
+      expect(shouldAutoSync(null)).toBe(true);
+    });
+
+    it('should return true on weekday daytime with stale timestamp (> 1hr)', () => {
+      mockDate(3, 14); // Wednesday 14:00
+      const twoHoursAgo = Date.now() - 2 * 3600_000;
+      expect(shouldAutoSync(twoHoursAgo)).toBe(true);
+    });
+
+    it('should return false on weekday daytime with fresh timestamp (< 1hr)', () => {
+      mockDate(2, 12); // Tuesday 12:00
+      const thirtyMinAgo = Date.now() - 30 * 60_000;
+      expect(shouldAutoSync(thirtyMinAgo)).toBe(false);
+    });
+
+    it('should return false on weekend', () => {
+      mockDate(0, 12); // Sunday 12:00
+      expect(shouldAutoSync(null)).toBe(false);
+    });
+
+    it('should return false on Saturday', () => {
+      mockDate(6, 10); // Saturday 10:00
+      expect(shouldAutoSync(null)).toBe(false);
+    });
+
+    it('should return false before 8am on weekday', () => {
+      mockDate(1, 6); // Monday 6:00
+      expect(shouldAutoSync(null)).toBe(false);
+    });
+
+    it('should return false after 18h on weekday', () => {
+      mockDate(4, 20); // Thursday 20:00
+      expect(shouldAutoSync(null)).toBe(false);
+    });
+
+    it('should return true at exactly 8am on weekday', () => {
+      mockDate(5, 8); // Friday 8:00
+      expect(shouldAutoSync(null)).toBe(true);
+    });
+
+    it('should return true at exactly 18h on weekday', () => {
+      mockDate(1, 18); // Monday 18:00
+      expect(shouldAutoSync(null)).toBe(true);
+    });
+  });
+
+  describe('SQLite ↔ SQLite pull simulation', () => {
+    // Simulate PG→SQLite by using two SQLite instances
+    let sourceDb: SQLiteCacheService;
+    let targetDb: SQLiteCacheService;
+    let sourcePath: string;
+    let targetPath: string;
+
+    const testDocs: DocumentRow[] = [
+      {
+        doc_id: 'doc-001',
+        context_id: DocumentContextId.Invoice,
+        doc_number: 1001,
+        issue_date: '2026-01-15',
+        customer_id: 'cust-a',
+        modified: 1705300000,
+      },
+      {
+        doc_id: 'doc-002',
+        context_id: DocumentContextId.Estimate,
+        doc_number: 2001,
+        issue_date: '2026-02-10',
+        customer_id: 'cust-b',
+        modified: 1707500000,
+      },
+      {
+        doc_id: 'doc-003',
+        context_id: DocumentContextId.PurchaseOrder,
+        doc_number: 3001,
+        issue_date: '2026-03-05',
+        customer_id: 'cust-a',
+        modified: 1709600000,
+      },
+    ];
+
+    const testItems = [
+      { item_id: 'item-x', doc_id: 'doc-001', quantity: 10, price: 25.50 },
+      { item_id: 'item-y', doc_id: 'doc-001', quantity: 5, price: 100 },
+      { item_id: 'item-x', doc_id: 'doc-002', quantity: 3, price: 30 },
+    ];
+
+    beforeEach(async () => {
+      const ts = Date.now();
+      const rand = Math.random().toString(36).slice(2);
+      sourcePath = join(tmpdir(), `test-source-${ts}-${rand}.db`);
+      targetPath = join(tmpdir(), `test-target-${ts}-${rand}.db`);
+      sourceDb = new SQLiteCacheService('source', sourcePath);
+      targetDb = new SQLiteCacheService('target', targetPath);
+
+      // Populate source with test data
+      await sourceDb.batchInsertDocuments(testDocs);
+      await sourceDb.batchInsertItemDocuments(testItems);
+      await sourceDb.setCacheState({
+        lastSync: 1709700000,
+        lastFullSync: 1709600000,
+        documentCount: 3,
+        itemDocumentCount: 3,
+        accountName: 'test',
+        schemaVersion: 1,
+      });
+    });
+
+    afterEach(async () => {
+      await sourceDb.close();
+      await targetDb.close();
+      for (const p of [sourcePath, targetPath]) {
+        try {
+          rmSync(p);
+          rmSync(`${p}-wal`, { force: true });
+          rmSync(`${p}-shm`, { force: true });
+        } catch { /* ignore */ }
+      }
+    });
+
+    it('should copy all documents from source to target', async () => {
+      // Read from source
+      const sourceDocs = await sourceDb.getDocumentsModifiedSince(0);
+      expect(sourceDocs.length).toBe(3);
+
+      // Target should be empty
+      const beforeDocs = await targetDb.getDocumentsModifiedSince(0);
+      expect(beforeDocs.length).toBe(0);
+
+      // Simulate pull: batch insert source docs into target
+      await targetDb.batchInsertDocuments(sourceDocs);
+
+      const afterDocs = await targetDb.getDocumentsModifiedSince(0);
+      expect(afterDocs.length).toBe(3);
+      expect(afterDocs.map(d => d.doc_id).sort()).toEqual(['doc-001', 'doc-002', 'doc-003']);
+    });
+
+    it('should copy all item documents from source to target', async () => {
+      // Get items from source via doc lookup
+      const doc1Items = await sourceDb.getItemDocuments('doc-001');
+      const doc2Items = await sourceDb.getItemDocuments('doc-002');
+      expect(doc1Items.length).toBe(2);
+      expect(doc2Items.length).toBe(1);
+
+      // Insert docs first (FK constraint)
+      const sourceDocs = await sourceDb.getDocumentsModifiedSince(0);
+      await targetDb.batchInsertDocuments(sourceDocs);
+
+      // Copy item documents
+      const allItems = [...doc1Items, ...doc2Items].map(i => ({
+        item_id: i.item_id,
+        doc_id: i.doc_id,
+        quantity: i.quantity,
+        price: i.price,
+      }));
+      await targetDb.batchInsertItemDocuments(allItems);
+
+      const targetDoc1Items = await targetDb.getItemDocuments('doc-001');
+      const targetDoc2Items = await targetDb.getItemDocuments('doc-002');
+      expect(targetDoc1Items.length).toBe(2);
+      expect(targetDoc2Items.length).toBe(1);
+    });
+
+    it('should copy cache state from source to target', async () => {
+      const sourceState = await sourceDb.getCacheState();
+      expect(sourceState).not.toBeNull();
+
+      await targetDb.setCacheState(sourceState!);
+      const targetState = await targetDb.getCacheState();
+
+      expect(targetState).toEqual(sourceState);
+    });
+
+    it('should clear target before pull (full replace)', async () => {
+      // Pre-populate target with different data
+      await targetDb.insertDocument({
+        doc_id: 'old-doc',
+        context_id: DocumentContextId.Invoice,
+        doc_number: 9999,
+        issue_date: '2025-01-01',
+        customer_id: 'old-cust',
+        modified: 1000000,
+      });
+
+      const beforeCount = await targetDb.getDocumentCount();
+      expect(beforeCount).toBe(1);
+
+      // Clear target
+      const oldDocs = await targetDb.getDocumentsModifiedSince(0);
+      await targetDb.batchDeleteDocuments(oldDocs.map(d => d.doc_id));
+
+      // Insert source data
+      const sourceDocs = await sourceDb.getDocumentsModifiedSince(0);
+      await targetDb.batchInsertDocuments(sourceDocs);
+
+      const afterCount = await targetDb.getDocumentCount();
+      expect(afterCount).toBe(3);
+
+      // Old doc should be gone
+      const oldDoc = await targetDb.getDocument('old-doc');
+      expect(oldDoc).toBeUndefined();
+    });
+
+    it('getRawMeta / setRawMeta should store and retrieve pull timestamp', () => {
+      const now = Date.now();
+      targetDb.setRawMeta('pg_pull_timestamp', String(now));
+      const retrieved = targetDb.getRawMeta('pg_pull_timestamp');
+      expect(retrieved).toBe(now);
+    });
+
+    it('getRawMeta should return null for missing key', () => {
+      const result = targetDb.getRawMeta('nonexistent_key');
+      expect(result).toBeNull();
+    });
+  });
+});

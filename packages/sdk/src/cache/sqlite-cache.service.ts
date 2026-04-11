@@ -406,6 +406,27 @@ export class SQLiteCacheService implements CacheService {
     return Promise.resolve(result.count);
   }
 
+  // ============ Raw Meta Access (used by PG→SQLite sync) ============
+
+  /**
+   * Read an arbitrary key from cache_meta
+   */
+  getRawMeta(key: string): number | null {
+    const stmt = this.db.prepare(`SELECT value FROM cache_meta WHERE key = ?`);
+    const row = stmt.get(key) as { value: string } | undefined;
+    if (!row) return null;
+    const num = Number(row.value);
+    return isNaN(num) ? null : num;
+  }
+
+  /**
+   * Write an arbitrary key to cache_meta
+   */
+  setRawMeta(key: string, value: string): void {
+    const stmt = this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)`);
+    stmt.run(key, value);
+  }
+
   /**
    * Close database connection
    */

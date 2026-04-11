@@ -17,26 +17,42 @@ export function registerCacheCommands(program: Command): void {
   // Sync command
   cache
     .command('sync')
-    .description(`Sync local cache with SalesBinder API
+    .description(`Sync cache with SalesBinder API
 
 Examples:
   salesbinder cache sync
   salesbinder cache sync --full
 
-Performs incremental sync by default.
+When SALESBINDER_DB_URL is set: syncs API → PostgreSQL, then pulls PG → SQLite.
+Otherwise: syncs API → SQLite directly.
 Use --full to force complete resync.`)
     .option('--full', 'Force full sync (re-download all documents)')
     .action(async (options: { full?: boolean }) => {
       let cacheService: import('@salesbinder/sdk').CacheService | null = null;
 
       try {
-        const { SalesBinderClient, DocumentIndexerService, createCacheService, loadPreferences } = await import(
-          '@salesbinder/sdk'
-        );
+        const {
+          SalesBinderClient,
+          DocumentIndexerService,
+          createPostgresCacheService,
+          SQLiteCacheService,
+          pullFromPostgres,
+          loadPreferences,
+        } = await import('@salesbinder/sdk');
 
         const accountName = program.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
-        cacheService = await createCacheService(accountName);
+        const dbUrl = process.env.SALESBINDER_DB_URL;
+
+        // Determine sync target: PG if available, else SQLite
+        const pgService = await createPostgresCacheService();
+        if (pgService) {
+          cacheService = pgService;
+          console.error('Syncing API → PostgreSQL...');
+        } else {
+          cacheService = new SQLiteCacheService(accountName);
+          console.error('Syncing API → SQLite...');
+        }
 
         // Load stale threshold from config
         const prefs = loadPreferences();
@@ -46,8 +62,6 @@ Use --full to force complete resync.`)
           accountName,
           prefs?.cacheStaleSeconds
         );
-
-        console.error('Starting cache sync...');
 
         const result = await indexer.sync({
           full: options.full,
@@ -64,13 +78,37 @@ Use --full to force complete resync.`)
         await cacheService.close();
         cacheService = null;
 
+        // If we synced to PG, also pull PG → SQLite
+        let pullInfo: { pulled: boolean; documents?: number; duration?: string } = { pulled: false };
+        if (pgService && dbUrl) {
+          console.error('Pulling PostgreSQL → SQLite...');
+          try {
+            const pullResult = await pullFromPostgres(dbUrl, accountName);
+            pullInfo = {
+              pulled: true,
+              documents: pullResult.documentsPulled,
+              duration: pullResult.duration,
+            };
+            console.error(`Pull complete: ${pullResult.documentsPulled} docs in ${pullResult.duration}`);
+          } catch (pullError: any) {
+            console.error(`Warning: PG → SQLite pull failed: ${pullError?.message}`);
+          }
+        }
+
         const output = {
           success: true,
+          sync_target: pgService ? 'postgresql' : 'sqlite',
           sync_type: result.type,
           documents_processed: result.documentsProcessed,
           documents_deleted: result.documentsDeleted || 0,
           line_items_processed: result.lineItemsProcessed,
           duration: result.duration,
+          ...(pullInfo.pulled && {
+            pg_to_sqlite_pull: {
+              documents: pullInfo.documents,
+              duration: pullInfo.duration,
+            },
+          }),
           message: `Sync complete: ${result.documentsProcessed} documents in ${result.duration}`,
         };
 
@@ -79,7 +117,6 @@ Use --full to force complete resync.`)
         console.error(formatError(error as Error));
         process.exit(1);
       } finally {
-        // Ensure database is closed even on error
         try {
           if (cacheService && typeof cacheService.close === 'function') {
             await cacheService.close();
@@ -319,6 +356,48 @@ Displays:
         } catch {
           // Ignore cleanup errors
         }
+      }
+    });
+
+  // Pull command (PG → SQLite)
+  cache
+    .command('pull')
+    .description(`Pull data from PostgreSQL into local SQLite cache
+
+Examples:
+  salesbinder cache pull
+
+Requires SALESBINDER_DB_URL environment variable.
+Downloads all cached data from shared PostgreSQL into local SQLite for fast offline reads.
+This happens automatically during weekdays 8-18h (at most once per hour),
+but you can run this command to force an immediate pull.`)
+    .action(async () => {
+      try {
+        const dbUrl = process.env.SALESBINDER_DB_URL;
+        if (!dbUrl) {
+          console.error(formatError(new Error('SALESBINDER_DB_URL is not set. Pull requires a PostgreSQL backend.')));
+          process.exit(1);
+        }
+
+        const { pullFromPostgres } = await import('@salesbinder/sdk');
+
+        const accountName = program.opts().account || 'default';
+        console.error('Pulling PostgreSQL → SQLite...');
+
+        const result = await pullFromPostgres(dbUrl, accountName);
+
+        console.log(
+          formatJson({
+            success: true,
+            documents_pulled: result.documentsPulled,
+            item_documents_pulled: result.itemDocumentsPulled,
+            duration: result.duration,
+            message: `Pull complete: ${result.documentsPulled} documents, ${result.itemDocumentsPulled} line items in ${result.duration}`,
+          })
+        );
+      } catch (error) {
+        console.error(formatError(error as Error));
+        process.exit(1);
       }
     });
 }
