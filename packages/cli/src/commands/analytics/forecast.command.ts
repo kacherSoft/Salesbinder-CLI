@@ -53,10 +53,11 @@ Output includes:
     .option('--refresh', 'Force cache refresh before query')
     .option('--cached', 'Use cache without checking freshness')
     .action(async (itemId: string, options: { refresh?: boolean; cached?: boolean }) => {
+      let cache: import('@salesbinder/sdk').CacheService | null = null;
       try {
         const {
           SalesBinderClient,
-          SQLiteCacheService,
+          createCacheService,
           DocumentIndexerService,
           DocumentContextId,
           CacheAnalyticsService,
@@ -66,7 +67,7 @@ Output includes:
         const rootProgram = analytics.parent;
         const accountName = rootProgram?.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
-        const cache = new SQLiteCacheService(accountName);
+        cache = await createCacheService(accountName);
         const analyticsService = new CacheAnalyticsService();
 
         const prefs = loadPreferences();
@@ -83,12 +84,12 @@ Output includes:
         };
 
         if (!analyticsOptions.useCachedOnly) {
-          const state = cache.getCacheState();
+          const state = await cache.getCacheState();
           const needsSync =
             analyticsOptions.forceRefresh ||
             !state ||
             state.accountName !== accountName ||
-            indexer.isCacheStale();
+            await indexer.isCacheStale();
 
           if (needsSync) {
             console.error('Syncing cache...');
@@ -115,7 +116,7 @@ Output includes:
         const startDateStr = startDate.toISOString().split('T')[0];
         const endDateStr = endDate.toISOString().split('T')[0];
 
-        const monthlySales = cache.getItemSalesByMonth(
+        const monthlySales = await cache.getItemSalesByMonth(
           itemId,
           startDateStr,
           endDateStr,
@@ -158,7 +159,8 @@ Output includes:
           });
         }
 
-        cache.close();
+        await cache.close();
+        cache = null;
 
         const result: ForecastOutput = {
           item_id: itemId,
@@ -177,6 +179,10 @@ Output includes:
       } catch (error) {
         console.error(formatError(error as Error));
         process.exit(1);
+      } finally {
+        try {
+          if (cache) await cache.close();
+        } catch { /* ignore */ }
       }
     });
 }

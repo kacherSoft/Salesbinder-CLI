@@ -27,22 +27,22 @@ Performs incremental sync by default.
 Use --full to force complete resync.`)
     .option('--full', 'Force full sync (re-download all documents)')
     .action(async (options: { full?: boolean }) => {
-      let cache: import('@salesbinder/sdk').SQLiteCacheService | null = null;
+      let cacheService: import('@salesbinder/sdk').CacheService | null = null;
 
       try {
-        const { SalesBinderClient, DocumentIndexerService, SQLiteCacheService, loadPreferences } = await import(
+        const { SalesBinderClient, DocumentIndexerService, createCacheService, loadPreferences } = await import(
           '@salesbinder/sdk'
         );
 
         const accountName = program.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
-        cache = new SQLiteCacheService(accountName);
+        cacheService = await createCacheService(accountName);
 
         // Load stale threshold from config
         const prefs = loadPreferences();
         const indexer = new DocumentIndexerService(
           client,
-          cache,
+          cacheService,
           accountName,
           prefs?.cacheStaleSeconds
         );
@@ -61,7 +61,8 @@ Use --full to force complete resync.`)
           },
         });
 
-        cache.close();
+        await cacheService.close();
+        cacheService = null;
 
         const output = {
           success: true,
@@ -80,8 +81,8 @@ Use --full to force complete resync.`)
       } finally {
         // Ensure database is closed even on error
         try {
-          if (cache && typeof cache.close === 'function') {
-            cache.close();
+          if (cacheService && typeof cacheService.close === 'function') {
+            await cacheService.close();
           }
         } catch {
           // Ignore cleanup errors
@@ -92,52 +93,74 @@ Use --full to force complete resync.`)
   // Clear command
   cache
     .command('clear')
-    .description(`Delete local cache file
+    .description(`Delete or truncate local cache
 
 Example:
   salesbinder cache clear
 
-Removes the local SQLite cache file.
+For SQLite: removes the local cache file.
+For PostgreSQL: truncates all cache tables.
 Next sync will perform a full resync.`)
     .action(async () => {
       try {
-        const accountName = program.opts().account || 'default';
-        const sanitizedAccount = accountName.replace(/[^a-zA-Z0-9_-]/g, '_');
-        const cacheDir = join(homedir(), '.salesbinder', 'cache');
-        const cacheFile = join(cacheDir, `salesbinder-${sanitizedAccount}.db`);
+        const dbUrl = process.env.SALESBINDER_DB_URL;
 
-        // Also check for WAL and SHM files
-        const walFile = `${cacheFile}-wal`;
-        const shmFile = `${cacheFile}-shm`;
+        if (dbUrl) {
+          // PostgreSQL: truncate tables
+          const { PostgresCacheService } = await import('@salesbinder/sdk');
+          const pgCache = new PostgresCacheService(dbUrl);
+          await pgCache.ensureSchema();
+          await pgCache.truncateAll();
+          await pgCache.close();
 
-        if (!existsSync(cacheFile)) {
           console.log(
             formatJson({
               success: true,
-              message: 'Cache file does not exist',
-              cache_file: cacheFile,
+              message: 'PostgreSQL cache tables truncated',
+              backend: 'postgresql',
+              next_sync: 'full',
             })
           );
-          return;
+        } else {
+          // SQLite: delete file
+          const accountName = program.opts().account || 'default';
+          const sanitizedAccount = accountName.replace(/[^a-zA-Z0-9_-]/g, '_');
+          const cacheDir = join(homedir(), '.salesbinder', 'cache');
+          const cacheFile = join(cacheDir, `salesbinder-${sanitizedAccount}.db`);
+
+          // Also check for WAL and SHM files
+          const walFile = `${cacheFile}-wal`;
+          const shmFile = `${cacheFile}-shm`;
+
+          if (!existsSync(cacheFile)) {
+            console.log(
+              formatJson({
+                success: true,
+                message: 'Cache file does not exist',
+                cache_file: cacheFile,
+              })
+            );
+            return;
+          }
+
+          // Get file size before deletion
+          const stats = statSync(cacheFile);
+          const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+
+          // Delete cache file and related files
+          unlinkSync(cacheFile);
+          if (existsSync(walFile)) unlinkSync(walFile);
+          if (existsSync(shmFile)) unlinkSync(shmFile);
+
+          console.log(
+            formatJson({
+              success: true,
+              message: `Cache deleted (${sizeMB} MB)`,
+              cache_file: cacheFile,
+              next_sync: 'full',
+            })
+          );
         }
-
-        // Get file size before deletion
-        const stats = statSync(cacheFile);
-        const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-
-        // Delete cache file and related files
-        unlinkSync(cacheFile);
-        if (existsSync(walFile)) unlinkSync(walFile);
-        if (existsSync(shmFile)) unlinkSync(shmFile);
-
-        console.log(
-          formatJson({
-            success: true,
-            message: `Cache deleted (${sizeMB} MB)`,
-            cache_file: cacheFile,
-            next_sync: 'full',
-          })
-        );
       } catch (error) {
         console.error(formatError(error as Error));
         process.exit(1);
@@ -153,88 +176,145 @@ Example:
   salesbinder cache status
 
 Displays:
-  - Cache file location
+  - Cache backend (SQLite or PostgreSQL)
+  - Cache file location or connection info
   - Account name
   - Last sync time
   - Document counts
-  - File size
   - Freshness status`)
     .action(async () => {
-      let cache: import('@salesbinder/sdk').SQLiteCacheService | null = null;
+      let cacheService: import('@salesbinder/sdk').CacheService | null = null;
 
       try {
-        const { SQLiteCacheService, DocumentIndexerService, SalesBinderClient, loadPreferences } = await import(
+        const { createCacheService, DocumentIndexerService, SalesBinderClient, loadPreferences } = await import(
           '@salesbinder/sdk'
         );
 
+        const dbUrl = process.env.SALESBINDER_DB_URL;
         const accountName = program.opts().account || 'default';
-        const sanitizedAccount = accountName.replace(/[^a-zA-Z0-9_-]/g, '_');
-        const cacheDir = join(homedir(), '.salesbinder', 'cache');
-        const cacheFile = join(cacheDir, `salesbinder-${sanitizedAccount}.db`);
 
-        const cacheExists = existsSync(cacheFile);
-
-        if (!cacheExists) {
-          console.log(
-            formatJson({
-              exists: false,
-              account: accountName,
-              cache_file: cacheFile,
-              message: 'Cache does not exist. Run "cache sync" to create it.',
-            })
+        if (dbUrl) {
+          // PostgreSQL backend
+          cacheService = await createCacheService(accountName);
+          const client = new SalesBinderClient(accountName);
+          const prefs = loadPreferences();
+          const indexer = new DocumentIndexerService(
+            client,
+            cacheService,
+            accountName,
+            prefs?.cacheStaleSeconds
           );
-          return;
+
+          const state = await cacheService.getCacheState();
+          const stale = await indexer.isCacheStale();
+
+          await cacheService.close();
+          cacheService = null;
+
+          const maskedUrl = (() => {
+            try {
+              const u = new URL(dbUrl);
+              u.password = '***';
+              return u.toString();
+            } catch {
+              return dbUrl;
+            }
+          })();
+
+          const output = {
+            backend: 'postgresql',
+            connection: maskedUrl,
+            account: accountName,
+            ...(state
+              ? {
+                  last_sync: new Date(state.lastSync * 1000).toISOString(),
+                  last_full_sync: new Date(state.lastFullSync * 1000).toISOString(),
+                  document_count: state.documentCount,
+                  line_item_count: state.itemDocumentCount,
+                  schema_version: state.schemaVersion,
+                  is_stale: stale,
+                  freshness: stale ? 'STALE' : 'FRESH',
+                  stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
+                }
+              : {
+                  message: 'Cache exists but no metadata found. May need full sync.',
+                }),
+          };
+
+          console.log(formatJson(output));
+        } else {
+          // SQLite backend
+          const sanitizedAccount = accountName.replace(/[^a-zA-Z0-9_-]/g, '_');
+          const cacheDir = join(homedir(), '.salesbinder', 'cache');
+          const cacheFile = join(cacheDir, `salesbinder-${sanitizedAccount}.db`);
+
+          const cacheExists = existsSync(cacheFile);
+
+          if (!cacheExists) {
+            console.log(
+              formatJson({
+                backend: 'sqlite',
+                exists: false,
+                account: accountName,
+                cache_file: cacheFile,
+                message: 'Cache does not exist. Run "cache sync" to create it.',
+              })
+            );
+            return;
+          }
+
+          const stats = statSync(cacheFile);
+          const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+
+          cacheService = await createCacheService(accountName);
+          const client = new SalesBinderClient(accountName);
+
+          // Load stale threshold from config
+          const prefs = loadPreferences();
+          const indexer = new DocumentIndexerService(
+            client,
+            cacheService,
+            accountName,
+            prefs?.cacheStaleSeconds
+          );
+
+          const state = await cacheService.getCacheState();
+          const stale = await indexer.isCacheStale();
+
+          await cacheService.close();
+          cacheService = null;
+
+          const output = {
+            backend: 'sqlite',
+            exists: true,
+            account: accountName,
+            cache_file: cacheFile,
+            size_mb: parseFloat(sizeMB),
+            ...(state
+              ? {
+                  last_sync: new Date(state.lastSync * 1000).toISOString(),
+                  last_full_sync: new Date(state.lastFullSync * 1000).toISOString(),
+                  document_count: state.documentCount,
+                  line_item_count: state.itemDocumentCount,
+                  schema_version: state.schemaVersion,
+                  is_stale: stale,
+                  freshness: stale ? 'STALE' : 'FRESH',
+                  stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
+                }
+              : {
+                  message: 'Cache exists but no metadata found. May need full sync.',
+                }),
+          };
+
+          console.log(formatJson(output));
         }
-
-        const stats = statSync(cacheFile);
-        const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-
-        cache = new SQLiteCacheService(accountName);
-        const client = new SalesBinderClient(accountName);
-
-        // Load stale threshold from config
-        const prefs = loadPreferences();
-        const indexer = new DocumentIndexerService(
-          client,
-          cache,
-          accountName,
-          prefs?.cacheStaleSeconds
-        );
-
-        const state = cache.getCacheState();
-        const stale = indexer.isCacheStale();
-
-        cache.close();
-
-        const output = {
-          exists: true,
-          account: accountName,
-          cache_file: cacheFile,
-          size_mb: parseFloat(sizeMB),
-          ...(state
-            ? {
-                last_sync: new Date(state.lastSync * 1000).toISOString(),
-                last_full_sync: new Date(state.lastFullSync * 1000).toISOString(),
-                document_count: state.documentCount,
-                line_item_count: state.itemDocumentCount,
-                schema_version: state.schemaVersion,
-                is_stale: stale,
-                freshness: stale ? 'STALE' : 'FRESH',
-                stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
-              }
-            : {
-                message: 'Cache exists but no metadata found. May need full sync.',
-              }),
-        };
-
-        console.log(formatJson(output));
       } catch (error) {
         console.error(formatError(error as Error));
         process.exit(1);
       } finally {
         try {
-          if (cache && typeof cache.close === 'function') {
-            cache.close();
+          if (cacheService && typeof cacheService.close === 'function') {
+            await cacheService.close();
           }
         } catch {
           // Ignore cleanup errors

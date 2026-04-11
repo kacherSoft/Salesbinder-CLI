@@ -6,12 +6,14 @@ import Database from 'better-sqlite3';
 import { mkdirSync, chmodSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import type { CacheService } from './cache.interface.js';
 import type { DocumentRow, ItemDocumentRow, CacheState, CacheMetaRow, ItemSalesByPeriodRow, PriceDistributionRow, CustomerSalesData } from './types.js';
 
 /**
- * SQLite cache service for local document caching
+ * SQLite cache service for local document caching.
+ * Implements CacheService with Promise-wrapped synchronous sqlite calls.
  */
-export class SQLiteCacheService {
+export class SQLiteCacheService implements CacheService {
   private db: Database.Database;
   private readonly accountName: string;
   private readonly dbPath: string;
@@ -127,57 +129,41 @@ export class SQLiteCacheService {
 
   // ============ Document CRUD Operations ============
 
-  /**
-   * Insert or replace a document
-   */
-  insertDocument(doc: DocumentRow): void {
+  insertDocument(doc: DocumentRow): Promise<void> {
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO documents
       (doc_id, context_id, doc_number, issue_date, customer_id, modified)
       VALUES (?, ?, ?, ?, ?, ?)
     `);
     stmt.run(doc.doc_id, doc.context_id, doc.doc_number, doc.issue_date, doc.customer_id, doc.modified);
+    return Promise.resolve();
   }
 
-  /**
-   * Get a document by ID
-   */
-  getDocument(docId: string): DocumentRow | undefined {
+  getDocument(docId: string): Promise<DocumentRow | undefined> {
     const stmt = this.db.prepare(`SELECT * FROM documents WHERE doc_id = ?`);
-    return stmt.get(docId) as DocumentRow | undefined;
+    return Promise.resolve(stmt.get(docId) as DocumentRow | undefined);
   }
 
-  /**
-   * Get documents by context ID
-   */
-  getDocumentsByContext(contextId: number): DocumentRow[] {
+  getDocumentsByContext(contextId: number): Promise<DocumentRow[]> {
     const stmt = this.db.prepare(`SELECT * FROM documents WHERE context_id = ?`);
-    return stmt.all(contextId) as DocumentRow[];
+    return Promise.resolve(stmt.all(contextId) as DocumentRow[]);
   }
 
-  /**
-   * Get documents modified since timestamp
-   */
-  getDocumentsModifiedSince(timestamp: number): DocumentRow[] {
+  getDocumentsModifiedSince(timestamp: number): Promise<DocumentRow[]> {
     const stmt = this.db.prepare(`
       SELECT * FROM documents WHERE modified > ?
       ORDER BY modified ASC
     `);
-    return stmt.all(timestamp) as DocumentRow[];
+    return Promise.resolve(stmt.all(timestamp) as DocumentRow[]);
   }
 
-  /**
-   * Delete a document (cascades to item_documents)
-   */
-  deleteDocument(docId: string): void {
+  deleteDocument(docId: string): Promise<void> {
     const stmt = this.db.prepare(`DELETE FROM documents WHERE doc_id = ?`);
     stmt.run(docId);
+    return Promise.resolve();
   }
 
-  /**
-   * Batch insert documents (transactional)
-   */
-  batchInsertDocuments(docs: DocumentRow[]): void {
+  batchInsertDocuments(docs: DocumentRow[]): Promise<void> {
     const insert = this.db.prepare(`
       INSERT OR REPLACE INTO documents
       (doc_id, context_id, doc_number, issue_date, customer_id, modified)
@@ -189,12 +175,10 @@ export class SQLiteCacheService {
       }
     });
     transaction(docs);
+    return Promise.resolve();
   }
 
-  /**
-   * Batch delete documents (transactional)
-   */
-  batchDeleteDocuments(docIds: string[]): void {
+  batchDeleteDocuments(docIds: string[]): Promise<void> {
     const deleteStmt = this.db.prepare(`DELETE FROM documents WHERE doc_id = ?`);
     const transaction = this.db.transaction((ids: string[]) => {
       for (const id of ids) {
@@ -202,42 +186,33 @@ export class SQLiteCacheService {
       }
     });
     transaction(docIds);
+    return Promise.resolve();
   }
 
   // ============ Item Document CRUD Operations ============
 
-  /**
-   * Insert a single item document
-   */
-  insertItemDocument(item: Omit<ItemDocumentRow, 'id'>): void {
+  insertItemDocument(item: Omit<ItemDocumentRow, 'id'>): Promise<void> {
     const stmt = this.db.prepare(`
       INSERT INTO item_documents (item_id, doc_id, quantity, price)
       VALUES (?, ?, ?, ?)
     `);
     stmt.run(item.item_id, item.doc_id, item.quantity, item.price);
+    return Promise.resolve();
   }
 
-  /**
-   * Get item documents for a document
-   */
-  getItemDocuments(docId: string): ItemDocumentRow[] {
+  getItemDocuments(docId: string): Promise<ItemDocumentRow[]> {
     const stmt = this.db.prepare(`SELECT * FROM item_documents WHERE doc_id = ?`);
-    return stmt.all(docId) as ItemDocumentRow[];
+    return Promise.resolve(stmt.all(docId) as ItemDocumentRow[]);
   }
 
-  /**
-   * Delete item documents for a document
-   */
-  deleteItemDocuments(docId: string): void {
+  deleteItemDocuments(docId: string): Promise<void> {
     const stmt = this.db.prepare(`DELETE FROM item_documents WHERE doc_id = ?`);
     stmt.run(docId);
+    return Promise.resolve();
   }
 
-  /**
-   * Batch insert item documents (transactional)
-   */
-  batchInsertItemDocuments(items: Omit<ItemDocumentRow, 'id'>[]): void {
-    if (items.length === 0) return;
+  batchInsertItemDocuments(items: Omit<ItemDocumentRow, 'id'>[]): Promise<void> {
+    if (items.length === 0) return Promise.resolve();
     
     const insert = this.db.prepare(`
       INSERT INTO item_documents (item_id, doc_id, quantity, price)
@@ -249,19 +224,17 @@ export class SQLiteCacheService {
       }
     });
     transaction(items);
+    return Promise.resolve();
   }
 
   // ============ Analytics Query Helpers ============
 
-  /**
-   * Get item documents for a specific period and document context
-   */
   getItemDocumentsForPeriod(
     itemId: string,
     startDate: string,
     endDate: string,
     contextId: number
-  ): ItemDocumentRow[] {
+  ): Promise<ItemDocumentRow[]> {
     const stmt = this.db.prepare(`
       SELECT id.* FROM item_documents id
       JOIN documents d ON d.doc_id = id.doc_id
@@ -270,13 +243,10 @@ export class SQLiteCacheService {
         AND d.issue_date BETWEEN ? AND ?
       ORDER BY d.issue_date DESC
     `);
-    return stmt.all(itemId, contextId, startDate, endDate) as ItemDocumentRow[];
+    return Promise.resolve(stmt.all(itemId, contextId, startDate, endDate) as ItemDocumentRow[]);
   }
 
-  /**
-   * Get latest document date for an item by context
-   */
-  getLatestItemDocumentDate(itemId: string, contextId: number): string | undefined {
+  getLatestItemDocumentDate(itemId: string, contextId: number): Promise<string | undefined> {
     const stmt = this.db.prepare(`
       SELECT MAX(d.issue_date) as latest_date
       FROM item_documents id
@@ -284,18 +254,15 @@ export class SQLiteCacheService {
       WHERE id.item_id = ? AND d.context_id = ?
     `);
     const result = stmt.get(itemId, contextId) as { latest_date: string | null } | undefined;
-    return result?.latest_date || undefined;
+    return Promise.resolve(result?.latest_date || undefined);
   }
 
-  /**
-   * Get item sales by period for analytics (raw data with dates)
-   */
   getItemSalesByPeriod(
     itemId: string,
     startDate: string,
     endDate: string,
     contextId: number
-  ): ItemSalesByPeriodRow[] {
+  ): Promise<ItemSalesByPeriodRow[]> {
     const stmt = this.db.prepare(`
       SELECT
         d.issue_date,
@@ -308,18 +275,15 @@ export class SQLiteCacheService {
         AND d.issue_date BETWEEN ? AND ?
       ORDER BY d.issue_date ASC
     `);
-    return stmt.all(itemId, contextId, startDate, endDate) as ItemSalesByPeriodRow[];
+    return Promise.resolve(stmt.all(itemId, contextId, startDate, endDate) as ItemSalesByPeriodRow[]);
   }
 
-  /**
-   * Get price distribution for analytics
-   */
   getItemPriceDistribution(
     itemId: string,
     startDate: string,
     endDate: string,
     contextId: number
-  ): PriceDistributionRow[] {
+  ): Promise<PriceDistributionRow[]> {
     const stmt = this.db.prepare(`
       SELECT
         id.price,
@@ -333,18 +297,15 @@ export class SQLiteCacheService {
       GROUP BY id.price
       ORDER BY id.price ASC
     `);
-    return stmt.all(itemId, contextId, startDate, endDate) as PriceDistributionRow[];
+    return Promise.resolve(stmt.all(itemId, contextId, startDate, endDate) as PriceDistributionRow[]);
   }
 
-  /**
-   * Get item sales aggregated by customer for analytics
-   */
   getItemSalesByCustomer(
     itemId: string,
     startDate: string,
     endDate: string,
     contextId: number
-  ): CustomerSalesData[] {
+  ): Promise<CustomerSalesData[]> {
     const stmt = this.db.prepare(`
       SELECT
         d.customer_id,
@@ -359,18 +320,15 @@ export class SQLiteCacheService {
       GROUP BY d.customer_id
       ORDER BY revenue DESC
     `);
-    return stmt.all(itemId, contextId, startDate, endDate) as CustomerSalesData[];
+    return Promise.resolve(stmt.all(itemId, contextId, startDate, endDate) as CustomerSalesData[]);
   }
 
-  /**
-   * Get item sales grouped by month for forecasting
-   */
   getItemSalesByMonth(
     itemId: string,
     startDate: string,
     endDate: string,
     contextId: number
-  ): { month: string; quantity: number; revenue: number }[] {
+  ): Promise<{ month: string; quantity: number; revenue: number }[]> {
     const stmt = this.db.prepare(`
       SELECT
         strftime('%Y-%m', d.issue_date) as month,
@@ -384,18 +342,14 @@ export class SQLiteCacheService {
       GROUP BY month
       ORDER BY month ASC
     `);
-    return stmt.all(itemId, contextId, startDate, endDate) as { month: string; quantity: number; revenue: number }[];
+    return Promise.resolve(stmt.all(itemId, contextId, startDate, endDate) as { month: string; quantity: number; revenue: number }[]);
   }
 
-  /**
-   * Get order pattern data (Estimates and Invoices only)
-   * Returns detailed document info for cycle time and win rate analysis
-   */
   getItemOrderPatterns(
     itemId: string,
     startDate: string,
     endDate: string
-  ): {
+  ): Promise<{
     doc_id: string;
     quantity: number;
     price: number;
@@ -403,7 +357,7 @@ export class SQLiteCacheService {
     customer_id: string;
     context_id: number;
     doc_number: number;
-  }[] {
+  }[]> {
     const stmt = this.db.prepare(`
       SELECT
         id.doc_id,
@@ -420,54 +374,42 @@ export class SQLiteCacheService {
         AND d.issue_date BETWEEN ? AND ?
       ORDER BY d.issue_date DESC
     `);
-    return stmt.all(itemId, startDate, endDate) as any[];
+    return Promise.resolve(stmt.all(itemId, startDate, endDate) as any[]);
   }
 
   // ============ Cache Metadata Operations ============
 
-  /**
-   * Get cache state
-   */
-  getCacheState(): CacheState | null {
+  getCacheState(): Promise<CacheState | null> {
     const stmt = this.db.prepare(`SELECT value FROM cache_meta WHERE key = 'state'`);
     const row = stmt.get() as CacheMetaRow | undefined;
-    if (!row) return null;
-    return JSON.parse(row.value) as CacheState;
+    if (!row) return Promise.resolve(null);
+    return Promise.resolve(JSON.parse(row.value) as CacheState);
   }
 
-  /**
-   * Set cache state
-   */
-  setCacheState(state: CacheState): void {
+  setCacheState(state: CacheState): Promise<void> {
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)
     `);
     stmt.run(JSON.stringify(state));
+    return Promise.resolve();
   }
 
-  /**
-   * Get document count
-   */
-  getDocumentCount(): number {
+  getDocumentCount(): Promise<number> {
     const stmt = this.db.prepare(`SELECT COUNT(*) as count FROM documents`);
     const result = stmt.get() as { count: number };
-    return result.count;
+    return Promise.resolve(result.count);
   }
 
-  /**
-   * Get item document count
-   */
-  getItemDocumentCount(): number {
+  getItemDocumentCount(): Promise<number> {
     const stmt = this.db.prepare(`SELECT COUNT(*) as count FROM item_documents`);
     const result = stmt.get() as { count: number };
-    return result.count;
+    return Promise.resolve(result.count);
   }
 
   /**
    * Close database connection
-   * Should be called when shutting down to release resources
    */
-  close(): void {
+  async close(): Promise<void> {
     if (this.db) {
       this.db.close();
     }

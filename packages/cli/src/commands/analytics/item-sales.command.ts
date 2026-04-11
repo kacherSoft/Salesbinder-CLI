@@ -35,10 +35,11 @@ Output includes:
     .option('--refresh', 'Force cache refresh before query')
     .option('--cached', 'Use cache without checking freshness')
     .action(async (itemId: string, options: { months: string; refresh?: boolean; cached?: boolean }) => {
+      let cache: import('@salesbinder/sdk').CacheService | null = null;
       try {
         const {
           SalesBinderClient,
-          SQLiteCacheService,
+          createCacheService,
           DocumentIndexerService,
           DocumentContextId,
           loadPreferences,
@@ -47,7 +48,7 @@ Output includes:
         const rootProgram = analytics.parent;
         const accountName = rootProgram?.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
-        const cache = new SQLiteCacheService(accountName);
+        cache = await createCacheService(accountName);
 
         // Load stale threshold from config
         const prefs = loadPreferences();
@@ -71,12 +72,12 @@ Output includes:
 
         // Check cache and sync if needed
         if (!analyticsOptions.useCachedOnly) {
-          const state = cache.getCacheState();
+          const state = await cache.getCacheState();
           const needsSync =
             analyticsOptions.forceRefresh ||
             !state ||
             state.accountName !== accountName ||
-            indexer.isCacheStale();
+            await indexer.isCacheStale();
 
           if (needsSync) {
             console.error('Syncing cache...');
@@ -98,10 +99,10 @@ Output includes:
         }
 
         // Query latest OC date (Estimate = context 4)
-        const latestOcDate = cache.getLatestItemDocumentDate(itemId, DocumentContextId.Estimate);
+        const latestOcDate = await cache.getLatestItemDocumentDate(itemId, DocumentContextId.Estimate);
 
         // Query latest PO date (Purchase Order = context 11)
-        const latestPoDate = cache.getLatestItemDocumentDate(itemId, DocumentContextId.PurchaseOrder);
+        const latestPoDate = await cache.getLatestItemDocumentDate(itemId, DocumentContextId.PurchaseOrder);
 
         // Aggregate sales by period
         const salesPeriods: { [key: string]: { sold: number; revenue: number } } = {};
@@ -114,7 +115,7 @@ Output includes:
           const endDateStr = now.toISOString().split('T')[0];
 
           // Query invoice line items (Invoice = context 5) for period
-          const lineItems = cache.getItemDocumentsForPeriod(
+          const lineItems = await cache.getItemDocumentsForPeriod(
             itemId,
             startDateStr,
             endDateStr,
@@ -129,11 +130,12 @@ Output includes:
         }
 
         // Get cache freshness info
-        const state = cache.getCacheState();
+        const state = await cache.getCacheState();
         const lastSync = state ? new Date(state.lastSync * 1000).toISOString() : 'unknown';
-        const stale = state ? indexer.isCacheStale() : true;
+        const stale = state ? await indexer.isCacheStale() : true;
 
-        cache.close();
+        await cache.close();
+        cache = null;
 
         const result = {
           item_id: itemId,
@@ -152,6 +154,10 @@ Output includes:
       } catch (error) {
         console.error(formatError(error as Error));
         process.exit(1);
+      } finally {
+        try {
+          if (cache) await cache.close();
+        } catch { /* ignore */ }
       }
     });
 }

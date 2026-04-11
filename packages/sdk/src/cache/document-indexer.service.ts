@@ -3,20 +3,20 @@
  */
 
 import type { SalesBinderClient } from '../resources/index.js';
-import type { SQLiteCacheService } from './sqlite-cache.service.js';
+import type { CacheService } from './cache.interface.js';
 import type { DocumentRow, ItemDocumentRow, SyncOptions, SyncResult, CacheState } from './types.js';
 import { DocumentContextId } from './types.js';
 import type { Document, DocumentListResponse } from '../types/documents.types.js';
 
 /**
- * Document indexer service for syncing API data to SQLite cache
+ * Document indexer service for syncing API data to cache
  */
 export class DocumentIndexerService {
   private readonly staleThreshold: number;
 
   constructor(
     private client: SalesBinderClient,
-    private cache: SQLiteCacheService,
+    private cache: CacheService,
     private readonly accountName: string,
     staleThresholdSeconds?: number
   ) {
@@ -31,7 +31,7 @@ export class DocumentIndexerService {
    * Perform sync (full or delta based on options and cache state)
    */
   async sync(options: SyncOptions = {}): Promise<SyncResult> {
-    const state = this.cache.getCacheState();
+    const state = await this.cache.getCacheState();
     const needsInitialSync = !state || state.accountName !== this.accountName;
 
     if (options.full || needsInitialSync) {
@@ -44,8 +44,8 @@ export class DocumentIndexerService {
   /**
    * Check if cache is stale (older than configured threshold)
    */
-  isCacheStale(): boolean {
-    const state = this.cache.getCacheState();
+  async isCacheStale(): Promise<boolean> {
+    const state = await this.cache.getCacheState();
     if (!state) return true;
     const staleTime = Math.floor(Date.now() / 1000) - this.staleThreshold;
     return state.lastSync < staleTime;
@@ -112,9 +112,9 @@ export class DocumentIndexerService {
               const { docRow, itemRows } = this.processDocument(fullDoc);
 
               // Delete existing item documents and insert new ones
-              this.cache.deleteItemDocuments(docRow.doc_id);
-              this.cache.insertDocument(docRow);
-              this.cache.batchInsertItemDocuments(itemRows);
+              await this.cache.deleteItemDocuments(docRow.doc_id);
+              await this.cache.insertDocument(docRow);
+              await this.cache.batchInsertItemDocuments(itemRows);
 
               totalDocuments++;
               totalLineItems += itemRows.length;
@@ -139,7 +139,7 @@ export class DocumentIndexerService {
 
       // Update cache state
       const now = Math.floor(Date.now() / 1000);
-      this.cache.setCacheState({
+      await this.cache.setCacheState({
         lastSync: now,
         lastFullSync: now,
         documentCount: totalDocuments,
@@ -168,7 +168,7 @@ export class DocumentIndexerService {
    */
   private async deltaSync(options: SyncOptions): Promise<SyncResult> {
     const startTime = Date.now();
-    const state = this.cache.getCacheState()!;
+    const state = (await this.cache.getCacheState())!;
     let documentsUpdated = 0;
     let documentsDeleted = 0;
     let lineItemsUpdated = 0;
@@ -219,9 +219,9 @@ export class DocumentIndexerService {
               const { docRow, itemRows } = this.processDocument(fullDoc);
 
               // Delete existing and re-insert
-              this.cache.deleteItemDocuments(docRow.doc_id);
-              this.cache.insertDocument(docRow);
-              this.cache.batchInsertItemDocuments(itemRows);
+              await this.cache.deleteItemDocuments(docRow.doc_id);
+              await this.cache.insertDocument(docRow);
+              await this.cache.batchInsertItemDocuments(itemRows);
 
               documentsUpdated++;
               lineItemsUpdated += itemRows.length;
@@ -250,10 +250,10 @@ export class DocumentIndexerService {
       const updatedState: CacheState = {
         ...state,
         lastSync: now,
-        documentCount: this.cache.getDocumentCount(),
-        itemDocumentCount: this.cache.getItemDocumentCount(),
+        documentCount: await this.cache.getDocumentCount(),
+        itemDocumentCount: await this.cache.getItemDocumentCount(),
       };
-      this.cache.setCacheState(updatedState);
+      await this.cache.setCacheState(updatedState);
 
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
