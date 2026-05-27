@@ -1,11 +1,10 @@
 /**
  * PG → SQLite sync service unit tests
  *
- * Tests the schedule logic (shouldAutoSync) and the full pull flow
- * using two SQLite instances to simulate PG (since PG may not be available in CI).
+ * Tests the explicit pull flow using two SQLite instances to simulate PG
+ * since PG may not be available in CI.
  */
 
-import { shouldAutoSync } from '../pg-to-sqlite-sync.service.js';
 import { SQLiteCacheService } from '../sqlite-cache.service.js';
 import { DocumentContextId } from '../types.js';
 import type { DocumentRow } from '../types.js';
@@ -14,76 +13,6 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 
 describe('PgToSqliteSyncService', () => {
-  describe('shouldAutoSync', () => {
-    // Save/restore Date to mock time
-    const RealDate = global.Date;
-
-    afterEach(() => {
-      global.Date = RealDate;
-    });
-
-    function mockDate(day: number, hour: number) {
-      // day: 0=Sun, 1=Mon ... 6=Sat
-      const d = new RealDate(2026, 3, 5 + day, hour, 30, 0); // April 2026, Sun=5th
-      const MockDate = function (this: any, ...args: any[]) {
-        if (args.length === 0) return new RealDate(d.getTime());
-        return new (RealDate as any)(...args);
-      } as any;
-      MockDate.prototype = RealDate.prototype;
-      MockDate.now = () => d.getTime();
-      MockDate.parse = RealDate.parse;
-      MockDate.UTC = RealDate.UTC;
-      global.Date = MockDate;
-    }
-
-    it('should return true on weekday daytime with no previous sync', () => {
-      mockDate(1, 10); // Monday 10:00
-      expect(shouldAutoSync(null)).toBe(true);
-    });
-
-    it('should return true on weekday daytime with stale timestamp (> 1hr)', () => {
-      mockDate(3, 14); // Wednesday 14:00
-      const twoHoursAgo = Date.now() - 2 * 3600_000;
-      expect(shouldAutoSync(twoHoursAgo)).toBe(true);
-    });
-
-    it('should return false on weekday daytime with fresh timestamp (< 1hr)', () => {
-      mockDate(2, 12); // Tuesday 12:00
-      const thirtyMinAgo = Date.now() - 30 * 60_000;
-      expect(shouldAutoSync(thirtyMinAgo)).toBe(false);
-    });
-
-    it('should return false on weekend', () => {
-      mockDate(0, 12); // Sunday 12:00
-      expect(shouldAutoSync(null)).toBe(false);
-    });
-
-    it('should return false on Saturday', () => {
-      mockDate(6, 10); // Saturday 10:00
-      expect(shouldAutoSync(null)).toBe(false);
-    });
-
-    it('should return false before 8am on weekday', () => {
-      mockDate(1, 6); // Monday 6:00
-      expect(shouldAutoSync(null)).toBe(false);
-    });
-
-    it('should return false after 18h on weekday', () => {
-      mockDate(4, 20); // Thursday 20:00
-      expect(shouldAutoSync(null)).toBe(false);
-    });
-
-    it('should return true at exactly 8am on weekday', () => {
-      mockDate(5, 8); // Friday 8:00
-      expect(shouldAutoSync(null)).toBe(true);
-    });
-
-    it('should return true at exactly 18h on weekday', () => {
-      mockDate(1, 18); // Monday 18:00
-      expect(shouldAutoSync(null)).toBe(true);
-    });
-  });
-
   describe('SQLite ↔ SQLite pull simulation', () => {
     // Simulate PG→SQLite by using two SQLite instances
     let sourceDb: SQLiteCacheService;

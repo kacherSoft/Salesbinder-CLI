@@ -389,7 +389,7 @@ describe('CacheAnalyticsService', () => {
       },
       {
         doc_id: 'est-3',
-        issue_date: '2026-01-25',
+        issue_date: new Date().toISOString().split('T')[0],
         customer_id: 'cust-3',
         context_id: 4,
         doc_number: 102,

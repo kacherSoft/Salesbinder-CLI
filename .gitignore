@@ -37,3 +37,10 @@ coverage/
 
 # Config files (may contain API keys)
 *.local.json
+
+# Local SalesBinder exports and generated business reports
+data/
+plans/reports/sales-report-*.md
+
+# Temporary files
+_tmp_*

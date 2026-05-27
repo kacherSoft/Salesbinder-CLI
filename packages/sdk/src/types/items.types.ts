@@ -7,20 +7,46 @@ import type { ListParams, ListResponse } from './common.types.js';
 /** Item resource */
 export interface Item {
   id: string;
-  account_id: string;
+  account_id?: string;
   item_number: number;
   name: string;
   description?: string;
   serial_number?: string;
   sku?: string;
-  multiple: boolean;
+  barcode?: string;
+  multiple?: boolean;
   quantity: number;
   threshold: number;
   cost: number;
   price: number;
+  published?: boolean;
   category_id?: string;
+  category?: {
+    id?: string;
+    name?: string;
+  };
   created: string;
   modified: string;
+  location?: {
+    id?: string;
+    name?: string;
+  } | null;
+  item_variations?: ItemVariation[];
+}
+
+export interface ItemVariation {
+  id: string;
+  item_id: string;
+  quantity?: number;
+  item_variations_locations?: ItemVariationLocation[];
+}
+
+export interface ItemVariationLocation {
+  id?: number | string;
+  item_variation_id?: string;
+  location_id?: string;
+  quantity?: number;
+  threshold?: number;
 }
 
 /** Create item DTO */

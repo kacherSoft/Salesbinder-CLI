@@ -2,41 +2,26 @@
  * PG → SQLite sync service
  *
  * Pulls data from a shared PostgreSQL cache into the local SQLite mirror.
- * SQLite is always the read-side for analytics commands (fast, offline-capable).
+ * SQLite is the optional local mirror for offline reads.
  * PostgreSQL is the shared source of truth (populated by `cache sync`).
- *
- * Schedule logic: auto-sync only on weekdays, daytime (8–18h), at most once per hour.
  */
 
 import type { CacheService } from './cache.interface.js';
-import type { DocumentRow, ItemDocumentRow } from './types.js';
+import type { AccountRow, DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
 import { PostgresCacheService } from './postgres-cache.service.js';
 import { SQLiteCacheService } from './sqlite-cache.service.js';
 
 /** Result of a PG → SQLite pull */
 export interface PgPullResult {
   success: boolean;
+  accountsPulled: number;
   documentsPulled: number;
   itemDocumentsPulled: number;
+  itemsPulled: number;
+  stockRowsPulled: number;
   duration: string;
   skipped?: boolean;
   skipReason?: string;
-}
-
-/**
- * Determine whether an automatic PG → SQLite sync should run.
- * Rules: weekday (Mon–Fri), daytime (8:00–18:00 local), and last pull > 1 hour ago.
- */
-export function shouldAutoSync(lastPullTimestamp: number | null): boolean {
-  const now = new Date();
-  const day = now.getDay(); // 0=Sun, 6=Sat
-  const hour = now.getHours();
-  const isWeekday = day >= 1 && day <= 5;
-  const isDaytime = hour >= 8 && hour <= 18;
-  if (!isWeekday || !isDaytime) return false;
-  if (lastPullTimestamp === null) return true; // never synced
-  const elapsed = Date.now() - lastPullTimestamp;
-  return elapsed > 3600_000; // 1 hour
 }
 
 /**
@@ -63,12 +48,24 @@ export async function pullFromPostgres(
     // 1. Pull all documents from PG
     const allDocs = await getAllDocuments(pg);
     const allItems = await getAllItemDocuments(pg);
+    const allAccounts = await getAllAccounts(pg);
+    const allMasterItems = await getAllItems(pg);
+    const allStockRows = await getAllStockRows(pg);
     const pgState = await pg.getCacheState();
 
     // 2. Clear SQLite tables (order matters: items first due to FK)
     await clearSqliteTables(sqlite);
 
     // 3. Bulk-insert into SQLite
+    if (allAccounts.length > 0) {
+      await sqlite.batchInsertAccounts(allAccounts);
+    }
+    if (allMasterItems.length > 0) {
+      await sqlite.batchInsertItems(allMasterItems);
+    }
+    if (allStockRows.length > 0) {
+      await sqlite.batchInsertItemStockLocations(allStockRows);
+    }
     if (allDocs.length > 0) {
       await sqlite.batchInsertDocuments(allDocs);
     }
@@ -87,63 +84,16 @@ export async function pullFromPostgres(
 
     return {
       success: true,
+      accountsPulled: allAccounts.length,
       documentsPulled: allDocs.length,
       itemDocumentsPulled: allItems.length,
+      itemsPulled: allMasterItems.length,
+      stockRowsPulled: allStockRows.length,
       duration: `${duration}s`,
     };
   } finally {
     try { if (pg) await pg.close(); } catch { /* ignore */ }
     try { if (sqlite) await sqlite.close(); } catch { /* ignore */ }
-  }
-}
-
-/**
- * Try an automatic PG → SQLite sync if conditions are met.
- * Fails silently (returns skipped result) on connection errors.
- */
-export async function tryAutoSync(
-  pgConnectionString: string,
-  sqliteAccountName: string,
-  sqliteCustomPath?: string,
-): Promise<PgPullResult> {
-  // Check schedule
-  let sqlite: SQLiteCacheService | null = null;
-  try {
-    sqlite = new SQLiteCacheService(sqliteAccountName, sqliteCustomPath);
-    const lastPull = await getPgPullTimestamp(sqlite);
-    await sqlite.close();
-    sqlite = null;
-
-    if (!shouldAutoSync(lastPull)) {
-      return {
-        success: true,
-        documentsPulled: 0,
-        itemDocumentsPulled: 0,
-        duration: '0s',
-        skipped: true,
-        skipReason: lastPull === null
-          ? 'Outside sync window (weekday 8-18h)'
-          : 'Last pull is still fresh (< 1 hour)',
-      };
-    }
-  } catch {
-    // SQLite doesn't exist yet or other local error — proceed with pull
-    try { if (sqlite) await sqlite.close(); } catch { /* ignore */ }
-  }
-
-  // Try to pull
-  try {
-    return await pullFromPostgres(pgConnectionString, sqliteAccountName, sqliteCustomPath);
-  } catch (error: any) {
-    // Connection failed — fail silently
-    return {
-      success: false,
-      documentsPulled: 0,
-      itemDocumentsPulled: 0,
-      duration: '0s',
-      skipped: true,
-      skipReason: `PostgreSQL unreachable: ${error?.message || error}`,
-    };
   }
 }
 
@@ -153,6 +103,18 @@ export async function tryAutoSync(
 async function getAllDocuments(pg: PostgresCacheService): Promise<DocumentRow[]> {
   // Use getDocumentsModifiedSince(0) to get everything
   return pg.getDocumentsModifiedSince(0);
+}
+
+async function getAllAccounts(pg: PostgresCacheService): Promise<AccountRow[]> {
+  return pg.getAllAccounts();
+}
+
+async function getAllItems(pg: PostgresCacheService): Promise<ItemRow[]> {
+  return pg.getAllItems();
+}
+
+async function getAllStockRows(pg: PostgresCacheService): Promise<ItemStockLocationRow[]> {
+  return pg.getAllItemStockLocations();
 }
 
 /** Fetch all item_documents from PG */
@@ -171,10 +133,21 @@ async function getAllItemDocuments(pg: PostgresCacheService): Promise<Omit<ItemD
     for (const items of results) {
       for (const item of items) {
         allItems.push({
+          document_item_id: item.document_item_id,
           item_id: item.item_id,
           doc_id: item.doc_id,
           quantity: item.quantity,
           price: item.price,
+          item_name: item.item_name,
+          item_number: item.item_number,
+          item_sku: item.item_sku,
+          item_location: item.item_location,
+          line_description: item.line_description,
+          quantity_received: item.quantity_received,
+          cost: item.cost,
+          total_amount: item.total_amount,
+          discounted_price: item.discounted_price,
+          discount_percent: item.discount_percent,
         });
       }
     }
@@ -185,35 +158,7 @@ async function getAllItemDocuments(pg: PostgresCacheService): Promise<Omit<ItemD
 
 /** Clear SQLite data tables (preserving schema) */
 async function clearSqliteTables(sqlite: SQLiteCacheService): Promise<void> {
-  // Delete item_documents first (FK constraint), then documents, then meta
-  // Use the interface methods — delete all documents via getDocumentsModifiedSince(0)
-  const allDocs = await sqlite.getDocumentsModifiedSince(0);
-  if (allDocs.length > 0) {
-    const docIds = allDocs.map(d => d.doc_id);
-    // Delete in batches
-    const batchSize = 500;
-    for (let i = 0; i < docIds.length; i += batchSize) {
-      const batch = docIds.slice(i, i + batchSize);
-      await sqlite.batchDeleteDocuments(batch);
-    }
-  }
-}
-
-/** Read last PG pull timestamp from SQLite cache_meta */
-async function getPgPullTimestamp(sqlite: CacheService): Promise<number | null> {
-  // We use getCacheState to piggyback — but we need a separate key.
-  // Access the underlying db via a workaround: store in cache_meta via setCacheState wrapper
-  // Instead, use the sqlite instance directly if it exposes raw access.
-  // For clean interface usage, store it as part of CacheState isn't ideal.
-  // Let's use a convention: store 'pg_pull_timestamp' in cache_meta.
-  // Since CacheService doesn't expose raw meta access, we cast to SQLiteCacheService.
-  const sqliteService = sqlite as SQLiteCacheService;
-  if ('getRawMeta' in sqliteService) {
-    return (sqliteService as any).getRawMeta('pg_pull_timestamp');
-  }
-  // Fallback: check if cache state has a recent lastSync
-  const state = await sqlite.getCacheState();
-  return state ? state.lastSync * 1000 : null;
+  await sqlite.clearAll();
 }
 
 /** Store PG pull timestamp in SQLite cache_meta */

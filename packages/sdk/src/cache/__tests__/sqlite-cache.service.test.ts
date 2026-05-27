@@ -38,6 +38,28 @@ describe('SQLiteCacheService', () => {
     });
   });
 
+  describe('Cache metadata', () => {
+    it('stores and returns sync status', async () => {
+      const status = {
+        status: 'running' as const,
+        runId: 'run-1',
+        accountName: 'test-account',
+        syncTarget: 'sqlite' as const,
+        startedAt: 1770000000,
+        updatedAt: 1770000000,
+        message: 'Sync running',
+      };
+
+      await service.setSyncStatus(status);
+
+      expect(await service.getSyncStatus()).toEqual(status);
+    });
+
+    it('returns null when sync status has not been written', async () => {
+      expect(await service.getSyncStatus()).toBeNull();
+    });
+  });
+
   describe('Document CRUD', () => {
     const testDoc: DocumentRow = {
       doc_id: 'test-doc-1',
@@ -51,7 +73,8 @@ describe('SQLiteCacheService', () => {
     it('should insert and retrieve document', async () => {
       await service.insertDocument(testDoc);
       const retrieved = await service.getDocument('test-doc-1');
-      expect(retrieved).toEqual(testDoc);
+      expect(retrieved).toMatchObject(testDoc);
+      expect(retrieved?.cache_source).toBe('api');
     });
 
     it('should update existing document', async () => {

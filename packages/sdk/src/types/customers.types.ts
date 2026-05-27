@@ -26,6 +26,11 @@ export interface Customer {
   shipping_region?: string;
   shipping_country?: string;
   shipping_postal_code?: string;
+  vat_number?: string;
+  account_manager?: string;
+  label_name?: string;
+  archived?: boolean;
+  last_invoiced?: string | null;
   created: string;
   modified: string;
 }

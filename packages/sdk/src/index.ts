@@ -11,6 +11,7 @@ export * from './types/customers.types.js';
 export * from './types/documents.types.js';
 export * from './types/locations.types.js';
 export * from './types/categories.types.js';
+export * from './types/deleted-log.types.js';
 export * from './config/config.schema.js';
 
 // Export config loader

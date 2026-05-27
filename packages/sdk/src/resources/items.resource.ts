@@ -31,6 +31,9 @@ export class ItemsResource {
    */
   async get(id: string): Promise<Item> {
     const response = await this.client.get<{ item: Item }>(`/items/${id}.json`);
+    if (!response?.data?.item) {
+      throw new Error(`Invalid API response for item ${id}: missing item wrapper`);
+    }
     return response.data.item;
   }
 

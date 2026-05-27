@@ -6,7 +6,7 @@ Command-line interface for [SalesBinder API](https://www.salesbinder.com/api/) -
 
 - Full CRUD operations for Items, Customers, Documents, Locations, Categories
 - **Sales Analytics** with pluggable cache backend (SQLite local or PostgreSQL shared)
-- **Cache Management** with incremental sync and auto-refresh
+- **Cache Management** with incremental sync, explicit PostgreSQL writes, and optional SQLite mirror pulls
 - Secure credential storage (0600 permissions)
 - Multiple account support
 - Pagination and search filters
@@ -78,7 +78,8 @@ Configure when the cache is considered stale (default: 3600 seconds = 1 hour).
     }
   },
   "preferences": {
-    "cacheStaleSeconds": 7200
+    "cacheStaleSeconds": 7200,
+    "syncLookbackSeconds": 604800
   }
 }
 ```
@@ -89,6 +90,12 @@ export SALESBINDER_CACHE_STALE_SECONDS=7200  # 2 hours
 ```
 
 **Priority**: Environment variable > Config file > Default (3600s)
+
+### Sync Lookback
+
+Delta sync uses a lookback window so late SalesBinder edits are not missed. Default is `604800` seconds, or 7 days.
+
+Set `preferences.syncLookbackSeconds` in `~/.salesbinder/config.json` to tune this. The same lookback is applied to account, document, item, and deleted-log delta sync.
 
 ### Cache Backend
 
@@ -101,13 +108,15 @@ export SALESBINDER_DB_URL=postgres://user:pass@host:5432/salesbinder
 
 **Important:** the current shared PostgreSQL database name is **`salesbinder`**.
 
-When `SALESBINDER_DB_URL` is set, the CLI does **not** switch analytics to query PostgreSQL directly. Instead:
+When `SALESBINDER_DB_URL` is set, PostgreSQL is the shared source of truth.
 
-- **Read path / analytics:** always use **local SQLite mirror**
-- **`cache sync`:** SalesBinder API → PostgreSQL → local SQLite mirror
-- **`cache pull`:** PostgreSQL → local SQLite mirror
-- **PostgreSQL:** shared source of truth for cached documents
-- **SQLite:** local mirror for fast/offline-ish reads
+- **Writer path:** `cache sync` writes SalesBinder API deltas to PostgreSQL only
+- **Reader path:** set `SALESBINDER_READ_BACKEND=postgresql` so analytics read PostgreSQL directly
+- **Optional local mirror:** `cache pull` copies PostgreSQL → SQLite when offline/local reads are needed
+- **Optional sync-and-pull:** `cache sync --pull` writes PostgreSQL, then refreshes local SQLite
+- **Sync status:** `cache_meta.sync_status` records `running`, `success`, or `failed` so readers can detect an active writer
+
+PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `cache sync` do not start a background pull.
 
 The PostgreSQL schema is created automatically on first use.
 
@@ -118,6 +127,15 @@ The PostgreSQL schema is created automatically on first use.
 | Storage | `~/.salesbinder/cache/` | Remote database |
 | Sharing | Single machine | Multi-machine / shared |
 | Performance | Fast local reads | Shared state across machines |
+
+For reader agents:
+
+```bash
+export SALESBINDER_READ_BACKEND=postgresql
+node packages/cli/dist/cli.js --account phuthaitech analytics item-sales <item-id>
+```
+
+Reader agents may query while a writer sync is running. PostgreSQL keeps reads valid, but a report can include a small mix of old/new rows during a writer update. Check `cache status` and its `sync_status` field; if it is `running`, wait/retry for strict reporting.
 
 ### Getting Your API Key
 
@@ -253,7 +271,7 @@ node packages/cli/dist/cli.js categories delete <category-id>
 
 ### Analytics
 
-Generate sales analytics for items using the **local SQLite mirror** for fast queries. If `SALESBINDER_DB_URL` is set, PostgreSQL acts as the shared upstream cache, but analytics still read from SQLite.
+Generate sales analytics for items using the configured cache backend. By default analytics read the local SQLite mirror. Set `SALESBINDER_READ_BACKEND=postgresql` with `SALESBINDER_DB_URL` when reader agents should query the shared PostgreSQL source of truth directly.
 
 #### Basic Sales
 
@@ -388,7 +406,8 @@ node packages/cli/dist/cli.js analytics pricing <item-id>
 # Analyze customer concentration
 node packages/cli/dist/cli.js analytics customers <item-id>
 
-# With customer names (slower, requires API calls)
+# Cached customer names are used automatically when present.
+# This flag only fills old/null-name rows by API.
 node packages/cli/dist/cli.js analytics customers <item-id> --resolve-names
 
 # Output includes:
@@ -398,7 +417,7 @@ node packages/cli/dist/cli.js analytics customers <item-id> --resolve-names
 # - Customer segmentation (large/medium/small)
 ```
 
-**Example output (with `--resolve-names`):**
+**Example output:**
 ```json
 {
   "item_id": "abc123",
@@ -531,7 +550,7 @@ All analytics commands support:
 --resolve-names   # (customers only) Fetch customer names from API
 ```
 
-**Note:** `--resolve-names` makes additional API calls for each customer, which is slower but provides more readable output. Use without the flag for fastest results (customer IDs only).
+**Note:** customer names are cached by CSV import and forward sync. `--resolve-names` is now a fallback for old rows where `customer_name` is still null.
 
 #### Example Workflow
 
@@ -563,8 +582,15 @@ node packages/cli/dist/cli.js analytics patterns <item-id>
 Manage the cache backend (SQLite or PostgreSQL) for analytics data.
 
 ```bash
-# Sync cache (incremental by default)
+# Seed cache from local CSV exports without API calls
+node packages/cli/dist/cli.js --account phuthaitech cache import-export data/ --dry-run
+node packages/cli/dist/cli.js --account phuthaitech cache import-export data/
+
+# Sync cache (incremental by default; no local mirror pull unless --pull is used)
 node packages/cli/dist/cli.js cache sync
+
+# Sync cache and also refresh local SQLite mirror
+node packages/cli/dist/cli.js cache sync --pull
 
 # Force full resync (re-download all documents)
 node packages/cli/dist/cli.js cache sync --full
@@ -576,48 +602,83 @@ node packages/cli/dist/cli.js cache status
 node packages/cli/dist/cli.js cache clear
 ```
 
+The CSV import expects these local export files under the import directory: customers, suppliers, 2024/2025/2026 invoice line items, 2025-2026 PO line items, and inventory variations. The importer validates headers, reports counts/warnings only, and does not print customer, supplier, item, document, or price rows.
+
+Expected PhuthaiTech seed counts:
+
+| Dataset | Count |
+|---|---:|
+| Customers | 4,626 |
+| Suppliers | 822 |
+| Invoice documents | 28,925 |
+| Invoice line rows | 68,618 |
+| Purchase order documents | 5,535 |
+| Purchase order line rows | 13,010 |
+| Item master rows | 33,912 |
+| Stock location rows | 218,613 |
+
+Forward sync after the CSV seed caches modified customers/suppliers, invoices/POs/estimates, items, item stock locations from full item detail, and deleted-log removals by stable `record_id`.
+
 **Performance:**
-- First sync: 5-10 minutes (~33K documents)
-- Delta sync: <1 minute (changes only)
+- CSV import: local only, no historical API fetch
+- First API full sync: 5-10 minutes or more depending on account size
+- Delta sync to PostgreSQL: <1 minute for small change sets
+- PostgreSQL → SQLite full mirror pull: can take several minutes for large caches; run only when needed
 - Cached queries: <100ms
 - SQLite location: `~/.salesbinder/cache/salesbinder-<account>.db`
 - PostgreSQL: set via `SALESBINDER_DB_URL` env var (see [Cache Backend](#cache-backend))
 
 ## Recommended Workflow
 
-For daily operations involving item sales analytics:
+For daily operations involving item sales analytics with PostgreSQL as the source of truth:
 
 1. **Initial Setup** (one-time):
    ```bash
-   # Full sync to build cache
-   node packages/cli/dist/cli.js cache sync
+   # Seed historical data from local exports
+   node packages/cli/dist/cli.js --account phuthaitech cache import-export data/ --dry-run
+   node packages/cli/dist/cli.js --account phuthaitech cache import-export data/
+
+   # Then keep PostgreSQL fresh
+   node packages/cli/dist/cli.js --account phuthaitech cache sync
    ```
 
-2. **Daily Analytics** (fast, uses cached data):
+2. **Writer Agent**:
    ```bash
-   # Quick query from cache (auto-syncs if stale >1 hour)
+   # Fast incremental write: SalesBinder API -> PostgreSQL
+   node packages/cli/dist/cli.js --account phuthaitech cache sync
+   ```
+
+3. **Reader Agents**:
+   ```bash
+   # Read directly from PostgreSQL source of truth
+   export SALESBINDER_READ_BACKEND=postgresql
    node packages/cli/dist/cli.js analytics item-sales <item-id>
    ```
 
-3. **Weekly Maintenance**:
+4. **Optional Local Mirror**:
    ```bash
-   # Check cache status
-   node packages/cli/dist/cli.js cache status
-
-   # Manual refresh if needed
-   node packages/cli/dist/cli.js cache sync
+   # Refresh local SQLite only when offline/local reads are needed
+   node packages/cli/dist/cli.js --account phuthaitech cache pull
    ```
 
-4. **Adjust Stale Threshold** (optional):
+5. **Status Check**:
+   ```bash
+   # Shows backend counts, freshness, and sync_status
+   node packages/cli/dist/cli.js --account phuthaitech cache status
+   ```
+
+6. **Adjust Stale Threshold** (optional):
    - Set to 7200 (2 hours) for less frequent syncs
    - Set to 1800 (30 minutes) for fresher data
    - Use `SALESBINDER_CACHE_STALE_SECONDS` environment variable for per-session override
 
 **Why this workflow?**
-- Cache sync is the bottleneck (~5-10 minutes for full sync)
-- Cached queries are instant (<100ms)
-- Auto-sync only triggers when cache is stale
-- `--cached` flag skips sync check for fastest queries
+- CSV import avoids historical API fetches.
+- Delta sync only requests recent modified accounts/documents/items and deleted-log entries.
+- Cached queries are instant (<100ms).
+- Writer sync is explicit, so reader agents do not unexpectedly wait for PostgreSQL → SQLite pulls.
+- `cache status` shows `sync_status` when a strict report should wait for the writer to finish.
+- `--cached` flag skips sync check for fastest queries.
 - `--refresh` flag forces fresh data when needed
 
 ## Output Format
@@ -664,7 +725,8 @@ When using this CLI via AI agents (Claude, ChatGPT, etc.), the CLI provides comp
 | `salesbinder customers list` | Browse customers |
 | `salesbinder documents list` | Browse invoices/estimates |
 | `salesbinder analytics item-sales <id>` | Get item sales analytics |
-| `salesbinder cache sync` | Sync document cache |
+| `salesbinder cache sync` | Sync SalesBinder API deltas to the configured cache backend |
+| `salesbinder cache sync --pull` | Sync to PostgreSQL, then refresh local SQLite mirror |
 | `salesbinder cache status` | Check cache status |
 | `salesbinder --help` | Show all commands |
 | `salesbinder <command> --help` | Command-specific help |
@@ -736,7 +798,7 @@ salesbinder-cli/
 │   │   ├── src/
 │   │   │   ├── cache/
 │   │   │   │   ├── cache.interface.ts      # Unified CacheService interface
-│   │   │   │   ├── cache.factory.ts        # Always returns SQLite for reads; optionally auto-pulls from PostgreSQL
+│   │   │   │   ├── cache.factory.ts        # Selects SQLite or PostgreSQL read backend
 │   │   │   │   ├── sqlite-cache.service.ts # Local SQLite backend
 │   │   │   │   ├── postgres-cache.service.ts # Shared PostgreSQL backend
 │   │   │   │   ├── document-indexer.service.ts

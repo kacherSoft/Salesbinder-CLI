@@ -2,7 +2,18 @@
  * Cache service interface - abstracts SQLite and PostgreSQL implementations
  */
 
-import type { DocumentRow, ItemDocumentRow, CacheState, ItemSalesByPeriodRow, PriceDistributionRow, CustomerSalesData } from './types.js';
+import type {
+  AccountRow,
+  DocumentRow,
+  ItemDocumentRow,
+  ItemRow,
+  ItemStockLocationRow,
+  CacheState,
+  CacheSyncStatus,
+  ItemSalesByPeriodRow,
+  PriceDistributionRow,
+  CustomerSalesData,
+} from './types.js';
 
 /**
  * Unified cache service interface.
@@ -16,8 +27,11 @@ export interface CacheService {
 
   insertDocument(doc: DocumentRow): Promise<void>;
   getDocument(docId: string): Promise<DocumentRow | undefined>;
+  getDocumentByApiId(apiDocId: string): Promise<DocumentRow | undefined>;
+  getDocumentByNumber(contextId: number, docNumber: number): Promise<DocumentRow | undefined>;
   getDocumentsByContext(contextId: number): Promise<DocumentRow[]>;
   getDocumentsModifiedSince(timestamp: number): Promise<DocumentRow[]>;
+  getDocumentCountByContext(contextId: number): Promise<number>;
   deleteDocument(docId: string): Promise<void>;
   batchInsertDocuments(docs: DocumentRow[]): Promise<void>;
   batchDeleteDocuments(docIds: string[]): Promise<void>;
@@ -28,6 +42,35 @@ export interface CacheService {
   getItemDocuments(docId: string): Promise<ItemDocumentRow[]>;
   deleteItemDocuments(docId: string): Promise<void>;
   batchInsertItemDocuments(items: Omit<ItemDocumentRow, 'id'>[]): Promise<void>;
+
+  // ============ Account CRUD Operations ============
+
+  insertAccount(account: AccountRow): Promise<void>;
+  getAccount(accountId: string): Promise<AccountRow | undefined>;
+  getAccountByNumber(contextId: number, accountNumber: number): Promise<AccountRow | undefined>;
+  getAccountsByName(contextId: number, name: string): Promise<AccountRow[]>;
+  getAllAccounts(): Promise<AccountRow[]>;
+  getAccountsModifiedSince(timestamp: number): Promise<AccountRow[]>;
+  batchInsertAccounts(accounts: AccountRow[]): Promise<void>;
+  deleteAccount(accountId: string): Promise<void>;
+
+  // ============ Item CRUD Operations ============
+
+  insertItem(item: ItemRow): Promise<void>;
+  getItem(itemId: string): Promise<ItemRow | undefined>;
+  getAllItems(): Promise<ItemRow[]>;
+  getItemsModifiedSince(timestamp: number): Promise<ItemRow[]>;
+  batchInsertItems(items: ItemRow[]): Promise<void>;
+  deleteItem(itemId: string): Promise<void>;
+
+  // ============ Item Stock/Location Operations ============
+
+  insertItemStockLocation(row: ItemStockLocationRow): Promise<void>;
+  getItemStockLocations(itemId: string): Promise<ItemStockLocationRow[]>;
+  getAllItemStockLocations(): Promise<ItemStockLocationRow[]>;
+  replaceItemStockLocations(itemId: string, rows: ItemStockLocationRow[]): Promise<void>;
+  batchInsertItemStockLocations(rows: ItemStockLocationRow[]): Promise<void>;
+  deleteItemStockLocations(itemId: string): Promise<void>;
 
   // ============ Analytics Query Helpers ============
 
@@ -86,8 +129,14 @@ export interface CacheService {
 
   getCacheState(): Promise<CacheState | null>;
   setCacheState(state: CacheState): Promise<void>;
+  getSyncStatus(): Promise<CacheSyncStatus | null>;
+  setSyncStatus(status: CacheSyncStatus): Promise<void>;
   getDocumentCount(): Promise<number>;
   getItemDocumentCount(): Promise<number>;
+  getAccountCount(contextId?: number): Promise<number>;
+  getItemCount(): Promise<number>;
+  getStockLocationCount(): Promise<number>;
+  clearAll(): Promise<void>;
 
   // ============ Connection Management ============
 

@@ -62,6 +62,17 @@ export interface Document {
   status?: DocumentStatus;
   context?: DocumentContext;
   document_items?: DocumentItem[];
+  customer?: {
+    id?: string;
+    name?: string;
+    customer_number?: number;
+  };
+  user?: {
+    id?: string;
+    name?: string;
+    first_name?: string;
+    last_name?: string;
+  };
 }
 
 /** Create document item DTO */

@@ -115,8 +115,13 @@ Output includes:
 
         let itemName: string | undefined;
         try {
-          const item = await client.items.get(itemId);
-          itemName = item.name;
+          const cachedItem = await cache.getItem(itemId);
+          if (cachedItem?.name) {
+            itemName = cachedItem.name;
+          } else {
+            const item = await client.items.get(itemId);
+            itemName = item.name;
+          }
         } catch (error) {
           console.error(`Warning: Could not fetch item details: ${error}`);
         }
@@ -143,7 +148,9 @@ Output includes:
         if (options.resolveNames) {
           console.error('Fetching customer names...');
           for (const sales of customerSales) {
-            if (!customerNameMap.has(sales.customer_id)) {
+            if (sales.customer_name) {
+              customerNameMap.set(sales.customer_id, sales.customer_name);
+            } else if (!customerNameMap.has(sales.customer_id)) {
               try {
                 const customer = await client.customers.get(sales.customer_id);
                 customerNameMap.set(sales.customer_id, customer.name);
@@ -181,8 +188,8 @@ Output includes:
               order_count: c.order_count,
               avg_order_size: Math.round((c.quantity / c.order_count) * 100) / 100,
             };
-            if (options.resolveNames) {
-              customer.customer_name = customerNameMap.get(c.customer_id);
+            if (c.customer_name || options.resolveNames) {
+              customer.customer_name = c.customer_name ?? customerNameMap.get(c.customer_id);
             }
             return customer;
           }),

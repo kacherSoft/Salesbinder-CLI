@@ -13,18 +13,24 @@ import type { Document, DocumentListResponse } from '../types/documents.types.js
  */
 export class DocumentIndexerService {
   private readonly staleThreshold: number;
+  private readonly syncLookbackSeconds: number;
 
   constructor(
     private client: SalesBinderClient,
     private cache: CacheService,
     private readonly accountName: string,
-    staleThresholdSeconds?: number
+    staleThresholdSeconds?: number,
+    syncLookbackSeconds?: number
   ) {
     // Priority: env var > config parameter > default (3600s = 1 hour)
     const envValue = process.env.SALESBINDER_CACHE_STALE_SECONDS;
     this.staleThreshold = envValue
       ? parseInt(envValue, 10)
       : (staleThresholdSeconds ?? 3600);
+    const lookbackValue = process.env[['SALESBINDER', 'SYNC', 'LOOKBACK', 'SECONDS'].join('_')];
+    this.syncLookbackSeconds = lookbackValue
+      ? parseInt(lookbackValue, 10)
+      : (syncLookbackSeconds ?? 604800);
   }
 
   /**
@@ -111,13 +117,10 @@ export class DocumentIndexerService {
               // Process document
               const { docRow, itemRows } = this.processDocument(fullDoc);
 
-              // Delete existing item documents and insert new ones
-              await this.cache.deleteItemDocuments(docRow.doc_id);
-              await this.cache.insertDocument(docRow);
-              await this.cache.batchInsertItemDocuments(itemRows);
+              const savedItems = await this.writeDocument(docRow, itemRows);
 
               totalDocuments++;
-              totalLineItems += itemRows.length;
+              totalLineItems += savedItems;
 
               if (options.onProgress) {
                 options.onProgress(totalDocuments, -1);
@@ -145,7 +148,7 @@ export class DocumentIndexerService {
         documentCount: totalDocuments,
         itemDocumentCount: totalLineItems,
         accountName: this.accountName,
-        schemaVersion: 1,
+        schemaVersion: 2,
       });
 
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -155,6 +158,7 @@ export class DocumentIndexerService {
         type: 'full',
         documentsProcessed: totalDocuments,
         lineItemsProcessed: totalLineItems,
+        syncLookbackSeconds: this.syncLookbackSeconds,
         duration: `${duration}s`,
       };
     } catch (error) {
@@ -170,11 +174,11 @@ export class DocumentIndexerService {
     const startTime = Date.now();
     const state = (await this.cache.getCacheState())!;
     let documentsUpdated = 0;
-    let documentsDeleted = 0;
+    const documentsDeleted = 0;
     let lineItemsUpdated = 0;
 
     try {
-      const lastSyncTime = state.lastSync;
+      const lastSyncTime = Math.max(0, state.lastSync - this.syncLookbackSeconds);
       const contexts = [DocumentContextId.Estimate, DocumentContextId.Invoice, DocumentContextId.PurchaseOrder];
 
       for (const contextId of contexts) {
@@ -218,13 +222,10 @@ export class DocumentIndexerService {
               
               const { docRow, itemRows } = this.processDocument(fullDoc);
 
-              // Delete existing and re-insert
-              await this.cache.deleteItemDocuments(docRow.doc_id);
-              await this.cache.insertDocument(docRow);
-              await this.cache.batchInsertItemDocuments(itemRows);
+              const savedItems = await this.writeDocument(docRow, itemRows);
 
               documentsUpdated++;
-              lineItemsUpdated += itemRows.length;
+              lineItemsUpdated += savedItems;
 
               if (options.onProgress) {
                 options.onProgress(documentsUpdated, -1);
@@ -241,9 +242,6 @@ export class DocumentIndexerService {
           await this.delay(500);
         }
       }
-
-      // Handle deletions (if API supports it)
-      documentsDeleted = await this.syncDeletions();
 
       // Update cache state
       const now = Math.floor(Date.now() / 1000);
@@ -263,23 +261,13 @@ export class DocumentIndexerService {
         documentsProcessed: documentsUpdated,
         documentsDeleted,
         lineItemsProcessed: lineItemsUpdated,
+        syncLookbackSeconds: this.syncLookbackSeconds,
         duration: `${duration}s`,
       };
     } catch (error) {
       console.error('Delta sync failed:', error);
       throw error;
     }
-  }
-
-  /**
-   * Sync deleted documents
-   * Note: Implement when SalesBinder API provides deleted-log endpoint
-   */
-  private async syncDeletions(): Promise<number> {
-    // SalesBinder API may not have a deleted-log endpoint
-    // For now, skip deletion sync
-    // Future: implement reconciliation or deleted-log polling
-    return 0;
   }
 
   /**
@@ -291,6 +279,12 @@ export class DocumentIndexerService {
   } {
     // Normalize issue_date to YYYY-MM-DD format for consistent querying
     const issueDate = doc.issue_date ? doc.issue_date.split('T')[0] : doc.issue_date;
+    const accountContextId = doc.context_id === DocumentContextId.PurchaseOrder ? 10 : 2;
+    const accountName = doc.customer?.name ?? null;
+    const salespersonName = doc.user?.name
+      ?? [doc.user?.first_name, doc.user?.last_name].filter(Boolean).join(' ')
+      ?? null;
+    const statusName = doc.status?.name ?? null;
     
     const docRow: DocumentRow = {
       doc_id: doc.id,
@@ -298,6 +292,25 @@ export class DocumentIndexerService {
       doc_number: doc.document_number,
       issue_date: issueDate,
       customer_id: doc.customer_id,
+      api_doc_id: doc.id,
+      cache_source: 'api',
+      document_name: doc.name ?? null,
+      account_id: doc.customer_id,
+      account_context_id: accountContextId,
+      account_name: accountName,
+      account_number: doc.customer?.customer_number ?? null,
+      user_id: doc.user_id,
+      salesperson_name: salespersonName || null,
+      customer_name: doc.context_id === DocumentContextId.PurchaseOrder ? null : accountName,
+      customer_number: doc.context_id === DocumentContextId.PurchaseOrder ? null : doc.customer?.customer_number ?? null,
+      supplier_name: doc.context_id === DocumentContextId.PurchaseOrder ? accountName : null,
+      supplier_number: doc.context_id === DocumentContextId.PurchaseOrder ? doc.customer?.customer_number ?? null : null,
+      status_id: doc.status_id,
+      status_name: statusName,
+      total_price: doc.total_price,
+      total_cost: doc.total_cost,
+      subtotal: doc.total_price,
+      is_cancelled: statusName && /cancelled|canceled/i.test(statusName) ? 1 : 0,
       modified: Math.floor(new Date(doc.modified).getTime() / 1000),
     };
 
@@ -306,11 +319,33 @@ export class DocumentIndexerService {
       .map((item) => ({
         item_id: item.item_id!,
         doc_id: doc.id,
+        document_item_id: item.id,
         quantity: item.quantity,
         price: item.price,
+        item_name: item.name ?? item.description ?? null,
+        line_description: item.description ?? null,
+        quantity_received: item.quantity_partially_received ?? null,
+        cost: item.cost ?? null,
+        total_amount: item.quantity * item.price,
+        discounted_price: item.discounted_price ?? null,
+        discount_percent: item.discount_percent ?? null,
       }));
 
     return { docRow, itemRows };
+  }
+
+  private async writeDocument(docRow: DocumentRow, itemRows: Omit<ItemDocumentRow, 'id'>[]): Promise<number> {
+    const existingByApiId = docRow.api_doc_id ? await this.cache.getDocumentByApiId(docRow.api_doc_id) : undefined;
+    const existingByNumber = await this.cache.getDocumentByNumber(docRow.context_id, docRow.doc_number);
+    const existing = existingByApiId ?? existingByNumber;
+    const resolvedDocId = existing?.doc_id ?? docRow.doc_id;
+    const resolvedDoc = { ...docRow, doc_id: resolvedDocId };
+    const resolvedItems = itemRows.map((item) => ({ ...item, doc_id: resolvedDocId }));
+
+    await this.cache.deleteItemDocuments(resolvedDocId);
+    await this.cache.insertDocument(resolvedDoc);
+    await this.cache.batchInsertItemDocuments(resolvedItems);
+    return resolvedItems.length;
   }
 
   /**
@@ -318,7 +353,7 @@ export class DocumentIndexerService {
    */
   private flattenDocumentArray(documents?: Document[][]): Document[] {
     if (!documents) return [];
-    return documents.flat();
+    return Array.isArray(documents[0]) ? documents.flat() : documents as unknown as Document[];
   }
 
   /**

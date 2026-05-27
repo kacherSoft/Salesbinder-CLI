@@ -22,6 +22,8 @@ export interface Preferences {
   timeout?: number;
   /** Cache stale threshold in seconds (default: 3600 = 1 hour) */
   cacheStaleSeconds?: number;
+  /** Delta sync lookback in seconds (default: 604800 = 7 days) */
+  syncLookbackSeconds?: number;
 }
 
 /** Complete configuration file structure */

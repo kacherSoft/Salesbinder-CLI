@@ -9,6 +9,7 @@ import { CustomersResource } from './customers.resource.js';
 import { DocumentsResource } from './documents.resource.js';
 import { LocationsResource } from './locations.resource.js';
 import { CategoriesResource } from './categories.resource.js';
+import { DeletedLogResource } from './deleted-log.resource.js';
 
 /**
  * SalesBinder SDK client
@@ -25,6 +26,8 @@ export class SalesBinderClient {
   readonly locations: LocationsResource;
   /** Categories resource */
   readonly categories: CategoriesResource;
+  /** Deleted log resource */
+  readonly deletedLog: DeletedLogResource;
 
   constructor(accountName?: string) {
     const account = loadConfig(accountName);
@@ -35,6 +38,7 @@ export class SalesBinderClient {
     this.documents = new DocumentsResource(client);
     this.locations = new LocationsResource(client);
     this.categories = new CategoriesResource(client);
+    this.deletedLog = new DeletedLogResource(client);
   }
 }
 
@@ -45,4 +49,5 @@ export * from '../types/customers.types.js';
 export * from '../types/documents.types.js';
 export * from '../types/locations.types.js';
 export * from '../types/categories.types.js';
+export * from '../types/deleted-log.types.js';
 export * from '../config/config.schema.js';
