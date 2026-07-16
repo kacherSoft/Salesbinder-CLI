@@ -13,6 +13,7 @@ export interface DocumentItem {
   description?: string;
   quantity: number;
   quantity_partially_received: number;
+  quantity_partially_shipped?: number | null;
   tax: number;
   tax2: number;
   discount_percent: number;
@@ -51,6 +52,7 @@ export interface Document {
   issue_date: string;
   expiry_date?: string | null;
   date_sent?: string | null;
+  shipped_percent?: number | null;
   status_id: number;
   total_cost: number;
   total_tax: number;

@@ -4,7 +4,11 @@
 
 export * from './types.js';
 export type { CacheService } from './cache.interface.js';
-export { SQLiteCacheService } from './sqlite-cache.service.js';
+export {
+  SQLiteCacheService,
+  tryAcquireSQLiteCacheMaintenanceLock,
+} from './sqlite-cache.service.js';
+export type { SQLiteCacheMaintenanceLease } from './sqlite-cache.service.js';
 export { PostgresCacheService } from './postgres-cache.service.js';
 export { createCacheService, createPostgresCacheService, getPostgresReadUrl } from './cache.factory.js';
 export { pullFromPostgres } from './pg-to-sqlite-sync.service.js';

@@ -3,25 +3,27 @@
  */
 
 import Database from 'better-sqlite3';
-import { mkdirSync, chmodSync, existsSync } from 'fs';
-import { join } from 'path';
+import { mkdirSync, chmodSync, existsSync, realpathSync } from 'fs';
+import { basename, dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import type { CacheService } from './cache.interface.js';
+import { CACHE_SCHEMA_VERSION } from './types.js';
 import type {
   AccountRow,
+  CacheMirrorSnapshot,
   CacheMetaRow,
   CacheState,
   CacheSyncStatus,
   CustomerSalesData,
+  DocumentNonItemLineRow,
   DocumentRow,
+  DocumentSnapshot,
   ItemDocumentRow,
   ItemRow,
   ItemSalesByPeriodRow,
   ItemStockLocationRow,
   PriceDistributionRow,
 } from './types.js';
-
-const SCHEMA_VERSION = 2;
 
 const DOCUMENT_COLUMNS = [
   'doc_id', 'context_id', 'doc_number', 'issue_date', 'customer_id', 'modified',
@@ -30,13 +32,23 @@ const DOCUMENT_COLUMNS = [
   'user_id', 'salesperson_name', 'customer_name', 'customer_number',
   'supplier_name', 'supplier_number', 'status_id', 'status_name',
   'total_price', 'total_cost', 'subtotal', 'associated_document_id',
-  'external_po_number', 'shipping_location', 'is_cancelled', 'imported_at',
+  'external_po_number', 'shipping_location', 'date_sent', 'shipped_percent',
+  'shipment_checked_at', 'source_fetched_at', 'snapshot_version',
+  'snapshot_complete', 'is_cancelled', 'imported_at',
 ] as const;
 
 const ITEM_DOCUMENT_COLUMNS = [
   'item_id', 'doc_id', 'quantity', 'price', 'document_item_id', 'item_name',
   'item_number', 'item_sku', 'item_location', 'line_description',
   'quantity_received', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
+  'quantity_shipped',
+] as const;
+
+const DOCUMENT_NON_ITEM_LINE_COLUMNS = [
+  'doc_id', 'document_item_id', 'line_type', 'name', 'line_description',
+  'service_category_id', 'unit_id', 'quantity', 'price', 'cost', 'total_amount',
+  'discounted_price', 'discount_percent', 'net_amount', 'tax', 'tax2', 'weight',
+  'source_created', 'source_modified', 'raw_classification',
 ] as const;
 
 const ACCOUNT_COLUMNS = [
@@ -62,16 +74,72 @@ const STOCK_COLUMNS = [
   'price', 'cost', 'valuation', 'barcode', 'cache_source', 'imported_at',
 ] as const;
 
+export interface SQLiteCacheMaintenanceLease {
+  release(): void;
+}
+
+export function tryAcquireSQLiteCacheMaintenanceLock(dbPath: string): SQLiteCacheMaintenanceLease | null {
+  const canonicalDbPath = canonicalizeSQLiteCachePath(dbPath);
+  const lockPath = `${canonicalDbPath}.maintenance-lock`;
+  const lockDb = new Database(lockPath, { timeout: 0 });
+  lockDb.pragma('busy_timeout = 0');
+
+  try {
+    lockDb.exec('BEGIN EXCLUSIVE');
+    lockDb.exec('CREATE TABLE IF NOT EXISTS maintenance_lock (id INTEGER PRIMARY KEY)');
+    try { chmodSync(lockPath, 0o600); } catch { /* ignore */ }
+  } catch (error) {
+    try { lockDb.close(); } catch { /* ignore */ }
+    if (isSQLiteLockError(error)) return null;
+    throw error;
+  }
+
+  let released = false;
+  return {
+    release(): void {
+      if (released) return;
+      released = true;
+      try {
+        lockDb.exec('COMMIT');
+      } catch {
+        try { lockDb.exec('ROLLBACK'); } catch { /* ignore */ }
+      } finally {
+        lockDb.close();
+      }
+    },
+  };
+}
+
 export class SQLiteCacheService implements CacheService {
-  private db: Database.Database;
+  private db!: Database.Database;
   private readonly accountName: string;
   private readonly dbPath: string;
+  private readonly writer: boolean;
+  private maintenanceLease: SQLiteCacheMaintenanceLease | null = null;
 
-  constructor(accountName: string, customPath?: string) {
+  constructor(accountName: string, customPath?: string, acquireMaintenanceLock = false) {
     this.accountName = this.sanitizeAccountName(accountName);
     this.dbPath = customPath || this.resolveCachePath(this.accountName);
-    this.db = this.connect();
-    this.initializeSchema();
+    this.writer = acquireMaintenanceLock;
+    if (acquireMaintenanceLock) {
+      this.maintenanceLease = tryAcquireSQLiteCacheMaintenanceLock(this.dbPath);
+      if (!this.maintenanceLease) {
+        throw new Error('Another SQLite cache writer is already running.');
+      }
+    }
+    try {
+      this.db = this.connect();
+      if (this.writer) {
+        this.initializeSchema();
+      } else {
+        this.validateReadonlySchema();
+      }
+    } catch (error) {
+      if (this.db?.open) this.db.close();
+      this.maintenanceLease?.release();
+      this.maintenanceLease = null;
+      throw error;
+    }
   }
 
   private sanitizeAccountName(name: string): string {
@@ -80,35 +148,72 @@ export class SQLiteCacheService implements CacheService {
 
   private resolveCachePath(accountName: string): string {
     const cacheDir = join(homedir(), '.salesbinder', 'cache');
-    mkdirSync(cacheDir, { mode: 0o700, recursive: true });
     return join(cacheDir, `salesbinder-${accountName}.db`);
   }
 
   private connect(): Database.Database {
     const debugSql = process.env['DEBUG'] === 'true';
     const db = new Database(this.dbPath, {
-      fileMustExist: false,
+      readonly: !this.writer,
+      fileMustExist: !this.writer,
       verbose: debugSql ? console.log : undefined,
     });
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
-    if (existsSync(this.dbPath)) {
-      try { chmodSync(this.dbPath, 0o600); } catch { /* ignore */ }
+    try {
+      db.function(
+        'salesbinder_cache_writer_version',
+        { deterministic: true },
+        () => this.maintenanceLease ? CACHE_SCHEMA_VERSION : 0
+      );
+      if (this.writer) {
+        db.pragma('journal_mode = WAL');
+        db.pragma('foreign_keys = ON');
+        if (existsSync(this.dbPath)) {
+          try { chmodSync(this.dbPath, 0o600); } catch { /* ignore */ }
+        }
+      } else {
+        db.pragma('query_only = ON');
+      }
+      return db;
+    } catch (error) {
+      db.close();
+      throw error;
     }
-    return db;
+  }
+
+  private validateReadonlySchema(): void {
+    const currentVersion = this.db.pragma('user_version', { simple: true }) as number;
+    if (currentVersion !== CACHE_SCHEMA_VERSION) {
+      throw new Error(
+        `SQLite cache schema version ${currentVersion} is not readable; expected ${CACHE_SCHEMA_VERSION}. `
+        + 'Run a cache writer to initialize or migrate it.'
+      );
+    }
   }
 
   private initializeSchema(): void {
     const currentVersion = this.db.pragma('user_version', { simple: true }) as number;
+    if (currentVersion > CACHE_SCHEMA_VERSION) {
+      throw new Error(
+        `SQLite cache schema version ${currentVersion} is newer than supported version ${CACHE_SCHEMA_VERSION}.`
+      );
+    }
+    const shouldPublishVersion = currentVersion < CACHE_SCHEMA_VERSION;
     if (currentVersion === 0) {
       this.createSchema();
+      // Some legacy cache files predate PRAGMA user_version. Make their
+      // existing tables additive-compatible before creating v3 indexes.
+      this.addDocumentColumns();
+      this.addItemDocumentColumns();
+      this.addDocumentSnapshotColumns();
+      this.addItemShipmentColumns();
+      this.assertUniqueSourceLines();
       this.createIndexes();
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
-      return;
-    }
-    if (currentVersion < SCHEMA_VERSION) {
+    } else if (currentVersion < CACHE_SCHEMA_VERSION) {
       this.migrateSchema(currentVersion);
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    }
+    this.createCompletenessTriggers();
+    if (shouldPublishVersion) {
+      this.db.pragma(`user_version = ${CACHE_SCHEMA_VERSION}`);
     }
   }
 
@@ -175,6 +280,12 @@ export class SQLiteCacheService implements CacheService {
         associated_document_id TEXT NULL,
         external_po_number TEXT NULL,
         shipping_location TEXT NULL,
+        date_sent TEXT NULL,
+        shipped_percent REAL NULL,
+        shipment_checked_at TEXT NULL,
+        source_fetched_at INTEGER NULL,
+        snapshot_version INTEGER NOT NULL DEFAULT 0,
+        snapshot_complete INTEGER NOT NULL DEFAULT 0,
         is_cancelled INTEGER NOT NULL DEFAULT 0,
         imported_at INTEGER NULL,
         UNIQUE(context_id, doc_number)
@@ -197,6 +308,32 @@ export class SQLiteCacheService implements CacheService {
         total_amount REAL NULL,
         discounted_price REAL NULL,
         discount_percent REAL NULL,
+        quantity_shipped REAL NULL,
+        FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS document_non_item_lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id TEXT NOT NULL,
+        document_item_id TEXT NOT NULL,
+        line_type TEXT NOT NULL DEFAULT 'non_item',
+        name TEXT NULL,
+        line_description TEXT NULL,
+        service_category_id TEXT NULL,
+        unit_id TEXT NULL,
+        quantity REAL NOT NULL,
+        price REAL NOT NULL,
+        cost REAL NULL,
+        total_amount REAL NOT NULL,
+        discounted_price REAL NULL,
+        discount_percent REAL NULL,
+        net_amount REAL NOT NULL,
+        tax REAL NULL,
+        tax2 REAL NULL,
+        weight REAL NULL,
+        source_created TEXT NULL,
+        source_modified TEXT NULL,
+        raw_classification TEXT NULL,
         FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
       );
 
@@ -261,6 +398,12 @@ export class SQLiteCacheService implements CacheService {
       this.createSchema();
       this.addDocumentColumns();
       this.addItemDocumentColumns();
+    }
+    if (fromVersion < 3) {
+      this.createSchema();
+      this.addDocumentSnapshotColumns();
+      this.addItemShipmentColumns();
+      this.assertUniqueSourceLines();
       this.createIndexes();
     }
   }
@@ -310,6 +453,55 @@ export class SQLiteCacheService implements CacheService {
     ]);
   }
 
+  private addDocumentSnapshotColumns(): void {
+    this.addColumnsIfMissing('documents', [
+      ['date_sent', 'TEXT NULL'],
+      ['shipped_percent', 'REAL NULL'],
+      ['shipment_checked_at', 'TEXT NULL'],
+      ['source_fetched_at', 'INTEGER NULL'],
+      ['snapshot_version', 'INTEGER NOT NULL DEFAULT 0'],
+      ['snapshot_complete', 'INTEGER NOT NULL DEFAULT 0'],
+    ]);
+  }
+
+  private addItemShipmentColumns(): void {
+    this.addColumnsIfMissing('item_documents', [
+      ['quantity_shipped', 'REAL NULL'],
+    ]);
+  }
+
+  private assertUniqueSourceLines(): void {
+    const invalid = this.db.prepare(`
+      SELECT doc_id, document_item_id
+        FROM (
+          SELECT doc_id, document_item_id FROM item_documents WHERE document_item_id IS NOT NULL
+          UNION ALL
+          SELECT doc_id, document_item_id FROM document_non_item_lines
+        )
+       WHERE TRIM(document_item_id) = ''
+       LIMIT 1
+    `).get() as { doc_id: string; document_item_id: string } | undefined;
+    if (invalid) {
+      throw new Error(`Cannot migrate cache schema: blank document line source id in ${invalid.doc_id}`);
+    }
+    const duplicate = this.db.prepare(`
+      SELECT doc_id, document_item_id
+        FROM (
+          SELECT doc_id, document_item_id FROM item_documents WHERE document_item_id IS NOT NULL
+          UNION ALL
+          SELECT doc_id, document_item_id FROM document_non_item_lines
+        )
+       GROUP BY doc_id, document_item_id
+      HAVING COUNT(*) > 1
+       LIMIT 1
+    `).get() as { doc_id: string; document_item_id: string } | undefined;
+    if (duplicate) {
+      throw new Error(
+        `Cannot migrate cache schema: duplicate document line ${duplicate.document_item_id} in ${duplicate.doc_id}`
+      );
+    }
+  }
+
   private addColumnsIfMissing(table: string, specs: Array<[string, string]>): void {
     const existing = new Set(
       (this.db.pragma(`table_info(${table})`) as Array<{ name: string }>).map((col) => col.name)
@@ -338,6 +530,11 @@ export class SQLiteCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_name ON item_documents(item_name);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_number ON item_documents(item_number);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_sku ON item_documents(item_sku);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_item_documents_source_line
+        ON item_documents(doc_id, document_item_id) WHERE document_item_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_document_non_item_lines_doc ON document_non_item_lines(doc_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_document_non_item_lines_source_line
+        ON document_non_item_lines(doc_id, document_item_id) WHERE document_item_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_accounts_context_number ON accounts(context_id, account_number);
       CREATE INDEX IF NOT EXISTS idx_accounts_context_name ON accounts(context_id, name);
       CREATE INDEX IF NOT EXISTS idx_accounts_modified ON accounts(modified);
@@ -348,6 +545,95 @@ export class SQLiteCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_items_item_number ON items(item_number);
       CREATE INDEX IF NOT EXISTS idx_stock_item ON item_stock_locations(item_id);
       CREATE INDEX IF NOT EXISTS idx_stock_location ON item_stock_locations(location_id);
+    `);
+  }
+
+  private createCompletenessTriggers(): void {
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_documents_writer_v3_insert
+      BEFORE INSERT ON documents
+      WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
+      BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_documents_writer_v3_update
+      BEFORE UPDATE ON documents
+      WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
+      BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_documents_writer_v3_delete
+      BEFORE DELETE ON documents
+      WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
+      BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_item_documents_writer_v3_insert
+      BEFORE INSERT ON item_documents
+      WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
+      BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_item_documents_writer_v3_update
+      BEFORE UPDATE ON item_documents
+      WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
+      BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_item_documents_writer_v3_delete
+      BEFORE DELETE ON item_documents
+      WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
+      BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_non_item_lines_writer_v3_insert
+      BEFORE INSERT ON document_non_item_lines
+      WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
+      BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_non_item_lines_writer_v3_update
+      BEFORE UPDATE ON document_non_item_lines
+      WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
+      BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_non_item_lines_writer_v3_delete
+      BEFORE DELETE ON document_non_item_lines
+      WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
+      BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_documents_financial_snapshot_incomplete
+      AFTER UPDATE OF context_id, doc_number, total_price, total_cost, subtotal ON documents
+      WHEN OLD.context_id IS NOT NEW.context_id
+        OR OLD.doc_number IS NOT NEW.doc_number
+        OR OLD.total_price IS NOT NEW.total_price
+        OR OLD.total_cost IS NOT NEW.total_cost
+        OR OLD.subtotal IS NOT NEW.subtotal
+      BEGIN
+        UPDATE documents SET snapshot_complete = 0 WHERE doc_id = NEW.doc_id;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_item_documents_insert_snapshot_incomplete
+      AFTER INSERT ON item_documents
+      BEGIN
+        UPDATE documents SET snapshot_complete = 0 WHERE doc_id = NEW.doc_id AND snapshot_complete <> 0;
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_item_documents_delete_snapshot_incomplete
+      AFTER DELETE ON item_documents
+      BEGIN
+        UPDATE documents SET snapshot_complete = 0 WHERE doc_id = OLD.doc_id AND snapshot_complete <> 0;
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_item_documents_financial_update_snapshot_incomplete
+      AFTER UPDATE OF item_id, doc_id, document_item_id, quantity, price, cost,
+        total_amount, discounted_price, discount_percent ON item_documents
+      BEGIN
+        UPDATE documents SET snapshot_complete = 0
+         WHERE doc_id IN (OLD.doc_id, NEW.doc_id) AND snapshot_complete <> 0;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_non_item_lines_insert_snapshot_incomplete
+      AFTER INSERT ON document_non_item_lines
+      BEGIN
+        UPDATE documents SET snapshot_complete = 0 WHERE doc_id = NEW.doc_id AND snapshot_complete <> 0;
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_non_item_lines_delete_snapshot_incomplete
+      AFTER DELETE ON document_non_item_lines
+      BEGIN
+        UPDATE documents SET snapshot_complete = 0 WHERE doc_id = OLD.doc_id AND snapshot_complete <> 0;
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_non_item_lines_update_snapshot_incomplete
+      AFTER UPDATE ON document_non_item_lines
+      BEGIN
+        UPDATE documents SET snapshot_complete = 0
+         WHERE doc_id IN (OLD.doc_id, NEW.doc_id) AND snapshot_complete <> 0;
+      END;
     `);
   }
 
@@ -406,6 +692,78 @@ export class SQLiteCacheService implements CacheService {
     return Promise.resolve();
   }
 
+  replaceDocumentSnapshot(snapshot: DocumentSnapshot): Promise<void> {
+    this.validateDocumentSnapshot(snapshot);
+    const replace = this.db.transaction((incoming: DocumentSnapshot) => {
+      const sourceDoc = incoming.document;
+      const existingByApiId = sourceDoc.api_doc_id ? this.db
+        .prepare(`SELECT * FROM documents WHERE api_doc_id = ?`)
+        .get(sourceDoc.api_doc_id) as DocumentRow | undefined : undefined;
+      const existingByNumber = this.db
+        .prepare(`SELECT * FROM documents WHERE context_id = ? AND doc_number = ?`)
+        .get(sourceDoc.context_id, sourceDoc.doc_number) as DocumentRow | undefined;
+      const existing = existingByApiId ?? existingByNumber;
+      const docId = existing?.doc_id ?? sourceDoc.doc_id;
+      const existingLines = this.db
+        .prepare(`SELECT * FROM item_documents WHERE doc_id = ?`)
+        .all(docId) as ItemDocumentRow[];
+      const existingBySourceId = new Map(
+        existingLines
+          .filter((line) => line.document_item_id)
+          .map((line) => [line.document_item_id!, line])
+      );
+      const preserveReconciledShipment = isShipmentNewer(existing?.shipment_checked_at, incoming.sourceFetchedAt);
+      const resolvedDocument: DocumentRow = {
+        ...sourceDoc,
+        doc_id: docId,
+        date_sent: preserveReconciledShipment
+          ? existing?.date_sent ?? sourceDoc.date_sent ?? null
+          : authoritativeShipmentValue(sourceDoc.date_sent, existing?.date_sent),
+        shipped_percent: preserveReconciledShipment
+          ? existing?.shipped_percent ?? sourceDoc.shipped_percent ?? null
+          : authoritativeShipmentValue(sourceDoc.shipped_percent, existing?.shipped_percent),
+        shipment_checked_at: existing?.shipment_checked_at ?? null,
+        source_fetched_at: incoming.sourceFetchedAt,
+        snapshot_version: CACHE_SCHEMA_VERSION,
+        snapshot_complete: 0,
+      };
+      const resolvedItems = incoming.itemLines.map((line) => {
+        const existingLine = line.document_item_id
+          ? existingBySourceId.get(line.document_item_id)
+          : undefined;
+        return {
+          ...line,
+          doc_id: docId,
+          quantity_shipped: preserveReconciledShipment
+            ? existingLine?.quantity_shipped ?? line.quantity_shipped ?? null
+            : authoritativeShipmentValue(line.quantity_shipped, existingLine?.quantity_shipped),
+        };
+      });
+      const resolvedNonItemLines = incoming.nonItemLines.map((line) => ({ ...line, doc_id: docId }));
+
+      this.db.prepare(this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'))
+        .run(...this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(resolvedDocument)));
+      this.db.prepare(`DELETE FROM item_documents WHERE doc_id = ?`).run(docId);
+      this.db.prepare(`DELETE FROM document_non_item_lines WHERE doc_id = ?`).run(docId);
+
+      const insertItem = this.db.prepare(
+        `INSERT INTO item_documents (${ITEM_DOCUMENT_COLUMNS.join(', ')}) VALUES (${ITEM_DOCUMENT_COLUMNS.map(() => '?').join(', ')})`
+      );
+      for (const line of resolvedItems) {
+        insertItem.run(...this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(line)));
+      }
+      const insertNonItem = this.db.prepare(
+        `INSERT INTO document_non_item_lines (${DOCUMENT_NON_ITEM_LINE_COLUMNS.join(', ')}) VALUES (${DOCUMENT_NON_ITEM_LINE_COLUMNS.map(() => '?').join(', ')})`
+      );
+      for (const line of resolvedNonItemLines) {
+        insertNonItem.run(...this.valuesFor(DOCUMENT_NON_ITEM_LINE_COLUMNS, this.normalizeDocumentNonItemLine(line)));
+      }
+      this.db.prepare(`UPDATE documents SET snapshot_complete = 1 WHERE doc_id = ?`).run(docId);
+    });
+    replace.immediate(snapshot);
+    return Promise.resolve();
+  }
+
   insertItemDocument(item: Omit<ItemDocumentRow, 'id'>): Promise<void> {
     const stmt = this.db.prepare(`INSERT INTO item_documents (${ITEM_DOCUMENT_COLUMNS.join(', ')}) VALUES (${ITEM_DOCUMENT_COLUMNS.map(() => '?').join(', ')})`);
     stmt.run(...this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)));
@@ -428,6 +786,45 @@ export class SQLiteCacheService implements CacheService {
       for (const item of rows) insert.run(...this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)));
     });
     tx(items);
+    return Promise.resolve();
+  }
+
+  insertDocumentNonItemLine(line: Omit<DocumentNonItemLineRow, 'id'>): Promise<void> {
+    const stmt = this.db.prepare(
+      `INSERT INTO document_non_item_lines (${DOCUMENT_NON_ITEM_LINE_COLUMNS.join(', ')}) VALUES (${DOCUMENT_NON_ITEM_LINE_COLUMNS.map(() => '?').join(', ')})`
+    );
+    stmt.run(...this.valuesFor(DOCUMENT_NON_ITEM_LINE_COLUMNS, this.normalizeDocumentNonItemLine(line)));
+    return Promise.resolve();
+  }
+
+  getDocumentNonItemLines(docId: string): Promise<DocumentNonItemLineRow[]> {
+    return Promise.resolve(
+      this.db.prepare(`SELECT * FROM document_non_item_lines WHERE doc_id = ?`).all(docId) as DocumentNonItemLineRow[]
+    );
+  }
+
+  getAllDocumentNonItemLines(): Promise<DocumentNonItemLineRow[]> {
+    return Promise.resolve(
+      this.db.prepare(`SELECT * FROM document_non_item_lines`).all() as DocumentNonItemLineRow[]
+    );
+  }
+
+  deleteDocumentNonItemLines(docId: string): Promise<void> {
+    this.db.prepare(`DELETE FROM document_non_item_lines WHERE doc_id = ?`).run(docId);
+    return Promise.resolve();
+  }
+
+  batchInsertDocumentNonItemLines(lines: Omit<DocumentNonItemLineRow, 'id'>[]): Promise<void> {
+    if (lines.length === 0) return Promise.resolve();
+    const insert = this.db.prepare(
+      `INSERT INTO document_non_item_lines (${DOCUMENT_NON_ITEM_LINE_COLUMNS.join(', ')}) VALUES (${DOCUMENT_NON_ITEM_LINE_COLUMNS.map(() => '?').join(', ')})`
+    );
+    const tx = this.db.transaction((rows: Omit<DocumentNonItemLineRow, 'id'>[]) => {
+      for (const line of rows) {
+        insert.run(...this.valuesFor(DOCUMENT_NON_ITEM_LINE_COLUMNS, this.normalizeDocumentNonItemLine(line)));
+      }
+    });
+    tx(lines);
     return Promise.resolve();
   }
 
@@ -650,6 +1047,10 @@ export class SQLiteCacheService implements CacheService {
     return Promise.resolve(this.count('item_documents'));
   }
 
+  getDocumentNonItemLineCount(): Promise<number> {
+    return Promise.resolve(this.count('document_non_item_lines'));
+  }
+
   getAccountCount(contextId?: number): Promise<number> {
     return Promise.resolve(contextId ? this.count('accounts', 'context_id = ?', [contextId]) : this.count('accounts'));
   }
@@ -665,6 +1066,7 @@ export class SQLiteCacheService implements CacheService {
   clearAll(): Promise<void> {
     this.db.exec(`
       DELETE FROM item_stock_locations;
+      DELETE FROM document_non_item_lines;
       DELETE FROM item_documents;
       DELETE FROM items;
       DELETE FROM documents;
@@ -672,6 +1074,70 @@ export class SQLiteCacheService implements CacheService {
       DELETE FROM cache_meta;
     `);
     return Promise.resolve();
+  }
+
+  replaceMirrorSnapshot(snapshot: CacheMirrorSnapshot): void {
+    const replace = this.db.transaction(() => {
+      this.db.exec(`
+        DELETE FROM item_stock_locations;
+        DELETE FROM document_non_item_lines;
+        DELETE FROM item_documents;
+        DELETE FROM items;
+        DELETE FROM documents;
+        DELETE FROM accounts;
+        DELETE FROM cache_meta;
+      `);
+      const insertAccount = this.db.prepare(this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'));
+      for (const row of snapshot.accounts) {
+        insertAccount.run(...this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(row)));
+      }
+      const insertItem = this.db.prepare(this.upsertSql('items', ITEM_COLUMNS, 'item_id'));
+      for (const row of snapshot.items) {
+        insertItem.run(...this.valuesFor(ITEM_COLUMNS, this.normalizeItem(row)));
+      }
+      const insertStock = this.db.prepare(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'));
+      for (const row of snapshot.stockLocations) {
+        insertStock.run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
+      }
+      const insertDocument = this.db.prepare(this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'));
+      for (const row of snapshot.documents) {
+        insertDocument.run(...this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(row)));
+      }
+      const insertItemDocument = this.db.prepare(
+        `INSERT INTO item_documents (${ITEM_DOCUMENT_COLUMNS.join(', ')}) VALUES (${ITEM_DOCUMENT_COLUMNS.map(() => '?').join(', ')})`
+      );
+      for (const row of snapshot.itemDocuments) {
+        insertItemDocument.run(...this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(row)));
+      }
+      const insertNonItemLine = this.db.prepare(
+        `INSERT INTO document_non_item_lines (${DOCUMENT_NON_ITEM_LINE_COLUMNS.join(', ')}) VALUES (${DOCUMENT_NON_ITEM_LINE_COLUMNS.map(() => '?').join(', ')})`
+      );
+      for (const row of snapshot.documentNonItemLines) {
+        insertNonItemLine.run(...this.valuesFor(DOCUMENT_NON_ITEM_LINE_COLUMNS, this.normalizeDocumentNonItemLine(row)));
+      }
+      const restoreCompleteness = this.db.prepare(
+        `UPDATE documents SET snapshot_complete = ?, snapshot_version = ? WHERE doc_id = ?`
+      );
+      for (const row of snapshot.documents) {
+        restoreCompleteness.run(row.snapshot_complete ?? 0, row.snapshot_version ?? 0, row.doc_id);
+      }
+      if (snapshot.state) {
+        const state: CacheState = {
+          ...snapshot.state,
+          schemaVersion: CACHE_SCHEMA_VERSION,
+          documentCount: snapshot.documents.length,
+          itemDocumentCount: snapshot.itemDocuments.length,
+          nonItemDocumentCount: snapshot.documentNonItemLines.length,
+        };
+        this.db.prepare(`INSERT INTO cache_meta (key, value) VALUES ('state', ?)`)
+          .run(JSON.stringify(state));
+      }
+      if (snapshot.syncStatus) {
+        this.db.prepare(`INSERT INTO cache_meta (key, value) VALUES ('sync_status', ?)`)
+          .run(JSON.stringify(snapshot.syncStatus));
+      }
+    });
+    replace.immediate();
   }
 
   getRawMeta(key: string): number | null {
@@ -685,8 +1151,22 @@ export class SQLiteCacheService implements CacheService {
     this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)`).run(key, value);
   }
 
+  async tryAcquireSyncLock(_lockKey: string): Promise<boolean> {
+    return this.writer && this.maintenanceLease !== null;
+  }
+
+  async releaseSyncLock(_lockKey: string): Promise<void> {
+    // A writable handle and its maintenance lease have the same lifetime.
+    // Releasing only the sidecar would leave an unfenced writable connection.
+  }
+
   async close(): Promise<void> {
-    if (this.db) this.db.close();
+    try {
+      if (this.db?.open) this.db.close();
+    } finally {
+      this.maintenanceLease?.release();
+      this.maintenanceLease = null;
+    }
   }
 
   isOpen(): boolean {
@@ -720,6 +1200,8 @@ export class SQLiteCacheService implements CacheService {
       account_id: doc.account_id ?? null,
       account_context_id: doc.account_context_id ?? null,
       account_name: doc.account_name ?? doc.customer_name ?? doc.supplier_name ?? null,
+      snapshot_version: doc.snapshot_version ?? 0,
+      snapshot_complete: doc.snapshot_complete ?? 0,
       is_cancelled: doc.is_cancelled ?? 0,
     };
   }
@@ -737,6 +1219,34 @@ export class SQLiteCacheService implements CacheService {
 
   private normalizeItemDocument(item: Omit<ItemDocumentRow, 'id'>): Record<string, unknown> {
     return { ...item, quantity: item.quantity ?? 0, price: item.price ?? 0 };
+  }
+
+  private normalizeDocumentNonItemLine(
+    line: Omit<DocumentNonItemLineRow, 'id'>
+  ): Record<string, unknown> {
+    return {
+      ...line,
+      line_type: 'non_item',
+      quantity: line.quantity ?? 0,
+      price: line.price ?? 0,
+      total_amount: line.total_amount ?? 0,
+      net_amount: line.net_amount ?? 0,
+    };
+  }
+
+  private validateDocumentSnapshot(snapshot: DocumentSnapshot): void {
+    if (!snapshot.document.doc_id || !Number.isFinite(snapshot.sourceFetchedAt)) {
+      throw new Error('Invalid document snapshot identity or source timestamp');
+    }
+    const sourceIds = new Set<string>();
+    for (const line of [...snapshot.itemLines, ...snapshot.nonItemLines]) {
+      const sourceId = line.document_item_id?.trim();
+      if (!sourceId) throw new Error(`Document ${snapshot.document.doc_id} contains a line without source id`);
+      if (sourceIds.has(sourceId)) {
+        throw new Error(`Document ${snapshot.document.doc_id} contains duplicate source line ${sourceId}`);
+      }
+      sourceIds.add(sourceId);
+    }
   }
 
   private normalizeAccount(account: AccountRow): Record<string, unknown> {
@@ -758,4 +1268,30 @@ export class SQLiteCacheService implements CacheService {
       cache_source: row.cache_source ?? 'api',
     };
   }
+}
+
+function isShipmentNewer(value: string | null | undefined, sourceFetchedAt: number): boolean {
+  if (!value) return false;
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) && timestamp > sourceFetchedAt * 1000;
+}
+
+function authoritativeShipmentValue<T>(incoming: T | null | undefined, existing: T | null | undefined): T | null {
+  return incoming === undefined ? existing ?? null : incoming;
+}
+
+function canonicalizeSQLiteCachePath(dbPath: string): string {
+  const absolutePath = resolve(dbPath);
+  mkdirSync(dirname(absolutePath), { mode: 0o700, recursive: true });
+  try {
+    return realpathSync.native(absolutePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  return join(realpathSync.native(dirname(absolutePath)), basename(absolutePath));
+}
+
+function isSQLiteLockError(error: unknown): boolean {
+  const code = (error as { code?: string })?.code;
+  return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED';
 }

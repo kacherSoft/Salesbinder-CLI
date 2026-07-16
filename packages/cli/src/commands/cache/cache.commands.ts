@@ -9,6 +9,11 @@ import { existsSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
+export const requiresFullItemSync = (
+  itemFull: boolean,
+  documentSyncType: 'full' | 'delta',
+) => itemFull || documentSyncType === 'full';
+
 /**
  * Register cache management commands
  */
@@ -31,7 +36,8 @@ Otherwise: syncs API → SQLite directly.
 Use --full to force complete resync.`)
     .option('--full', 'Force full sync (re-download all documents)')
     .option('--pull', 'After PostgreSQL sync, pull PostgreSQL into local SQLite')
-    .action(async (options: { full?: boolean; pull?: boolean }) => {
+    .option('--detail-rate <requestsPerSecond>', 'Maximum authoritative document detail request starts per second', '0.75')
+    .action(async (options: { full?: boolean; pull?: boolean; detailRate: string }) => {
       let cacheService: import('@salesbinder/sdk').CacheService | null = null;
       let syncRunId: string | null = null;
       let syncLockKey: string | null = null;
@@ -45,8 +51,10 @@ Use --full to force complete resync.`)
           DocumentIndexerService,
           ItemIndexerService,
           DeletedLogSyncService,
-          createPostgresCacheService,
+          PostgresCacheService,
           SQLiteCacheService,
+          CACHE_SCHEMA_VERSION,
+          CACHE_WRITER_LOCK_KEY,
           pullFromPostgres,
           loadPreferences,
         } = await import('@salesbinder/sdk');
@@ -56,17 +64,18 @@ Use --full to force complete resync.`)
         const dbUrl = process.env.SALESBINDER_DB_URL;
 
         // Determine sync target: PG if available, else SQLite
-        const pgService = await createPostgresCacheService();
+        const pgService = dbUrl ? new PostgresCacheService(dbUrl) : null;
         if (pgService) {
           cacheService = pgService;
           console.error('Syncing API → PostgreSQL...');
-          syncLockKey = `salesbinder-cache-sync:${accountName}`;
+          syncLockKey = CACHE_WRITER_LOCK_KEY;
           lockAcquired = await pgService.tryAcquireSyncLock(syncLockKey);
           if (!lockAcquired) {
-            throw new Error('Another cache sync is already running for this account.');
+            throw new Error('Another cache writer is already running.');
           }
+          await pgService.ensureSchema();
         } else {
-          cacheService = new SQLiteCacheService(accountName);
+          cacheService = new SQLiteCacheService(accountName, undefined, true);
           console.error('Syncing API → SQLite...');
         }
 
@@ -86,31 +95,63 @@ Use --full to force complete resync.`)
         const prefs = loadPreferences();
         const lookbackEnv = process.env[['SALESBINDER', 'SYNC', 'LOOKBACK', 'SECONDS'].join('_')];
         const syncLookbackSeconds = lookbackEnv ? parseInt(lookbackEnv, 10) : (prefs?.syncLookbackSeconds ?? 604800);
+        const detailRequestsPerSecond = Number(options.detailRate);
+        if (!Number.isFinite(detailRequestsPerSecond) || detailRequestsPerSecond <= 0) {
+          throw new Error('--detail-rate must be a positive number.');
+        }
         const accountIndexer = new AccountIndexerService(client, cacheService, accountName, syncLookbackSeconds);
         const indexer = new DocumentIndexerService(
           client,
           cacheService,
           accountName,
           prefs?.cacheStaleSeconds,
-          syncLookbackSeconds
+          syncLookbackSeconds,
+          detailRequestsPerSecond
         );
         const itemIndexer = new ItemIndexerService(client, cacheService, accountName, syncLookbackSeconds);
         const deletedLogSync = new DeletedLogSyncService(client, cacheService, accountName, syncLookbackSeconds);
 
-        const accountResult = await accountIndexer.sync(options.full);
-        const result = await indexer.sync({
-          full: options.full,
-          onProgress: (current, total) => {
-            if (total > 0) {
-              const percent = Math.round((current / total) * 100);
-              console.error(`Progress: ${current}/${total} (${percent}%)`);
-            } else {
-              console.error(`Processed: ${current} documents`);
-            }
-          },
-        });
-        const itemResult = await itemIndexer.sync(options.full);
+        const initialState = await cacheService.getCacheState();
+        const cacheIdentityMismatch = !initialState
+          || initialState.accountName !== accountName
+          || initialState.schemaVersion !== CACHE_SCHEMA_VERSION;
+        const accountFull = Boolean(options.full || cacheIdentityMismatch || !initialState?.lastAccountSync);
+        const documentFull = Boolean(options.full || cacheIdentityMismatch || !initialState?.lastDocumentSync);
+        const itemFull = Boolean(options.full || cacheIdentityMismatch || !initialState?.lastItemSync);
+
+        const accountResult = await accountIndexer.sync(accountFull);
+        let result: import('@salesbinder/sdk').SyncResult;
+        try {
+          result = await indexer.sync({
+            full: documentFull,
+            onProgress: (current, total) => {
+              if (total > 0) {
+                const percent = Math.round((current / total) * 100);
+                console.error(`Progress: ${current}/${total} (${percent}%)`);
+              } else {
+                console.error(`Processed: ${current} documents`);
+              }
+            },
+          });
+        } catch (error) {
+          try {
+            await deletedLogSync.sync();
+          } catch (deletedError: any) {
+            console.error(`Deletion reconciliation also failed: ${deletedError?.message || deletedError}`);
+          }
+          throw error;
+        }
         const deletedResult = await deletedLogSync.sync();
+        if (!result.success) {
+          throw Object.assign(
+            new Error(`Document sync incomplete: ${result.failedDocuments} document(s) require retry.`),
+            { syncResult: result }
+          );
+        }
+        // A resumed document-full checkpoint carries the original historical
+        // intent even when this invocation omitted --full. Complete the item
+        // master at the same scope before reporting the cache as successful.
+        const itemResult = await itemIndexer.sync(requiresFullItemSync(itemFull, result.type));
         const cloudSyncFinishedAt = Math.floor(Date.now() / 1000);
         await cacheService.setSyncStatus({
           status: 'success',
@@ -124,6 +165,9 @@ Use --full to force complete resync.`)
           syncType: result.type,
           documentsProcessed: result.documentsProcessed,
           lineItemsProcessed: result.lineItemsProcessed,
+          nonItemLinesProcessed: result.nonItemLinesProcessed,
+          failedDocuments: 0,
+          retryDocumentIds: [],
           itemsProcessed: itemResult.itemsProcessed,
           stockRowsProcessed: itemResult.stockRowsProcessed,
           deletedRecordsProcessed: deletedResult.deletedRecordsProcessed,
@@ -138,6 +182,7 @@ Use --full to force complete resync.`)
           accounts?: number;
           documents?: number;
           itemDocuments?: number;
+          documentNonItemLines?: number;
           items?: number;
           stockRows?: number;
           duration?: string;
@@ -151,6 +196,7 @@ Use --full to force complete resync.`)
               accounts: pullResult.accountsPulled,
               documents: pullResult.documentsPulled,
               itemDocuments: pullResult.itemDocumentsPulled,
+              documentNonItemLines: pullResult.documentNonItemLinesPulled,
               items: pullResult.itemsPulled,
               stockRows: pullResult.stockRowsPulled,
               duration: pullResult.duration,
@@ -174,6 +220,7 @@ Use --full to force complete resync.`)
           documents_processed: result.documentsProcessed,
           documents_deleted: result.documentsDeleted || 0,
           line_items_processed: result.lineItemsProcessed,
+          non_item_lines_processed: result.nonItemLinesProcessed,
           items_processed: itemResult.itemsProcessed,
           stock_rows_processed: itemResult.stockRowsProcessed,
           deleted_records_processed: deletedResult.deletedRecordsProcessed,
@@ -190,6 +237,7 @@ Use --full to force complete resync.`)
               accounts: pullInfo.accounts,
               documents: pullInfo.documents,
               item_documents: pullInfo.itemDocuments,
+              document_non_item_lines: pullInfo.documentNonItemLines,
               items: pullInfo.items,
               stock_rows: pullInfo.stockRows,
               duration: pullInfo.duration,
@@ -203,6 +251,9 @@ Use --full to force complete resync.`)
         try {
           if (cacheService && syncRunId) {
             const now = Math.floor(Date.now() / 1000);
+            const syncResult = (error as Error & {
+              syncResult?: import('@salesbinder/sdk').SyncResult;
+            }).syncResult;
             await cacheService.setSyncStatus({
               status: 'failed',
               runId: syncRunId,
@@ -212,6 +263,12 @@ Use --full to force complete resync.`)
               updatedAt: now,
               finishedAt: now,
               message: 'Sync failed',
+              syncType: syncResult?.type,
+              documentsProcessed: syncResult?.documentsProcessed,
+              lineItemsProcessed: syncResult?.lineItemsProcessed,
+              nonItemLinesProcessed: syncResult?.nonItemLinesProcessed,
+              failedDocuments: syncResult?.failedDocuments,
+              retryDocumentIds: syncResult?.retryDocumentIds,
               error: (error as Error).message,
             });
           }
@@ -251,11 +308,22 @@ Next sync will perform a full resync.`)
 
         if (dbUrl) {
           // PostgreSQL: truncate tables
-          const { PostgresCacheService } = await import('@salesbinder/sdk');
+          const { CACHE_WRITER_LOCK_KEY, PostgresCacheService } = await import('@salesbinder/sdk');
           const pgCache = new PostgresCacheService(dbUrl);
-          await pgCache.ensureSchema();
-          await pgCache.truncateAll();
-          await pgCache.close();
+          const lockKey = CACHE_WRITER_LOCK_KEY;
+          try {
+            if (!await pgCache.tryAcquireSyncLock(lockKey)) {
+              throw new Error('Another cache writer is already running.');
+            }
+            try {
+              await pgCache.ensureSchema();
+              await pgCache.truncateAll();
+            } finally {
+              await pgCache.releaseSyncLock(lockKey);
+            }
+          } finally {
+            await pgCache.close();
+          }
 
           console.log(
             formatJson({
@@ -266,7 +334,7 @@ Next sync will perform a full resync.`)
             })
           );
         } else {
-          // SQLite: delete file
+          // SQLite: delete file while holding the same maintenance lease used by writers.
           const accountName = program.opts().account || 'default';
           const sanitizedAccount = accountName.replace(/[^a-zA-Z0-9_-]/g, '_');
           const cacheDir = join(homedir(), '.salesbinder', 'cache');
@@ -275,35 +343,40 @@ Next sync will perform a full resync.`)
           // Also check for WAL and SHM files
           const walFile = `${cacheFile}-wal`;
           const shmFile = `${cacheFile}-shm`;
+          const { tryAcquireSQLiteCacheMaintenanceLock } = await import('@salesbinder/sdk');
+          const lease = tryAcquireSQLiteCacheMaintenanceLock(cacheFile);
+          if (!lease) throw new Error('Another SQLite cache writer is already running.');
+          try {
+            if (!existsSync(cacheFile)) {
+              if (existsSync(walFile)) unlinkSync(walFile);
+              if (existsSync(shmFile)) unlinkSync(shmFile);
+              console.log(
+                formatJson({
+                  success: true,
+                  message: 'Cache file does not exist',
+                  cache_file: cacheFile,
+                })
+              );
+              return;
+            }
 
-          if (!existsSync(cacheFile)) {
+            const stats = statSync(cacheFile);
+            const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+            unlinkSync(cacheFile);
+            if (existsSync(walFile)) unlinkSync(walFile);
+            if (existsSync(shmFile)) unlinkSync(shmFile);
+
             console.log(
               formatJson({
                 success: true,
-                message: 'Cache file does not exist',
+                message: `Cache deleted (${sizeMB} MB)`,
                 cache_file: cacheFile,
+                next_sync: 'full',
               })
             );
-            return;
+          } finally {
+            lease.release();
           }
-
-          // Get file size before deletion
-          const stats = statSync(cacheFile);
-          const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-
-          // Delete cache file and related files
-          unlinkSync(cacheFile);
-          if (existsSync(walFile)) unlinkSync(walFile);
-          if (existsSync(shmFile)) unlinkSync(shmFile);
-
-          console.log(
-            formatJson({
-              success: true,
-              message: `Cache deleted (${sizeMB} MB)`,
-              cache_file: cacheFile,
-              next_sync: 'full',
-            })
-          );
         }
       } catch (error) {
         console.error(formatError(error as Error));
@@ -327,9 +400,15 @@ No historical SalesBinder API requests are made.`)
     .option('--target <backend>', 'Cache backend: sqlite or postgresql')
     .action(async (directory: string, options: { dryRun?: boolean; target?: string }) => {
       let cacheService: CacheService | null = null;
+      let releaseMaintenanceLock: (() => Promise<void>) | null = null;
 
       try {
-        const { CsvCacheImportService, SQLiteCacheService, PostgresCacheService } = await import('@salesbinder/sdk');
+        const {
+          CACHE_WRITER_LOCK_KEY,
+          CsvCacheImportService,
+          SQLiteCacheService,
+          PostgresCacheService,
+        } = await import('@salesbinder/sdk');
         const accountName = program.opts().account || 'default';
         const databaseUrlEnv = ['SALESBINDER', 'DB', 'URL'].join('_');
         const dbUrl = process.env[databaseUrlEnv];
@@ -339,13 +418,20 @@ No historical SalesBinder API requests are made.`)
           throw new Error('Invalid --target. Use sqlite or postgresql.');
         }
 
-        if (target === 'postgresql') {
-          if (!dbUrl) throw new Error('Database URL environment variable is required for --target postgresql.');
-          const pgCache = new PostgresCacheService(dbUrl);
-          await pgCache.ensureSchema();
-          cacheService = pgCache;
-        } else {
-          cacheService = new SQLiteCacheService(accountName);
+        if (!options.dryRun) {
+          if (target === 'postgresql') {
+            if (!dbUrl) throw new Error('Database URL environment variable is required for --target postgresql.');
+            const pgCache = new PostgresCacheService(dbUrl);
+            cacheService = pgCache;
+            const lockKey = CACHE_WRITER_LOCK_KEY;
+            if (!await pgCache.tryAcquireSyncLock(lockKey)) {
+              throw new Error('Another cache writer is already running.');
+            }
+            releaseMaintenanceLock = () => pgCache.releaseSyncLock(lockKey);
+            await pgCache.ensureSchema();
+          } else {
+            cacheService = new SQLiteCacheService(accountName, undefined, true);
+          }
         }
 
         console.error(`${options.dryRun ? 'Validating' : 'Importing'} CSV exports -> ${target}...`);
@@ -355,8 +441,14 @@ No historical SalesBinder API requests are made.`)
           accountName,
         });
 
-        await cacheService.close();
-        cacheService = null;
+        if (releaseMaintenanceLock) {
+          await releaseMaintenanceLock();
+          releaseMaintenanceLock = null;
+        }
+        if (cacheService) {
+          await cacheService.close();
+          cacheService = null;
+        }
 
         console.log(formatJson({ ...result, backend: target }));
       } catch (error) {
@@ -364,6 +456,7 @@ No historical SalesBinder API requests are made.`)
         process.exit(1);
       } finally {
         try {
+          if (releaseMaintenanceLock) await releaseMaintenanceLock();
           if (cacheService && typeof cacheService.close === 'function') {
             await cacheService.close();
           }
@@ -392,7 +485,7 @@ Displays:
       let cacheService: import('@salesbinder/sdk').CacheService | null = null;
 
       try {
-        const { createCacheService, createPostgresCacheService, DocumentIndexerService, SalesBinderClient, loadPreferences } = await import(
+        const { createCacheService, PostgresCacheService, DocumentIndexerService, SalesBinderClient, loadPreferences } = await import(
           '@salesbinder/sdk'
         );
 
@@ -401,10 +494,7 @@ Displays:
 
         if (dbUrl) {
           // PostgreSQL backend
-          const pgCache = await createPostgresCacheService();
-          if (!pgCache) {
-            throw new Error('PostgreSQL backend is configured but could not be opened.');
-          }
+          const pgCache = new PostgresCacheService(dbUrl);
           cacheService = pgCache;
           const client = new SalesBinderClient(accountName);
           const prefs = loadPreferences();
@@ -568,6 +658,7 @@ This pull is explicit; normal cache reads and normal cache sync do not refresh S
             accounts_pulled: result.accountsPulled,
             documents_pulled: result.documentsPulled,
             item_documents_pulled: result.itemDocumentsPulled,
+            document_non_item_lines_pulled: result.documentNonItemLinesPulled,
             items_pulled: result.itemsPulled,
             stock_rows_pulled: result.stockRowsPulled,
             duration: result.duration,
@@ -588,6 +679,7 @@ async function collectCacheCounts(cacheService: CacheService) {
     poCount,
     estimateCount,
     lineItemCount,
+    nonItemLineCount,
     accountCount,
     customerCount,
     supplierCount,
@@ -599,6 +691,7 @@ async function collectCacheCounts(cacheService: CacheService) {
     cacheService.getDocumentCountByContext(11),
     cacheService.getDocumentCountByContext(4),
     cacheService.getItemDocumentCount(),
+    cacheService.getDocumentNonItemLineCount(),
     cacheService.getAccountCount(),
     cacheService.getAccountCount(2),
     cacheService.getAccountCount(10),
@@ -612,6 +705,7 @@ async function collectCacheCounts(cacheService: CacheService) {
     purchase_order_document_count: poCount,
     estimate_document_count: estimateCount,
     line_item_count: lineItemCount,
+    non_item_line_count: nonItemLineCount,
     account_count: accountCount,
     customer_count: customerCount,
     supplier_count: supplierCount,

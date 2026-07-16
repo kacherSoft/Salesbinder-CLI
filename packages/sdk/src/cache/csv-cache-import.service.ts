@@ -3,7 +3,7 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import type { CacheService } from './cache.interface.js';
 import type { AccountRow, DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
-import { DocumentContextId } from './types.js';
+import { CACHE_SCHEMA_VERSION, DocumentContextId } from './types.js';
 import { ContextId } from '../types/common.types.js';
 import { parseCsvFile } from './csv-cache-import.parser.js';
 import type { CsvImportOptions, CsvImportResult, CsvImportWarnings, CsvRow } from './csv-cache-import.types.js';
@@ -61,7 +61,7 @@ interface PreparedImport {
 }
 
 export class CsvCacheImportService {
-  constructor(private readonly cache: CacheService) {}
+  constructor(private readonly cache: CacheService | null = null) {}
 
   async importDirectory(directory: string, options: CsvImportOptions): Promise<CsvImportResult> {
     const start = Date.now();
@@ -158,49 +158,95 @@ export class CsvCacheImportService {
   }
 
   private async write(prepared: PreparedImport, accountName: string): Promise<void> {
-    const { documents, lineItems } = await this.resolveExistingDocuments(prepared);
+    const cache = this.requireCache();
+    const { documents, lineItems } = await this.resolveExistingDocuments(prepared, cache);
+    const protectedRows = await this.excludeApiOwnedRows(prepared, cache);
 
-    await this.cache.batchInsertAccounts(prepared.accounts);
-    await this.cache.batchInsertItems(prepared.items);
-    await this.cache.batchInsertItemStockLocations(prepared.stockRows);
-    await this.cache.batchInsertDocuments(documents);
+    await cache.batchInsertAccounts(protectedRows.accounts);
+    await cache.batchInsertItems(protectedRows.items);
+    await cache.batchInsertItemStockLocations(protectedRows.stockRows);
+    await cache.batchInsertDocuments(documents);
 
     for (const doc of documents) {
-      await this.cache.deleteItemDocuments(doc.doc_id);
+      await cache.deleteItemDocuments(doc.doc_id);
+      await cache.deleteDocumentNonItemLines(doc.doc_id);
     }
-    await this.cache.batchInsertItemDocuments(lineItems);
+    await cache.batchInsertItemDocuments(lineItems);
 
     const now = Math.floor(Date.now() / 1000);
-    await this.cache.setCacheState({
+    const previousState = { ...(await cache.getCacheState()) };
+    delete previousState.lastAccountSync;
+    delete previousState.lastDocumentSync;
+    delete previousState.lastFullDocumentSync;
+    delete previousState.lastItemSync;
+    delete previousState.lastFullItemSync;
+    delete previousState.lastDeletedSync;
+    delete previousState.documentSyncCheckpoint;
+    await cache.setCacheState({
+      ...previousState,
       lastSync: now,
       lastFullSync: now,
-      documentCount: await this.cache.getDocumentCount(),
-      itemDocumentCount: await this.cache.getItemDocumentCount(),
+      documentCount: await cache.getDocumentCount(),
+      itemDocumentCount: await cache.getItemDocumentCount(),
+      nonItemDocumentCount: await cache.getDocumentNonItemLineCount(),
       accountName,
-      schemaVersion: 2,
-      accountCount: await this.cache.getAccountCount(),
-      customerCount: await this.cache.getAccountCount(ContextId.Customer),
-      supplierCount: await this.cache.getAccountCount(ContextId.Supplier),
-      itemCount: await this.cache.getItemCount(),
-      stockLocationCount: await this.cache.getStockLocationCount(),
-      lastAccountSync: now,
-      lastItemSync: now,
-      lastFullItemSync: now,
+      schemaVersion: CACHE_SCHEMA_VERSION,
+      accountCount: await cache.getAccountCount(),
+      customerCount: await cache.getAccountCount(ContextId.Customer),
+      supplierCount: await cache.getAccountCount(ContextId.Supplier),
+      itemCount: await cache.getItemCount(),
+      stockLocationCount: await cache.getStockLocationCount(),
     });
   }
 
-  private async resolveExistingDocuments(prepared: PreparedImport): Promise<{
+  private async excludeApiOwnedRows(prepared: PreparedImport, cache: CacheService): Promise<{
+    accounts: AccountRow[];
+    items: ItemRow[];
+    stockRows: ItemStockLocationRow[];
+  }> {
+    const apiAccountIds = new Set(
+      (await cache.getAllAccounts())
+        .filter((account) => account.cache_source === 'api')
+        .map((account) => account.account_id)
+    );
+    const apiItemIds = new Set(
+      (await cache.getAllItems())
+        .filter((item) => item.cache_source === 'api')
+        .map((item) => item.item_id)
+    );
+    const apiStockRowIds = new Set(
+      (await cache.getAllItemStockLocations())
+        .filter((row) => row.cache_source === 'api')
+        .map((row) => row.stock_row_id)
+    );
+
+    return {
+      accounts: prepared.accounts.filter((account) => !apiAccountIds.has(account.account_id)),
+      items: prepared.items.filter((item) => !apiItemIds.has(item.item_id)),
+      stockRows: prepared.stockRows.filter((row) => (
+        !apiItemIds.has(row.item_id) && !apiStockRowIds.has(row.stock_row_id)
+      )),
+    };
+  }
+
+  private async resolveExistingDocuments(prepared: PreparedImport, cache: CacheService): Promise<{
     documents: DocumentRow[];
     lineItems: Omit<ItemDocumentRow, 'id'>[];
   }> {
     const docIdMap = new Map<string, string>();
+    const protectedApiDocumentIds = new Set<string>();
     const documents: DocumentRow[] = [];
 
     for (const doc of prepared.documents) {
-      const existing = await this.cache.getDocumentByNumber(doc.context_id, doc.doc_number);
+      const existing = await cache.getDocumentByNumber(doc.context_id, doc.doc_number);
       if (!existing) {
         documents.push(doc);
         docIdMap.set(doc.doc_id, doc.doc_id);
+        continue;
+      }
+
+      if (existing.snapshot_complete === 1 && existing.api_doc_id) {
+        protectedApiDocumentIds.add(doc.doc_id);
         continue;
       }
 
@@ -210,11 +256,20 @@ export class CsvCacheImportService {
 
     return {
       documents,
-      lineItems: prepared.lineItems.map((line) => ({
-        ...line,
-        doc_id: docIdMap.get(line.doc_id) ?? line.doc_id,
-      })),
+      lineItems: prepared.lineItems
+        .filter((line) => !protectedApiDocumentIds.has(line.doc_id))
+        .map((line) => ({
+          ...line,
+          doc_id: docIdMap.get(line.doc_id) ?? line.doc_id,
+        })),
     };
+  }
+
+  private requireCache(): CacheService {
+    if (!this.cache) {
+      throw new Error('A writable cache service is required for CSV import.');
+    }
+    return this.cache;
   }
 
   private async readAccounts(filePath: string, contextId: ContextId, importedAt: number): Promise<AccountRow[]> {
@@ -374,6 +429,8 @@ export class CsvCacheImportService {
           subtotal: toNumber(row['Subtotal']),
           external_po_number: nullable(row['External PO#']),
           shipping_location: nullable(row['Shipping Location']),
+          snapshot_version: CACHE_SCHEMA_VERSION,
+          snapshot_complete: 0,
           imported_at: importedAt,
         });
 
@@ -462,6 +519,12 @@ function mergeDocument(existing: DocumentRow, imported: DocumentRow): DocumentRo
     salesperson_name: existing.salesperson_name ?? imported.salesperson_name ?? null,
     status_id: existing.status_id ?? imported.status_id ?? null,
     status_name: existing.status_name ?? imported.status_name ?? null,
+    date_sent: existing.date_sent ?? imported.date_sent ?? null,
+    shipped_percent: existing.shipped_percent ?? imported.shipped_percent ?? null,
+    shipment_checked_at: existing.shipment_checked_at ?? null,
+    source_fetched_at: existing.source_fetched_at ?? null,
+    snapshot_version: CACHE_SCHEMA_VERSION,
+    snapshot_complete: 0,
     is_cancelled: existing.is_cancelled ?? imported.is_cancelled ?? 0,
     cache_source: existing.api_doc_id ? 'api' : imported.cache_source,
   };

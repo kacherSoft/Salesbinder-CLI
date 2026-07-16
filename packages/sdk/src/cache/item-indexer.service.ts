@@ -3,6 +3,7 @@ import type { SalesBinderClient } from '../resources/index.js';
 import type { Item, ItemListResponse, ItemVariationLocation } from '../types/items.types.js';
 import type { CacheService } from './cache.interface.js';
 import type { CacheState, ItemRow, ItemStockLocationRow } from './types.js';
+import { CACHE_SCHEMA_VERSION } from './types.js';
 
 export interface ItemSyncResult {
   itemsProcessed: number;
@@ -25,8 +26,17 @@ export class ItemIndexerService {
   }
 
   async sync(full = false): Promise<ItemSyncResult> {
+    const syncStartedAt = Math.floor(Date.now() / 1000);
     const state = await this.cache.getCacheState();
-    const since = full ? 0 : Math.max(0, (state?.lastItemSync ?? state?.lastSync ?? 0) - this.syncLookbackSeconds);
+    const lastItemSync = state?.lastItemSync;
+    const effectiveFull = full
+      || state === null
+      || state.accountName !== this.accountName
+      || state.schemaVersion !== CACHE_SCHEMA_VERSION
+      || lastItemSync == null;
+    const since = effectiveFull || lastItemSync == null
+      ? 0
+      : Math.max(0, lastItemSync - this.syncLookbackSeconds);
     let page = 1;
     let itemCount = 0;
     let stockCount = 0;
@@ -58,7 +68,7 @@ export class ItemIndexerService {
       page++;
     }
 
-    await this.cache.setCacheState(await this.mergeState(state, Math.floor(Date.now() / 1000)));
+    await this.cache.setCacheState(await this.mergeState(state, syncStartedAt, effectiveFull));
     return { itemsProcessed: itemCount, stockRowsProcessed: stockCount };
   }
 
@@ -142,18 +152,19 @@ export class ItemIndexerService {
     };
   }
 
-  private async mergeState(state: CacheState | null, now: number): Promise<CacheState> {
+  private async mergeState(state: CacheState | null, syncStartedAt: number, full: boolean): Promise<CacheState> {
     return {
       ...state,
-      lastSync: state?.lastSync ?? now,
-      lastFullSync: state?.lastFullSync ?? now,
+      lastSync: state?.lastSync ?? syncStartedAt,
+      lastFullSync: state?.lastFullSync ?? syncStartedAt,
       documentCount: state?.documentCount ?? 0,
       itemDocumentCount: state?.itemDocumentCount ?? 0,
-      accountName: state?.accountName ?? this.accountName,
-      schemaVersion: 2,
+      accountName: this.accountName,
+      schemaVersion: CACHE_SCHEMA_VERSION,
       itemCount: await this.cache.getItemCount(),
       stockLocationCount: await this.cache.getStockLocationCount(),
-      lastItemSync: now,
+      lastItemSync: syncStartedAt,
+      ...(full ? { lastFullItemSync: syncStartedAt } : {}),
     };
   }
 }

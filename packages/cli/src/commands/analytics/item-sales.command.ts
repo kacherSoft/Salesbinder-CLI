@@ -4,6 +4,7 @@
 
 import type { Command } from 'commander';
 import { formatJson, formatError } from '../../output/json.formatter.js';
+import { prepareAnalyticsCache } from './analytics-cache.js';
 
 interface AnalyticsOptions {
   forceRefresh?: boolean;
@@ -39,8 +40,6 @@ Output includes:
       try {
         const {
           SalesBinderClient,
-          createCacheService,
-          DocumentIndexerService,
           DocumentContextId,
           loadPreferences,
         } = await import('@salesbinder/sdk');
@@ -48,16 +47,9 @@ Output includes:
         const rootProgram = analytics.parent;
         const accountName = rootProgram?.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
-        cache = await createCacheService(accountName);
 
         // Load stale threshold from config
         const prefs = loadPreferences();
-        const indexer = new DocumentIndexerService(
-          client,
-          cache,
-          accountName,
-          prefs?.cacheStaleSeconds
-        );
 
         // Parse months option
         const periods = options.months
@@ -69,22 +61,14 @@ Output includes:
           forceRefresh: options.refresh,
           useCachedOnly: options.cached,
         };
-
-        // Check cache and sync if needed
-        if (!analyticsOptions.useCachedOnly) {
-          const state = await cache.getCacheState();
-          const needsSync =
-            analyticsOptions.forceRefresh ||
-            !state ||
-            state.accountName !== accountName ||
-            await indexer.isCacheStale();
-
-          if (needsSync) {
-            console.error('Syncing cache...');
-            await indexer.sync({ full: analyticsOptions.forceRefresh });
-            console.error('Sync complete');
-          }
-        }
+        const prepared = await prepareAnalyticsCache({
+          accountName,
+          client,
+          staleSeconds: prefs?.cacheStaleSeconds,
+          ...analyticsOptions,
+        });
+        cache = prepared.cache;
+        const indexer = prepared.indexer;
 
         // Fetch item details for name and stock
         let itemName: string | undefined;
