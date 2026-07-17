@@ -108,11 +108,6 @@ export SALESBINDER_DB_URL=postgres://user:pass@host:5432/salesbinder
 
 **Important:** the current shared PostgreSQL database name is **`salesbinder`**.
 
-The shared cache tables are not account-namespaced. Use one SalesBinder account per
-PostgreSQL database (and per SQLite cache file). Switching accounts requires a
-separate cache/database or an explicit cache clear; normal sync refuses to mix
-rows from different accounts.
-
 When `SALESBINDER_DB_URL` is set, PostgreSQL is the shared source of truth.
 
 - **Writer path:** `cache sync` writes SalesBinder API deltas to PostgreSQL only
@@ -123,23 +118,7 @@ When `SALESBINDER_DB_URL` is set, PostgreSQL is the shared source of truth.
 
 PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `cache sync` do not start a background pull.
 
-The PostgreSQL schema is created by an authoritative writer only after a
-read-only ownership preflight. Reader paths, including `cache pull`, never run
-schema DDL. Direct `PostgresCacheService` mutation APIs are internal plumbing;
-supported shared-cache writes are `cache sync`, `cache import-export`, and the
-explicit destructive `cache clear` workflow.
-
-Deploy the same current CLI version to every writer host before a schema
-upgrade. The writer preflight rejects a database with a newer published schema,
-but an already-deployed obsolete binary that still owns DDL privileges cannot be
-made safe by newer application code.
-
-Cache contract v4 is published only after accounts, documents, deletions, and
-items all finish an authoritative full sync. Interrupted upgrades remain marked
-pending. A separate `documentSnapshotVersion` is published after document and
-deletion stages finish, so legacy salesperson reporting can remain available if
-a later item/category stage fails. Brand/category analytics, CLI analytics, and
-PostgreSQL → SQLite pulls still require the completed whole-cache contract.
+The PostgreSQL schema is created automatically on first use.
 
 | Feature | SQLite (local mirror) | PostgreSQL (shared upstream) |
 |---------|------------------------|-------------------------------|
@@ -156,15 +135,7 @@ export SALESBINDER_READ_BACKEND=postgresql
 node packages/cli/dist/cli.js --account phuthaitech analytics item-sales <item-id>
 ```
 
-PostgreSQL itself remains readable during a writer sync, but the CLI analytics
-commands reject `running` or `failed` sync status so they cannot present a mixed
-snapshot as complete. Direct SQL consumers must inspect `cache_meta.sync_status`
-and `cache_meta.state`: require sync status `success` and no
-`state.documentSyncCheckpoint` before treating the snapshot as complete.
-Analytics commands never perform document-only refresh writes against the shared
-PostgreSQL cache; when it is stale or `--refresh` is requested, run
-`salesbinder cache sync` so accounts, documents, deletions, items, and stock
-advance through the authoritative publication protocol together.
+Reader agents may query while a writer sync is running. PostgreSQL keeps reads valid, but a report can include a small mix of old/new rows during a writer update. Check `cache status` and its `sync_status` field; if it is `running`, wait/retry for strict reporting.
 
 ### Getting Your API Key
 
@@ -581,10 +552,6 @@ All analytics commands support:
 
 **Note:** customer names are cached by CSV import and forward sync. `--resolve-names` is now a fallback for old rows where `customer_name` is still null.
 
-`--cached` and analytics refreshes read only a completed current cache. They do
-not bootstrap or upgrade an uninitialized, obsolete, pending, failed, or
-unfinished document-checkpoint cache; run `salesbinder cache sync` first.
-
 #### Example Workflow
 
 ```bash
@@ -636,11 +603,6 @@ node packages/cli/dist/cli.js cache clear
 ```
 
 The CSV import expects these local export files under the import directory: customers, suppliers, 2024/2025/2026 invoice line items, 2025-2026 PO line items, and inventory variations. The importer validates headers, reports counts/warnings only, and does not print customer, supplier, item, document, or price rows.
-
-A CSV import is a seed, not a publish step. It marks the cache pending before its
-first row write and leaves it pending afterward. Run one authoritative
-`salesbinder cache sync` before using Brand/category analytics or creating a
-SQLite mirror.
 
 Expected PhuthaiTech seed counts:
 
@@ -715,9 +677,8 @@ For daily operations involving item sales analytics with PostgreSQL as the sourc
 - Delta sync only requests recent modified accounts/documents/items and deleted-log entries.
 - Cached queries are instant (<100ms).
 - Writer sync is explicit, so reader agents do not unexpectedly wait for PostgreSQL → SQLite pulls.
-- `cache status` shows `sync_status` when a report must wait for the writer to finish.
-- `--cached` skips freshness refresh, but still validates account, schema, pending
-  state, sync status, and the absence of an unfinished document checkpoint.
+- `cache status` shows `sync_status` when a strict report should wait for the writer to finish.
+- `--cached` flag skips sync check for fastest queries.
 - `--refresh` flag forces fresh data when needed
 
 ## Output Format
