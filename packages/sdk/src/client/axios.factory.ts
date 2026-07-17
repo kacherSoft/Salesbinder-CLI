@@ -9,10 +9,6 @@ import type { RetryConfig } from './retry.handler.js';
 import { generateRequestId } from '../utils/request-id.generator.js';
 import type { AccountConfig } from '../config/config.schema.js';
 
-type RateLimitedRequestConfig = InternalAxiosRequestConfig & {
-  salesBinderBeforeRequestStart?: () => Promise<void>;
-};
-
 /**
  * Create configured axios instance for SalesBinder API
  * @param account - Account configuration
@@ -48,13 +44,6 @@ export function createAxiosClient(account: AccountConfig): AxiosInstance {
       attempt: 0,
       requestId,
     };
-    return config;
-  });
-
-  // This hook stays on the Axios request path so it runs for both the initial
-  // request and every retry started by the response interceptor.
-  client.interceptors.request.use(async (config: RateLimitedRequestConfig) => {
-    await config.salesBinderBeforeRequestStart?.();
     return config;
   });
 

@@ -2,7 +2,7 @@
  * Documents (Invoices/Estimates/POs) resource for SalesBinder API
  */
 
-import type { AxiosInstance, AxiosRequestConfig } from 'axios';
+import type { AxiosInstance } from 'axios';
 import type {
   Document,
   CreateDocumentDto,
@@ -10,10 +10,6 @@ import type {
   DocumentListParams,
   DocumentListResponse,
 } from '../types/documents.types.js';
-
-export interface DocumentGetOptions {
-  beforeRequestStart?: () => Promise<void>;
-}
 
 /**
  * Documents resource class
@@ -37,13 +33,8 @@ export class DocumentsResource {
   /**
    * Get single document by ID
    */
-  async get(id: string, options: DocumentGetOptions = {}): Promise<Document> {
-    const requestConfig: AxiosRequestConfig & {
-      salesBinderBeforeRequestStart?: () => Promise<void>;
-    } = {
-      salesBinderBeforeRequestStart: options.beforeRequestStart,
-    };
-    const response = await this.client.get<{ document: Document }>(`/documents/${id}.json`, requestConfig);
+  async get(id: string): Promise<Document> {
+    const response = await this.client.get<{ document: Document }>(`/documents/${id}.json`);
     // Handle error responses that don't have the expected structure
     if (!response.data?.document) {
       throw new Error(`Invalid API response for document ${id}: ${JSON.stringify(response.data)}`);

@@ -6,8 +6,8 @@
  */
 
 import { SQLiteCacheService } from '../sqlite-cache.service.js';
-import { CACHE_SCHEMA_VERSION, DocumentContextId } from '../types.js';
-import type { CacheMirrorSnapshot, DocumentRow } from '../types.js';
+import { DocumentContextId } from '../types.js';
+import type { DocumentRow } from '../types.js';
 import { rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -58,8 +58,8 @@ describe('PgToSqliteSyncService', () => {
       const rand = Math.random().toString(36).slice(2);
       sourcePath = join(tmpdir(), `test-source-${ts}-${rand}.db`);
       targetPath = join(tmpdir(), `test-target-${ts}-${rand}.db`);
-      sourceDb = new SQLiteCacheService('source', sourcePath, true);
-      targetDb = new SQLiteCacheService('target', targetPath, true);
+      sourceDb = new SQLiteCacheService('source', sourcePath);
+      targetDb = new SQLiteCacheService('target', targetPath);
 
       // Populate source with test data
       await sourceDb.batchInsertDocuments(testDocs);
@@ -167,52 +167,6 @@ describe('PgToSqliteSyncService', () => {
       // Old doc should be gone
       const oldDoc = await targetDb.getDocument('old-doc');
       expect(oldDoc).toBeUndefined();
-    });
-
-    it('should atomically mirror non-item lines with the source snapshot', async () => {
-      await targetDb.insertDocument({
-        doc_id: 'old-doc',
-        context_id: DocumentContextId.Invoice,
-        doc_number: 9999,
-        issue_date: '2025-01-01',
-        customer_id: 'old-cust',
-        modified: 1000000,
-      });
-      const snapshot: CacheMirrorSnapshot = {
-        accounts: [],
-        documents: (await sourceDb.getDocumentsModifiedSince(0)).map((document, index) => index === 0
-          ? { ...document, snapshot_version: CACHE_SCHEMA_VERSION, snapshot_complete: 1 }
-          : document),
-        itemDocuments: testItems,
-        documentNonItemLines: [{
-          doc_id: 'doc-001',
-          document_item_id: 'line-adjustment',
-          line_type: 'non_item',
-          quantity: 1,
-          price: -25,
-          total_amount: -25,
-          net_amount: -25,
-        }],
-        items: [],
-        stockLocations: [],
-        state: await sourceDb.getCacheState(),
-        syncStatus: null,
-      };
-
-      targetDb.replaceMirrorSnapshot(snapshot);
-
-      expect(await targetDb.getDocument('old-doc')).toBeUndefined();
-      expect(await targetDb.getDocumentNonItemLines('doc-001')).toEqual([
-        expect.objectContaining({ document_item_id: 'line-adjustment', net_amount: -25 }),
-      ]);
-      expect(await targetDb.getDocument('doc-001')).toMatchObject({
-        snapshot_version: CACHE_SCHEMA_VERSION,
-        snapshot_complete: 1,
-      });
-      expect(await targetDb.getCacheState()).toMatchObject({
-        schemaVersion: CACHE_SCHEMA_VERSION,
-        nonItemDocumentCount: 1,
-      });
     });
 
     it('getRawMeta / setRawMeta should store and retrieve pull timestamp', () => {

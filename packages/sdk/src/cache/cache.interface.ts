@@ -4,9 +4,7 @@
 
 import type {
   AccountRow,
-  DocumentNonItemLineRow,
   DocumentRow,
-  DocumentSnapshot,
   ItemDocumentRow,
   ItemRow,
   ItemStockLocationRow,
@@ -26,8 +24,6 @@ export interface CacheService {
   getDbPath(): string;
 
   // ============ Document CRUD Operations ============
-  // Mutations require a writer lease: the SQLite maintenance lease or the
-  // PostgreSQL global advisory lock. Reader factories deliberately omit it.
 
   insertDocument(doc: DocumentRow): Promise<void>;
   getDocument(docId: string): Promise<DocumentRow | undefined>;
@@ -39,7 +35,6 @@ export interface CacheService {
   deleteDocument(docId: string): Promise<void>;
   batchInsertDocuments(docs: DocumentRow[]): Promise<void>;
   batchDeleteDocuments(docIds: string[]): Promise<void>;
-  replaceDocumentSnapshot(snapshot: DocumentSnapshot): Promise<void>;
 
   // ============ Item Document CRUD Operations ============
 
@@ -47,14 +42,6 @@ export interface CacheService {
   getItemDocuments(docId: string): Promise<ItemDocumentRow[]>;
   deleteItemDocuments(docId: string): Promise<void>;
   batchInsertItemDocuments(items: Omit<ItemDocumentRow, 'id'>[]): Promise<void>;
-
-  // ============ Non-Item Document Line CRUD Operations ============
-
-  insertDocumentNonItemLine(line: Omit<DocumentNonItemLineRow, 'id'>): Promise<void>;
-  getDocumentNonItemLines(docId: string): Promise<DocumentNonItemLineRow[]>;
-  getAllDocumentNonItemLines(): Promise<DocumentNonItemLineRow[]>;
-  deleteDocumentNonItemLines(docId: string): Promise<void>;
-  batchInsertDocumentNonItemLines(lines: Omit<DocumentNonItemLineRow, 'id'>[]): Promise<void>;
 
   // ============ Account CRUD Operations ============
 
@@ -146,7 +133,6 @@ export interface CacheService {
   setSyncStatus(status: CacheSyncStatus): Promise<void>;
   getDocumentCount(): Promise<number>;
   getItemDocumentCount(): Promise<number>;
-  getDocumentNonItemLineCount(): Promise<number>;
   getAccountCount(contextId?: number): Promise<number>;
   getItemCount(): Promise<number>;
   getStockLocationCount(): Promise<number>;
@@ -154,8 +140,6 @@ export interface CacheService {
 
   // ============ Connection Management ============
 
-  tryAcquireSyncLock(lockKey: string): Promise<boolean>;
-  releaseSyncLock(lockKey: string): Promise<void>;
   close(): Promise<void>;
   isOpen(): boolean;
 }

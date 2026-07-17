@@ -6,6 +6,8 @@
  * PostgreSQL is the shared source of truth (populated by `cache sync`).
  */
 
+import type { CacheService } from './cache.interface.js';
+import type { AccountRow, DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
 import { PostgresCacheService } from './postgres-cache.service.js';
 import { SQLiteCacheService } from './sqlite-cache.service.js';
 
@@ -15,7 +17,6 @@ export interface PgPullResult {
   accountsPulled: number;
   documentsPulled: number;
   itemDocumentsPulled: number;
-  documentNonItemLinesPulled: number;
   itemsPulled: number;
   stockRowsPulled: number;
   duration: string;
@@ -42,28 +43,128 @@ export async function pullFromPostgres(
     // Open both connections
     pg = new PostgresCacheService(pgConnectionString);
     await pg.ensureSchema();
-    sqlite = new SQLiteCacheService(sqliteAccountName, sqliteCustomPath, true);
+    sqlite = new SQLiteCacheService(sqliteAccountName, sqliteCustomPath);
 
-    // Read one repeatable-read PostgreSQL image, then atomically replace SQLite.
-    const snapshot = await pg.readMirrorSnapshot();
-    sqlite.replaceMirrorSnapshot(snapshot);
+    // 1. Pull all documents from PG
+    const allDocs = await getAllDocuments(pg);
+    const allItems = await getAllItemDocuments(pg);
+    const allAccounts = await getAllAccounts(pg);
+    const allMasterItems = await getAllItems(pg);
+    const allStockRows = await getAllStockRows(pg);
+    const pgState = await pg.getCacheState();
+
+    // 2. Clear SQLite tables (order matters: items first due to FK)
+    await clearSqliteTables(sqlite);
+
+    // 3. Bulk-insert into SQLite
+    if (allAccounts.length > 0) {
+      await sqlite.batchInsertAccounts(allAccounts);
+    }
+    if (allMasterItems.length > 0) {
+      await sqlite.batchInsertItems(allMasterItems);
+    }
+    if (allStockRows.length > 0) {
+      await sqlite.batchInsertItemStockLocations(allStockRows);
+    }
+    if (allDocs.length > 0) {
+      await sqlite.batchInsertDocuments(allDocs);
+    }
+    if (allItems.length > 0) {
+      await sqlite.batchInsertItemDocuments(allItems);
+    }
+
+    // 4. Copy cache metadata + record pull timestamp
+    if (pgState) {
+      await sqlite.setCacheState(pgState);
+    }
     // Store the pull timestamp in cache_meta so we can check next time
-    sqlite.setRawMeta('pg_pull_timestamp', String(Date.now()));
+    await setPgPullTimestamp(sqlite, Date.now());
 
     const duration = ((Date.now() - start) / 1000).toFixed(1);
 
     return {
       success: true,
-      accountsPulled: snapshot.accounts.length,
-      documentsPulled: snapshot.documents.length,
-      itemDocumentsPulled: snapshot.itemDocuments.length,
-      documentNonItemLinesPulled: snapshot.documentNonItemLines.length,
-      itemsPulled: snapshot.items.length,
-      stockRowsPulled: snapshot.stockLocations.length,
+      accountsPulled: allAccounts.length,
+      documentsPulled: allDocs.length,
+      itemDocumentsPulled: allItems.length,
+      itemsPulled: allMasterItems.length,
+      stockRowsPulled: allStockRows.length,
       duration: `${duration}s`,
     };
   } finally {
     try { if (pg) await pg.close(); } catch { /* ignore */ }
     try { if (sqlite) await sqlite.close(); } catch { /* ignore */ }
+  }
+}
+
+// ============ Internal helpers ============
+
+/** Fetch all documents from PG (batched to avoid memory issues) */
+async function getAllDocuments(pg: PostgresCacheService): Promise<DocumentRow[]> {
+  // Use getDocumentsModifiedSince(0) to get everything
+  return pg.getDocumentsModifiedSince(0);
+}
+
+async function getAllAccounts(pg: PostgresCacheService): Promise<AccountRow[]> {
+  return pg.getAllAccounts();
+}
+
+async function getAllItems(pg: PostgresCacheService): Promise<ItemRow[]> {
+  return pg.getAllItems();
+}
+
+async function getAllStockRows(pg: PostgresCacheService): Promise<ItemStockLocationRow[]> {
+  return pg.getAllItemStockLocations();
+}
+
+/** Fetch all item_documents from PG */
+async function getAllItemDocuments(pg: PostgresCacheService): Promise<Omit<ItemDocumentRow, 'id'>[]> {
+  // We need a raw query — add a helper method or use existing interface
+  // Get all doc_ids first, then batch-fetch item docs
+  const docs = await pg.getDocumentsModifiedSince(0);
+  const allItems: Omit<ItemDocumentRow, 'id'>[] = [];
+
+  // Batch by 100 doc_ids to avoid too many round-trips
+  const batchSize = 100;
+  for (let i = 0; i < docs.length; i += batchSize) {
+    const batch = docs.slice(i, i + batchSize);
+    const promises = batch.map(doc => pg.getItemDocuments(doc.doc_id));
+    const results = await Promise.all(promises);
+    for (const items of results) {
+      for (const item of items) {
+        allItems.push({
+          document_item_id: item.document_item_id,
+          item_id: item.item_id,
+          doc_id: item.doc_id,
+          quantity: item.quantity,
+          price: item.price,
+          item_name: item.item_name,
+          item_number: item.item_number,
+          item_sku: item.item_sku,
+          item_location: item.item_location,
+          line_description: item.line_description,
+          quantity_received: item.quantity_received,
+          cost: item.cost,
+          total_amount: item.total_amount,
+          discounted_price: item.discounted_price,
+          discount_percent: item.discount_percent,
+        });
+      }
+    }
+  }
+
+  return allItems;
+}
+
+/** Clear SQLite data tables (preserving schema) */
+async function clearSqliteTables(sqlite: SQLiteCacheService): Promise<void> {
+  await sqlite.clearAll();
+}
+
+/** Store PG pull timestamp in SQLite cache_meta */
+async function setPgPullTimestamp(sqlite: CacheService, timestamp: number): Promise<void> {
+  const sqliteService = sqlite as SQLiteCacheService;
+  if ('setRawMeta' in sqliteService) {
+    (sqliteService as any).setRawMeta('pg_pull_timestamp', String(timestamp));
   }
 }

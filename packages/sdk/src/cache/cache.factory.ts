@@ -10,7 +10,6 @@
 import type { CacheService } from './cache.interface.js';
 import { SQLiteCacheService } from './sqlite-cache.service.js';
 import { PostgresCacheService } from './postgres-cache.service.js';
-import { CACHE_WRITER_LOCK_KEY } from './types.js';
 
 const DATABASE_URL_ENV = ['SALESBINDER', 'DB', 'URL'].join('_');
 const READ_BACKEND_ENV = ['SALESBINDER', 'READ', 'BACKEND'].join('_');
@@ -27,31 +26,16 @@ export function getPostgresReadUrl(env: NodeJS.ProcessEnv = process.env): string
  *
  * @param accountName - Account name (used for SQLite file isolation)
  * @param customPath  - Optional custom path (SQLite only, for testing)
- * @param writable    - Hold the backend's global writer lease until close
  */
-export async function createCacheService(
-  accountName: string,
-  customPath?: string,
-  writable = false
-): Promise<CacheService> {
+export async function createCacheService(accountName: string, customPath?: string): Promise<CacheService> {
   const readDbUrl = getPostgresReadUrl();
   if (readDbUrl) {
     const pg = new PostgresCacheService(readDbUrl);
-    try {
-      if (writable) {
-        if (!await pg.tryAcquireSyncLock(CACHE_WRITER_LOCK_KEY)) {
-          throw new Error('Another cache writer is already running.');
-        }
-        await pg.ensureSchema();
-      }
-      return pg;
-    } catch (error) {
-      await pg.close();
-      throw error;
-    }
+    await pg.ensureSchema();
+    return pg;
   }
 
-  return new SQLiteCacheService(accountName, customPath, writable);
+  return new SQLiteCacheService(accountName, customPath);
 }
 
 /**
@@ -63,14 +47,6 @@ export async function createPostgresCacheService(): Promise<PostgresCacheService
   const dbUrl = process.env.SALESBINDER_DB_URL;
   if (!dbUrl) return null;
   const service = new PostgresCacheService(dbUrl);
-  try {
-    if (!await service.tryAcquireSyncLock(CACHE_WRITER_LOCK_KEY)) {
-      throw new Error('Another cache writer is already running.');
-    }
-    await service.ensureSchema();
-    return service;
-  } catch (error) {
-    await service.close();
-    throw error;
-  }
+  await service.ensureSchema();
+  return service;
 }

@@ -4,16 +4,8 @@
 
 import type { SalesBinderClient } from '../resources/index.js';
 import type { CacheService } from './cache.interface.js';
-import type {
-  DocumentNonItemLineRow,
-  DocumentRow,
-  DocumentSnapshot,
-  DocumentSyncCheckpoint,
-  ItemDocumentRow,
-  SyncOptions,
-  SyncResult,
-} from './types.js';
-import { CACHE_SCHEMA_VERSION, DocumentContextId } from './types.js';
+import type { DocumentRow, ItemDocumentRow, SyncOptions, SyncResult, CacheState } from './types.js';
+import { DocumentContextId } from './types.js';
 import type { Document, DocumentListResponse } from '../types/documents.types.js';
 
 /**
@@ -22,16 +14,13 @@ import type { Document, DocumentListResponse } from '../types/documents.types.js
 export class DocumentIndexerService {
   private readonly staleThreshold: number;
   private readonly syncLookbackSeconds: number;
-  private readonly detailRequestIntervalMs: number;
-  private nextDetailRequestAt = 0;
 
   constructor(
     private client: SalesBinderClient,
     private cache: CacheService,
     private readonly accountName: string,
     staleThresholdSeconds?: number,
-    syncLookbackSeconds?: number,
-    detailRequestsPerSecond = 0.75
+    syncLookbackSeconds?: number
   ) {
     // Priority: env var > config parameter > default (3600s = 1 hour)
     const envValue = process.env.SALESBINDER_CACHE_STALE_SECONDS;
@@ -42,10 +31,6 @@ export class DocumentIndexerService {
     this.syncLookbackSeconds = lookbackValue
       ? parseInt(lookbackValue, 10)
       : (syncLookbackSeconds ?? 604800);
-    const detailRate = Number.isFinite(detailRequestsPerSecond) && detailRequestsPerSecond > 0
-      ? detailRequestsPerSecond
-      : 0.75;
-    this.detailRequestIntervalMs = Math.ceil(1000 / detailRate);
   }
 
   /**
@@ -53,15 +38,9 @@ export class DocumentIndexerService {
    */
   async sync(options: SyncOptions = {}): Promise<SyncResult> {
     const state = await this.cache.getCacheState();
-    const pendingSyncType = state?.documentSyncCheckpoint?.accountName === this.accountName
-      ? state.documentSyncCheckpoint.syncType
-      : undefined;
-    const needsInitialSync = !state
-      || state.accountName !== this.accountName
-      || state.schemaVersion !== CACHE_SCHEMA_VERSION
-      || !state.lastDocumentSync;
+    const needsInitialSync = !state || state.accountName !== this.accountName;
 
-    if (options.full || pendingSyncType === 'full' || (!pendingSyncType && needsInitialSync)) {
+    if (options.full || needsInitialSync) {
       return this.fullSync(options);
     } else {
       return this.deltaSync(options);
@@ -73,354 +52,231 @@ export class DocumentIndexerService {
    */
   async isCacheStale(): Promise<boolean> {
     const state = await this.cache.getCacheState();
-    if (!state?.lastDocumentSync) return true;
+    if (!state) return true;
     const staleTime = Math.floor(Date.now() / 1000) - this.staleThreshold;
-    return state.lastDocumentSync < staleTime;
+    return state.lastSync < staleTime;
   }
 
   /**
    * Perform full sync - fetch all documents
    */
   private async fullSync(options: SyncOptions): Promise<SyncResult> {
-    return this.runSync('full', options);
+    const startTime = Date.now();
+    let totalDocuments = 0;
+    let totalLineItems = 0;
+
+    try {
+      const contexts = [
+        { id: DocumentContextId.Estimate, name: 'Estimate' },
+        { id: DocumentContextId.Invoice, name: 'Invoice' },
+        { id: DocumentContextId.PurchaseOrder, name: 'Purchase Order' },
+      ];
+
+      for (const context of contexts) {
+        console.error(`Syncing ${context.name}s...`);
+
+        let page = 1;
+        let hasMore = true;
+
+        while (hasMore) {
+          let response: DocumentListResponse;
+          try {
+            response = await this.client.documents.list({
+              contextId: context.id,
+              page,
+              pageLimit: 50,
+            });
+          } catch (error: any) {
+            // 404 means we've reached the end of available pages
+            if (error?.response?.status === 404) {
+              hasMore = false;
+              break;
+            }
+            // Re-throw other errors
+            throw error;
+          }
+
+          const documents = this.flattenDocumentArray(response?.documents);
+          if (!documents || documents.length === 0) {
+            hasMore = false;
+            break;
+          }
+
+          // Process documents from list response (includes line items in most cases)
+          for (const doc of documents) {
+            try {
+              let fullDoc = doc;
+              
+              // Only fetch individual document if line items are missing
+              if (!doc.document_items || doc.document_items.length === 0) {
+                fullDoc = await this.client.documents.get(doc.id);
+                // Add small delay after individual fetch to avoid rate limits
+                await this.delay(200);
+              }
+
+              // Process document
+              const { docRow, itemRows } = this.processDocument(fullDoc);
+
+              const savedItems = await this.writeDocument(docRow, itemRows);
+
+              totalDocuments++;
+              totalLineItems += savedItems;
+
+              if (options.onProgress) {
+                options.onProgress(totalDocuments, -1);
+              }
+            } catch (error: any) {
+              const isRateLimit = error?.response?.status === 429;
+              if (!isRateLimit) {
+                console.error(`Failed to fetch document ${doc.id}:`, error?.message || error);
+              }
+            }
+          }
+
+          page++;
+
+          // Rate limiting: pause between pages to avoid rate limits
+          await this.delay(500);
+        }
+      }
+
+      // Update cache state
+      const now = Math.floor(Date.now() / 1000);
+      await this.cache.setCacheState({
+        lastSync: now,
+        lastFullSync: now,
+        documentCount: totalDocuments,
+        itemDocumentCount: totalLineItems,
+        accountName: this.accountName,
+        schemaVersion: 2,
+      });
+
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+
+      return {
+        success: true,
+        type: 'full',
+        documentsProcessed: totalDocuments,
+        lineItemsProcessed: totalLineItems,
+        syncLookbackSeconds: this.syncLookbackSeconds,
+        duration: `${duration}s`,
+      };
+    } catch (error) {
+      console.error('Full sync failed:', error);
+      throw error;
+    }
   }
 
   /**
    * Perform delta sync - fetch only modified documents
    */
   private async deltaSync(options: SyncOptions): Promise<SyncResult> {
-    return this.runSync('delta', options);
-  }
-
-  private async runSync(type: 'full' | 'delta', options: SyncOptions): Promise<SyncResult> {
     const startTime = Date.now();
-    const state = await this.cache.getCacheState();
-    const resumable = state?.documentSyncCheckpoint?.accountName === this.accountName
-      && state.documentSyncCheckpoint.syncType === type;
-    const sourceModifiedSince = type === 'full'
-      ? 0
-      : Math.max(0, (state?.lastDocumentSync ?? 0) - this.syncLookbackSeconds);
-    const checkpoint: DocumentSyncCheckpoint = resumable
-      ? {
-          ...state!.documentSyncCheckpoint!,
-          phase: state!.documentSyncCheckpoint!.phase ?? 'primary',
-          retryDocumentIds: [...state!.documentSyncCheckpoint!.retryDocumentIds],
-          retryDocumentIdentities: { ...state!.documentSyncCheckpoint!.retryDocumentIdentities },
-        }
-      : {
-          accountName: this.accountName,
-          syncType: type,
-          phase: 'primary',
-          startedAt: Math.floor(startTime / 1000),
-          sourceModifiedSince,
-          nextContextIndex: 0,
-          nextPage: 1,
-          retryDocumentIds: [],
-          retryDocumentIdentities: {},
-        };
-    await this.persistCheckpoint(checkpoint);
-    let documentsProcessed = 0;
-    let documentsDeleted = 0;
-    let lineItemsProcessed = 0;
-    let nonItemLinesProcessed = 0;
-    const retryDocumentIds = new Set(checkpoint.retryDocumentIds);
-    const retryDocumentIdentities = new Map(
-      Object.entries(checkpoint.retryDocumentIdentities ?? {})
-        .filter(([documentId]) => retryDocumentIds.has(documentId))
-    );
-    const contexts = [
-      { id: DocumentContextId.Estimate, name: 'Estimate' },
-      { id: DocumentContextId.Invoice, name: 'Invoice' },
-      { id: DocumentContextId.PurchaseOrder, name: 'Purchase Order' },
-    ];
+    const state = (await this.cache.getCacheState())!;
+    let documentsUpdated = 0;
+    const documentsDeleted = 0;
+    let lineItemsUpdated = 0;
 
     try {
-      let shouldRunAnotherPass = true;
-      while (shouldRunAnotherPass) {
-        shouldRunAnotherPass = false;
-        const pass = await this.traverseCheckpoint(
-          checkpoint,
-          contexts,
-          type === 'full' && checkpoint.phase === 'primary',
-          retryDocumentIds,
-          retryDocumentIdentities,
-          options
-        );
-        documentsProcessed += pass.documents;
-        documentsDeleted += pass.documentsDeleted;
-        lineItemsProcessed += pass.itemLines;
-        nonItemLinesProcessed += pass.nonItemLines;
+      const lastSyncTime = Math.max(0, state.lastSync - this.syncLookbackSeconds);
+      const contexts = [DocumentContextId.Estimate, DocumentContextId.Invoice, DocumentContextId.PurchaseOrder];
 
-        const retried = await this.retryFailedDocuments(
-          checkpoint,
-          retryDocumentIds,
-          retryDocumentIdentities,
-          options
-        );
-        documentsProcessed += retried.documents;
-        documentsDeleted += retried.documentsDeleted;
-        lineItemsProcessed += retried.itemLines;
-        nonItemLinesProcessed += retried.nonItemLines;
+      for (const contextId of contexts) {
+        let page = 1;
+        let hasMore = true;
 
-        if (retryDocumentIds.size > 0) break;
-        if (type === 'full' && checkpoint.phase === 'primary') {
-          checkpoint.phase = 'catch_up';
-          checkpoint.sourceModifiedSince = Math.max(0, checkpoint.startedAt - 1);
-          checkpoint.endWatermark = Math.floor(Date.now() / 1000);
-          checkpoint.nextContextIndex = 0;
-          checkpoint.nextPage = 1;
-          checkpoint.retryDocumentIds = [];
-          checkpoint.retryDocumentIdentities = {};
-          retryDocumentIdentities.clear();
-          await this.persistCheckpoint(checkpoint);
-          shouldRunAnotherPass = true;
+        while (hasMore) {
+          let response: DocumentListResponse;
+          try {
+            response = await this.client.documents.list({
+              contextId,
+              modifiedSince: lastSyncTime,
+              page,
+              pageLimit: 50,
+            });
+          } catch (error: any) {
+            // 404 means we've reached the end of available pages
+            if (error?.response?.status === 404) {
+              hasMore = false;
+              break;
+            }
+            // Re-throw other errors
+            throw error;
+          }
+
+          const documents = this.flattenDocumentArray(response?.documents);
+          if (!documents || documents.length === 0) {
+            hasMore = false;
+            break;
+          }
+
+          for (const doc of documents) {
+            try {
+              let fullDoc = doc;
+              
+              // Only fetch individual document if line items are missing
+              if (!doc.document_items || doc.document_items.length === 0) {
+                fullDoc = await this.client.documents.get(doc.id);
+                await this.delay(200);
+              }
+              
+              const { docRow, itemRows } = this.processDocument(fullDoc);
+
+              const savedItems = await this.writeDocument(docRow, itemRows);
+
+              documentsUpdated++;
+              lineItemsUpdated += savedItems;
+
+              if (options.onProgress) {
+                options.onProgress(documentsUpdated, -1);
+              }
+            } catch (error: any) {
+              const isRateLimit = error?.response?.status === 429;
+              if (!isRateLimit) {
+                console.error(`Failed to fetch document ${doc.id}:`, error?.message || error);
+              }
+            }
+          }
+
+          page++;
+          await this.delay(500);
         }
       }
 
-      const failedIds = [...retryDocumentIds];
-      const success = failedIds.length === 0
-        && (type === 'delta' || checkpoint.phase === 'catch_up');
-      if (success) await this.commitSuccessfulState(type, checkpoint);
+      // Update cache state
+      const now = Math.floor(Date.now() / 1000);
+      const updatedState: CacheState = {
+        ...state,
+        lastSync: now,
+        documentCount: await this.cache.getDocumentCount(),
+        itemDocumentCount: await this.cache.getItemDocumentCount(),
+      };
+      await this.cache.setCacheState(updatedState);
+
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+
       return {
-        success,
-        type,
-        documentsProcessed,
+        success: true,
+        type: 'delta',
+        documentsProcessed: documentsUpdated,
         documentsDeleted,
-        lineItemsProcessed,
-        nonItemLinesProcessed,
-        failedDocuments: failedIds.length,
-        retryDocumentIds: failedIds,
+        lineItemsProcessed: lineItemsUpdated,
         syncLookbackSeconds: this.syncLookbackSeconds,
         duration: `${duration}s`,
       };
     } catch (error) {
-      console.error(`${type === 'full' ? 'Full' : 'Delta'} sync failed:`, error);
+      console.error('Delta sync failed:', error);
       throw error;
     }
-  }
-
-  private async traverseCheckpoint(
-    checkpoint: DocumentSyncCheckpoint,
-    contexts: Array<{ id: DocumentContextId; name: string }>,
-    useFullList: boolean,
-    retryDocumentIds: Set<string>,
-    retryDocumentIdentities: Map<string, { contextId: number; documentNumber: number }>,
-    options: SyncOptions
-  ): Promise<{ documents: number; documentsDeleted: number; itemLines: number; nonItemLines: number }> {
-    let documents = 0;
-    let documentsDeleted = 0;
-    let itemLines = 0;
-    let nonItemLines = 0;
-    const seenDocumentIds = new Set<string>();
-
-    for (let contextIndex = checkpoint.nextContextIndex; contextIndex < contexts.length; contextIndex++) {
-      const context = contexts[contextIndex];
-      console.error(`Syncing ${context.name}s${checkpoint.phase === 'catch_up' ? ' (catch-up)' : ''}...`);
-      let page = contextIndex === checkpoint.nextContextIndex ? checkpoint.nextPage : 1;
-
-      let shouldFetchPage = true;
-      while (shouldFetchPage) {
-        let response: DocumentListResponse;
-        try {
-          response = await this.client.documents.list({
-            contextId: context.id,
-            ...(useFullList ? {} : { modifiedSince: checkpoint.sourceModifiedSince }),
-            page,
-            pageLimit: 50,
-          });
-        } catch (error: any) {
-          if (error?.response?.status === 404) {
-            shouldFetchPage = false;
-            continue;
-          }
-          throw error;
-        }
-        const listedDocuments = this.flattenDocumentArray(response?.documents);
-        if (listedDocuments.length === 0) {
-          shouldFetchPage = false;
-          continue;
-        }
-
-        for (const document of listedDocuments) {
-          if (seenDocumentIds.has(document.id)) continue;
-          seenDocumentIds.add(document.id);
-          try {
-            const saved = await this.fetchAndReplaceDocument(document.id, {
-              contextId: document.context_id,
-              documentNumber: document.document_number,
-            });
-            retryDocumentIds.delete(document.id);
-            retryDocumentIdentities.delete(document.id);
-            documents++;
-            if (saved.deleted) documentsDeleted++;
-            itemLines += saved.itemLines;
-            nonItemLines += saved.nonItemLines;
-            options.onProgress?.(documents, -1);
-          } catch (error: any) {
-            retryDocumentIds.add(document.id);
-            retryDocumentIdentities.set(document.id, {
-              contextId: document.context_id,
-              documentNumber: document.document_number,
-            });
-            console.error(`Failed to replace document ${document.id}:`, error?.message || error);
-          }
-        }
-
-        page++;
-        await this.updateCheckpoint(
-          checkpoint,
-          contextIndex,
-          page,
-          retryDocumentIds,
-          retryDocumentIdentities
-        );
-        await this.delay(500);
-      }
-      await this.updateCheckpoint(
-        checkpoint,
-        contextIndex + 1,
-        1,
-        retryDocumentIds,
-        retryDocumentIdentities
-      );
-    }
-    return { documents, documentsDeleted, itemLines, nonItemLines };
-  }
-
-  private async retryFailedDocuments(
-    checkpoint: DocumentSyncCheckpoint,
-    retryDocumentIds: Set<string>,
-    retryDocumentIdentities: Map<string, { contextId: number; documentNumber: number }>,
-    options: SyncOptions
-  ): Promise<{ documents: number; documentsDeleted: number; itemLines: number; nonItemLines: number }> {
-    let documents = 0;
-    let documentsDeleted = 0;
-    let itemLines = 0;
-    let nonItemLines = 0;
-    for (const documentId of [...retryDocumentIds]) {
-      try {
-        const saved = await this.fetchAndReplaceDocument(
-          documentId,
-          retryDocumentIdentities.get(documentId)
-        );
-        retryDocumentIds.delete(documentId);
-        retryDocumentIdentities.delete(documentId);
-        documents++;
-        if (saved.deleted) documentsDeleted++;
-        itemLines += saved.itemLines;
-        nonItemLines += saved.nonItemLines;
-        options.onProgress?.(documents, -1);
-      } catch (error: any) {
-        console.error(`Retry failed for document ${documentId}:`, error?.message || error);
-      }
-    }
-    checkpoint.retryDocumentIds = [...retryDocumentIds];
-    checkpoint.retryDocumentIdentities = Object.fromEntries(retryDocumentIdentities);
-    await this.persistCheckpoint(checkpoint);
-    return { documents, documentsDeleted, itemLines, nonItemLines };
-  }
-
-  private async fetchAndReplaceDocument(
-    documentId: string,
-    listedIdentity?: { contextId: number; documentNumber: number }
-  ): Promise<{ itemLines: number; nonItemLines: number; deleted: boolean }> {
-    let sourceFetchedAt = Math.floor(Date.now() / 1000);
-    let firstRequestStart = true;
-    let fullDocument: Document;
-    try {
-      fullDocument = await this.client.documents.get(documentId, {
-        beforeRequestStart: async () => {
-          await this.waitForDetailRequestSlot();
-          if (firstRequestStart) {
-            sourceFetchedAt = Math.floor(Date.now() / 1000);
-            firstRequestStart = false;
-          }
-        },
-      });
-    } catch (error: any) {
-      if (!isNotFoundError(error)) throw error;
-      const cachedByApiId = await this.cache.getDocumentByApiId(documentId);
-      const cachedByNumber = !cachedByApiId && listedIdentity
-        ? await this.cache.getDocumentByNumber(listedIdentity.contextId, listedIdentity.documentNumber)
-        : undefined;
-      await this.cache.deleteDocument(cachedByApiId?.doc_id ?? cachedByNumber?.doc_id ?? documentId);
-      return { itemLines: 0, nonItemLines: 0, deleted: true };
-    }
-    if (fullDocument.id !== documentId) {
-      throw new Error(`Document detail identity mismatch for ${documentId}`);
-    }
-    const snapshot = this.processDocument(fullDocument, sourceFetchedAt);
-    await this.cache.replaceDocumentSnapshot(snapshot);
-    return {
-      itemLines: snapshot.itemLines.length,
-      nonItemLines: snapshot.nonItemLines.length,
-      deleted: false,
-    };
-  }
-
-  private async commitSuccessfulState(
-    type: 'full' | 'delta',
-    checkpoint: DocumentSyncCheckpoint
-  ): Promise<void> {
-    const state = await this.cache.getCacheState();
-    const safeWatermark = checkpoint.endWatermark ?? checkpoint.startedAt;
-    await this.cache.setCacheState({
-      ...state,
-      lastSync: safeWatermark,
-      lastFullSync: type === 'full' ? safeWatermark : state?.lastFullSync ?? 0,
-      lastDocumentSync: safeWatermark,
-      lastFullDocumentSync: type === 'full' ? safeWatermark : state?.lastFullDocumentSync,
-      documentCount: await this.cache.getDocumentCount(),
-      itemDocumentCount: await this.cache.getItemDocumentCount(),
-      nonItemDocumentCount: await this.cache.getDocumentNonItemLineCount(),
-      accountName: this.accountName,
-      schemaVersion: CACHE_SCHEMA_VERSION,
-      documentSyncCheckpoint: undefined,
-    });
-  }
-
-  private async updateCheckpoint(
-    checkpoint: DocumentSyncCheckpoint,
-    nextContextIndex: number,
-    nextPage: number,
-    retryDocumentIds: Set<string>,
-    retryDocumentIdentities: Map<string, { contextId: number; documentNumber: number }>
-  ): Promise<void> {
-    checkpoint.nextContextIndex = nextContextIndex;
-    checkpoint.nextPage = nextPage;
-    checkpoint.retryDocumentIds = [...retryDocumentIds];
-    checkpoint.retryDocumentIdentities = Object.fromEntries(retryDocumentIdentities);
-    await this.persistCheckpoint(checkpoint);
-  }
-
-  private async persistCheckpoint(checkpoint: DocumentSyncCheckpoint): Promise<void> {
-    const state = await this.cache.getCacheState();
-    await this.cache.setCacheState({
-      ...state,
-      lastSync: state?.lastSync ?? 0,
-      lastFullSync: state?.lastFullSync ?? 0,
-      documentCount: state?.documentCount ?? 0,
-      itemDocumentCount: state?.itemDocumentCount ?? 0,
-      accountName: this.accountName,
-      schemaVersion: CACHE_SCHEMA_VERSION,
-      documentSyncCheckpoint: checkpoint,
-    });
-  }
-
-  private async waitForDetailRequestSlot(): Promise<void> {
-    const waitMs = Math.max(0, this.nextDetailRequestAt - Date.now());
-    if (waitMs > 0) await this.delay(waitMs);
-    this.nextDetailRequestAt = Date.now() + this.detailRequestIntervalMs;
   }
 
   /**
    * Process a document into database rows
    */
-  private processDocument(doc: Document, sourceFetchedAt: number): DocumentSnapshot {
-    if (!Array.isArray(doc.document_items)) {
-      throw new Error(`Authoritative detail for document ${doc.id} omitted document_items`);
-    }
+  private processDocument(doc: Document): {
+    docRow: DocumentRow;
+    itemRows: Omit<ItemDocumentRow, 'id'>[];
+  } {
     // Normalize issue_date to YYYY-MM-DD format for consistent querying
     const issueDate = doc.issue_date ? doc.issue_date.split('T')[0] : doc.issue_date;
     const accountContextId = doc.context_id === DocumentContextId.PurchaseOrder ? 10 : 2;
@@ -429,8 +285,6 @@ export class DocumentIndexerService {
       ?? [doc.user?.first_name, doc.user?.last_name].filter(Boolean).join(' ')
       ?? null;
     const statusName = doc.status?.name ?? null;
-    const headerSubtotal = finiteDocumentNumber(doc.total_price, 'total_price', doc.id);
-    const headerCogs = finiteDocumentNumber(doc.total_cost, 'total_cost', doc.id);
     
     const docRow: DocumentRow = {
       doc_id: doc.id,
@@ -453,89 +307,45 @@ export class DocumentIndexerService {
       supplier_number: doc.context_id === DocumentContextId.PurchaseOrder ? doc.customer?.customer_number ?? null : null,
       status_id: doc.status_id,
       status_name: statusName,
-      total_price: headerSubtotal,
-      total_cost: headerCogs,
-      subtotal: headerSubtotal,
-      date_sent: doc.date_sent,
-      shipped_percent: doc.shipped_percent,
-      source_fetched_at: sourceFetchedAt,
-      snapshot_version: CACHE_SCHEMA_VERSION,
-      snapshot_complete: 1,
+      total_price: doc.total_price,
+      total_cost: doc.total_cost,
+      subtotal: doc.total_price,
       is_cancelled: statusName && /cancelled|canceled/i.test(statusName) ? 1 : 0,
       modified: Math.floor(new Date(doc.modified).getTime() / 1000),
     };
-    if (!Number.isFinite(docRow.modified)) {
-      throw new Error(`Document ${doc.id} has invalid modified timestamp`);
-    }
 
-    const sourceIds = new Set<string>();
-    const itemLines: Omit<ItemDocumentRow, 'id'>[] = [];
-    const nonItemLines: Omit<DocumentNonItemLineRow, 'id'>[] = [];
-    for (const item of doc.document_items) {
-      if (!item.id?.trim() || item.document_id !== doc.id) {
-        throw new Error(`Document ${doc.id} contains a line with invalid source identity`);
-      }
-      if (sourceIds.has(item.id)) {
-        throw new Error(`Document ${doc.id} contains duplicate source line ${item.id}`);
-      }
-      sourceIds.add(item.id);
-      const quantity = finiteNumber(item.quantity, 'quantity', doc.id, item.id);
-      const price = finiteNumber(item.price, 'price', doc.id, item.id);
-      const discountPercent = finiteNumber(item.discount_percent ?? 0, 'discount_percent', doc.id, item.id);
-      const totalAmount = quantity * price;
-
-      if (item.item_id) {
-        const cost = finiteNumber(item.cost, 'cost', doc.id, item.id);
-        itemLines.push({
-          item_id: item.item_id,
-          doc_id: doc.id,
-          document_item_id: item.id,
-          quantity,
-          price,
-          item_name: item.name ?? item.description ?? null,
-          line_description: item.description ?? null,
-          quantity_received: item.quantity_partially_received ?? null,
-          quantity_shipped: item.quantity_partially_shipped,
-          cost,
-          total_amount: totalAmount,
-          discounted_price: item.discounted_price ?? null,
-          discount_percent: discountPercent,
-        });
-        continue;
-      }
-
-      nonItemLines.push({
+    const itemRows: Omit<ItemDocumentRow, 'id'>[] = (doc.document_items || [])
+      .filter((item) => item.item_id)
+      .map((item) => ({
+        item_id: item.item_id!,
         doc_id: doc.id,
         document_item_id: item.id,
-        line_type: 'non_item',
-        name: item.name ?? null,
+        quantity: item.quantity,
+        price: item.price,
+        item_name: item.name ?? item.description ?? null,
         line_description: item.description ?? null,
-        service_category_id: item.service_category_id ?? null,
-        unit_id: item.unit_id ?? null,
-        quantity,
-        price,
+        quantity_received: item.quantity_partially_received ?? null,
         cost: item.cost ?? null,
-        total_amount: totalAmount,
+        total_amount: item.quantity * item.price,
         discounted_price: item.discounted_price ?? null,
-        discount_percent: discountPercent,
-        net_amount: totalAmount * (1 - discountPercent / 100),
-        tax: item.tax ?? null,
-        tax2: item.tax2 ?? null,
-        weight: item.weight ?? null,
-        source_created: item.created ?? null,
-        source_modified: item.modified ?? null,
-        raw_classification: JSON.stringify({
-          has_item_id: false,
-          source_name: item.name ?? null,
-          service_category_id: item.service_category_id ?? null,
-          unit_id: item.unit_id ?? null,
-          item_variations_location_id: item.item_variations_location_id ?? null,
-          item_variation_data: item.item_variation_data ?? null,
-        }),
-      });
-    }
+        discount_percent: item.discount_percent ?? null,
+      }));
 
-    return { document: docRow, itemLines, nonItemLines, sourceFetchedAt };
+    return { docRow, itemRows };
+  }
+
+  private async writeDocument(docRow: DocumentRow, itemRows: Omit<ItemDocumentRow, 'id'>[]): Promise<number> {
+    const existingByApiId = docRow.api_doc_id ? await this.cache.getDocumentByApiId(docRow.api_doc_id) : undefined;
+    const existingByNumber = await this.cache.getDocumentByNumber(docRow.context_id, docRow.doc_number);
+    const existing = existingByApiId ?? existingByNumber;
+    const resolvedDocId = existing?.doc_id ?? docRow.doc_id;
+    const resolvedDoc = { ...docRow, doc_id: resolvedDocId };
+    const resolvedItems = itemRows.map((item) => ({ ...item, doc_id: resolvedDocId }));
+
+    await this.cache.deleteItemDocuments(resolvedDocId);
+    await this.cache.insertDocument(resolvedDoc);
+    await this.cache.batchInsertItemDocuments(resolvedItems);
+    return resolvedItems.length;
   }
 
   /**
@@ -552,28 +362,4 @@ export class DocumentIndexerService {
   private delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
-}
-
-function finiteNumber(value: unknown, field: string, docId: string, lineId: string): number {
-  if (value === null || value === undefined || value === '') {
-    throw new Error(`Document ${docId} line ${lineId} omitted ${field}`);
-  }
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
-    throw new Error(`Document ${docId} line ${lineId} has invalid ${field}`);
-  }
-  return numeric;
-}
-
-function finiteDocumentNumber(value: unknown, field: string, docId: string): number {
-  if (value === null || value === undefined || value === '') {
-    throw new Error(`Document ${docId} omitted ${field}`);
-  }
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) throw new Error(`Document ${docId} has invalid ${field}`);
-  return numeric;
-}
-
-function isNotFoundError(error: unknown): boolean {
-  return (error as { response?: { status?: number } } | null)?.response?.status === 404;
 }

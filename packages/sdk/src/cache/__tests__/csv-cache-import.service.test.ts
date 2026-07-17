@@ -14,7 +14,7 @@ describe('CsvCacheImportService', () => {
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'salesbinder-csv-fixture-'));
     dbPath = join(dir, 'cache.db');
-    cache = new SQLiteCacheService('test', dbPath, true);
+    cache = new SQLiteCacheService('test', dbPath);
     importer = new CsvCacheImportService(cache);
     writeFixtureSet(dir);
   });
@@ -25,7 +25,7 @@ describe('CsvCacheImportService', () => {
   });
 
   it('dry-runs synthetic exports without writes', async () => {
-    const result = await new CsvCacheImportService().importDirectory(dir, { dryRun: true, accountName: 'test' });
+    const result = await importer.importDirectory(dir, { dryRun: true, accountName: 'test' });
 
     expect(result.accounts.total).toBe(2);
     expect(result.documents.total).toBe(2);
@@ -33,11 +33,6 @@ describe('CsvCacheImportService', () => {
     expect(result.items.item_rows).toBe(1);
     expect(result.items.stock_location_rows).toBe(1);
     expect(await cache.getDocumentCount()).toBe(0);
-  });
-
-  it('requires an explicit writable cache for a real import', async () => {
-    await expect(new CsvCacheImportService().importDirectory(dir, { accountName: 'test' }))
-      .rejects.toThrow(/writable cache service is required/i);
   });
 
   it('imports and reimports synthetic exports idempotently', async () => {
@@ -62,90 +57,6 @@ describe('CsvCacheImportService', () => {
     await expect(importer.importDirectory(dir, { accountName: 'test' }))
       .rejects.toThrow(/missing Account Number/);
     expect(await cache.getAccountCount()).toBe(0);
-  });
-
-  it('preserves API-owned catalog rows and clears API catalog watermarks', async () => {
-    await cache.insertAccount({
-      account_id: 'cust-a',
-      context_id: 2,
-      account_number: 101,
-      name: 'Authoritative API customer',
-      archived: 0,
-      cache_source: 'api',
-    });
-    await cache.insertItem({
-      item_id: 'item-a',
-      item_number: 5001,
-      name: 'Authoritative API item',
-      category_id: 'api-category',
-      category_name: 'Authoritative API category',
-      quantity: 99,
-      cost: 7,
-      price: 11,
-      cache_source: 'api',
-    });
-    await cache.insertItemStockLocation({
-      stock_row_id: 'api-stock-a',
-      item_id: 'item-a',
-      item_number: 5001,
-      location_id: 'api-location',
-      location_name: 'API warehouse',
-      category_name: 'Authoritative API category',
-      quantity_on_hand: 99,
-      quantity_reserved: 2,
-      quantity_available: 97,
-      quantity_incoming: 3,
-      in_transit: 4,
-      price: 11,
-      cost: 7,
-      cache_source: 'api',
-    });
-    await cache.setCacheState({
-      lastSync: 100,
-      lastFullSync: 100,
-      documentCount: 0,
-      itemDocumentCount: 0,
-      accountName: 'test',
-      schemaVersion: 3,
-      lastAccountSync: 90,
-      lastItemSync: 90,
-      lastFullItemSync: 80,
-      lastDocumentSync: 90,
-      lastFullDocumentSync: 80,
-      lastDeletedSync: 90,
-    });
-
-    await importer.importDirectory(dir, { accountName: 'test' });
-
-    expect(await cache.getItem('item-a')).toMatchObject({
-      name: 'Authoritative API item',
-      category_id: 'api-category',
-      category_name: 'Authoritative API category',
-      quantity: 99,
-      cache_source: 'api',
-    });
-    expect(await cache.getAccount('cust-a')).toMatchObject({
-      name: 'Authoritative API customer',
-      cache_source: 'api',
-    });
-    expect(await cache.getItemStockLocations('item-a')).toEqual([
-      expect.objectContaining({
-        stock_row_id: 'api-stock-a',
-        category_name: 'Authoritative API category',
-        quantity_on_hand: 99,
-        cache_source: 'api',
-      }),
-    ]);
-    expect(await cache.getCacheState()).toEqual(expect.objectContaining({
-      accountName: 'test',
-      schemaVersion: 3,
-    }));
-    expect((await cache.getCacheState())?.lastAccountSync).toBeUndefined();
-    expect((await cache.getCacheState())?.lastItemSync).toBeUndefined();
-    expect((await cache.getCacheState())?.lastFullItemSync).toBeUndefined();
-    expect((await cache.getCacheState())?.lastDocumentSync).toBeUndefined();
-    expect((await cache.getCacheState())?.lastFullDocumentSync).toBeUndefined();
-    expect((await cache.getCacheState())?.lastDeletedSync).toBeUndefined();
   });
 });
 

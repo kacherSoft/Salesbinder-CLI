@@ -2,10 +2,6 @@
  * Cache types for SQLite document caching
  */
 
-/** Current cache schema and authoritative document snapshot contract. */
-export const CACHE_SCHEMA_VERSION = 3;
-export const CACHE_WRITER_LOCK_KEY = 'salesbinder-cache-writer-v3';
-
 /** Database schema row for documents table */
 export interface DocumentRow {
   doc_id: string;
@@ -36,12 +32,6 @@ export interface DocumentRow {
   associated_document_id?: string | null;
   external_po_number?: string | null;
   shipping_location?: string | null;
-  date_sent?: string | null;
-  shipped_percent?: number | null;
-  shipment_checked_at?: string | null;
-  source_fetched_at?: number | null;
-  snapshot_version?: number;
-  snapshot_complete?: number;
   is_cancelled?: number;
   imported_at?: number | null;
 }
@@ -64,52 +54,6 @@ export interface ItemDocumentRow {
   total_amount?: number | null;
   discounted_price?: number | null;
   discount_percent?: number | null;
-  quantity_shipped?: number | null;
-}
-
-/** Source document line without an inventory item relationship. */
-export interface DocumentNonItemLineRow {
-  id?: number; // Auto-generated
-  doc_id: string;
-  document_item_id: string;
-  line_type: 'non_item';
-  name?: string | null;
-  line_description?: string | null;
-  service_category_id?: string | null;
-  unit_id?: string | null;
-  quantity: number;
-  price: number;
-  cost?: number | null;
-  total_amount: number;
-  discounted_price?: number | null;
-  discount_percent?: number | null;
-  net_amount: number;
-  tax?: number | null;
-  tax2?: number | null;
-  weight?: number | null;
-  source_created?: string | null;
-  source_modified?: string | null;
-  raw_classification?: string | null;
-}
-
-/** Complete authoritative replacement for one source document. */
-export interface DocumentSnapshot {
-  document: DocumentRow;
-  itemLines: Omit<ItemDocumentRow, 'id'>[];
-  nonItemLines: Omit<DocumentNonItemLineRow, 'id'>[];
-  sourceFetchedAt: number; // Unix timestamp in seconds
-}
-
-/** Consistent PostgreSQL source image used to replace a SQLite mirror. */
-export interface CacheMirrorSnapshot {
-  accounts: AccountRow[];
-  documents: DocumentRow[];
-  itemDocuments: Omit<ItemDocumentRow, 'id'>[];
-  documentNonItemLines: Omit<DocumentNonItemLineRow, 'id'>[];
-  items: ItemRow[];
-  stockLocations: ItemStockLocationRow[];
-  state: CacheState | null;
-  syncStatus: CacheSyncStatus | null;
 }
 
 /** Database schema row for SalesBinder accounts (customers/suppliers) */
@@ -201,27 +145,12 @@ export interface CacheMetaRow {
   value: string;
 }
 
-/** Persistent cursor for a resumable authoritative document sync. */
-export interface DocumentSyncCheckpoint {
-  accountName: string;
-  syncType: 'full' | 'delta';
-  phase: 'primary' | 'catch_up';
-  startedAt: number;
-  sourceModifiedSince: number;
-  endWatermark?: number;
-  nextContextIndex: number;
-  nextPage: number;
-  retryDocumentIds: string[];
-  retryDocumentIdentities?: Record<string, { contextId: number; documentNumber: number }>;
-}
-
 /** Cache sync state metadata */
 export interface CacheState {
   lastSync: number; // Unix timestamp
   lastFullSync: number; // Unix timestamp
   documentCount: number;
   itemDocumentCount: number;
-  nonItemDocumentCount?: number;
   accountName: string;
   schemaVersion: number;
   accountCount?: number;
@@ -229,13 +158,10 @@ export interface CacheState {
   supplierCount?: number;
   itemCount?: number;
   stockLocationCount?: number;
-  lastDocumentSync?: number;
-  lastFullDocumentSync?: number;
   lastAccountSync?: number;
   lastItemSync?: number;
   lastFullItemSync?: number;
   lastDeletedSync?: number;
-  documentSyncCheckpoint?: DocumentSyncCheckpoint;
 }
 
 /** Writer sync status stored in cache_meta. */
@@ -251,9 +177,6 @@ export interface CacheSyncStatus {
   syncType?: 'full' | 'delta';
   documentsProcessed?: number;
   lineItemsProcessed?: number;
-  nonItemLinesProcessed?: number;
-  failedDocuments?: number;
-  retryDocumentIds?: string[];
   itemsProcessed?: number;
   stockRowsProcessed?: number;
   deletedRecordsProcessed?: number;
@@ -273,9 +196,6 @@ export interface SyncResult {
   documentsProcessed: number;
   documentsDeleted?: number;
   lineItemsProcessed: number;
-  nonItemLinesProcessed: number;
-  failedDocuments: number;
-  retryDocumentIds: string[];
   duration: string;
   accountsProcessed?: number;
   customersProcessed?: number;

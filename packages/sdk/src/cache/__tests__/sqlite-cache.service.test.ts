@@ -2,12 +2,10 @@
  * SQLiteCacheService unit tests
  */
 
-import Database from 'better-sqlite3';
 import { SQLiteCacheService } from '../sqlite-cache.service.js';
-import { CACHE_SCHEMA_VERSION, DocumentContextId } from '../types.js';
-import type { DocumentRow, CacheState } from '../types.js';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'fs';
-import { join, relative } from 'path';
+import { DocumentContextId, DocumentRow, CacheState } from '../types.js';
+import { rmSync, existsSync } from 'fs';
+import { join } from 'path';
 import { tmpdir } from 'os';
 
 describe('SQLiteCacheService', () => {
@@ -16,7 +14,7 @@ describe('SQLiteCacheService', () => {
 
   beforeEach(() => {
     testDbPath = join(tmpdir(), `test-cache-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
-    service = new SQLiteCacheService('test-account', testDbPath, true);
+    service = new SQLiteCacheService('test-account', testDbPath);
   });
 
   afterEach(async () => {
@@ -25,7 +23,6 @@ describe('SQLiteCacheService', () => {
       rmSync(testDbPath);
       rmSync(`${testDbPath}-wal`, { force: true });
       rmSync(`${testDbPath}-shm`, { force: true });
-      rmSync(`${testDbPath}.maintenance-lock`, { force: true });
     } catch {
       // Ignore cleanup errors
     }
@@ -38,114 +35,6 @@ describe('SQLiteCacheService', () => {
 
     it('should return correct db path', () => {
       expect(service.getDbPath()).toBe(testDbPath);
-    });
-
-    it('serializes SQLite cache maintenance across service instances', async () => {
-      const maintenancePath = `${testDbPath}.maintenance-test`;
-      const first = new SQLiteCacheService('test-account', maintenancePath, true);
-
-      expect(() => new SQLiteCacheService('test-account', maintenancePath, true))
-        .toThrow('Another SQLite cache writer is already running.');
-
-      await first.close();
-      const second = new SQLiteCacheService('test-account', maintenancePath, true);
-      await second.close();
-
-      rmSync(maintenancePath, { force: true });
-      rmSync(`${maintenancePath}-wal`, { force: true });
-      rmSync(`${maintenancePath}-shm`, { force: true });
-      rmSync(`${maintenancePath}.maintenance-lock`, { force: true });
-    });
-
-    it('opens an exact-version cache read-only without changing its schema', async () => {
-      const inspector = new Database(testDbPath, { readonly: true, fileMustExist: true });
-      const schemaVersionBefore = inspector.pragma('schema_version', { simple: true });
-      inspector.close();
-
-      const reader = new SQLiteCacheService('test-account', testDbPath);
-      try {
-        expect(await reader.getDocumentCount()).toBe(0);
-        expect(() => reader.setRawMeta('forbidden', '1')).toThrow(/readonly/i);
-        expect(() => reader.insertItem({ item_id: 'forbidden', name: 'Forbidden write' }))
-          .toThrow(/readonly/i);
-      } finally {
-        await reader.close();
-      }
-
-      const verifier = new Database(testDbPath, { readonly: true, fileMustExist: true });
-      expect(verifier.pragma('schema_version', { simple: true })).toBe(schemaVersionBefore);
-      expect(verifier.pragma('user_version', { simple: true })).toBe(CACHE_SCHEMA_VERSION);
-      verifier.close();
-    });
-
-    it('does not create or migrate a cache from the default read-only mode', () => {
-      const missingPath = `${testDbPath}.missing`;
-      expect(() => new SQLiteCacheService('test-account', missingPath)).toThrow();
-      expect(existsSync(missingPath)).toBe(false);
-      expect(existsSync(`${missingPath}.maintenance-lock`)).toBe(false);
-
-      const stalePath = `${testDbPath}.stale`;
-      const stale = new Database(stalePath);
-      stale.pragma(`user_version = ${CACHE_SCHEMA_VERSION - 1}`);
-      stale.close();
-
-      expect(() => new SQLiteCacheService('test-account', stalePath))
-        .toThrow(`SQLite cache schema version ${CACHE_SCHEMA_VERSION - 1} is not readable`);
-      const verifier = new Database(stalePath, { readonly: true, fileMustExist: true });
-      expect(verifier.pragma('user_version', { simple: true })).toBe(CACHE_SCHEMA_VERSION - 1);
-      verifier.close();
-      rmSync(stalePath, { force: true });
-    });
-
-    it('does not upgrade a read-only handle when sync lock acquisition is requested', async () => {
-      await service.close();
-      const reader = new SQLiteCacheService('test-account', testDbPath);
-      let writer: SQLiteCacheService | null = null;
-      try {
-        expect(await reader.tryAcquireSyncLock('ignored')).toBe(false);
-        writer = new SQLiteCacheService('test-account', testDbPath, true);
-        expect(() => reader.setRawMeta('forbidden', '1')).toThrow(/readonly/i);
-      } finally {
-        await writer?.close();
-        await reader.close();
-      }
-    });
-
-    it('contends on one sidecar through relative, symlink-parent, and symlink-file aliases', async () => {
-      const root = mkdtempSync(join(tmpdir(), 'sqlite-cache-alias-'));
-      const actualDir = join(root, 'actual');
-      const parentAlias = join(root, 'parent-alias');
-      const actualPath = join(actualDir, 'cache.db');
-      const fileAlias = join(root, 'file-alias.db');
-      mkdirSync(actualDir);
-      symlinkSync(actualDir, parentAlias, 'dir');
-
-      let first: SQLiteCacheService | null = null;
-      try {
-        first = new SQLiteCacheService('test-account', actualPath, true);
-        symlinkSync(actualPath, fileAlias, 'file');
-
-        for (const alias of [
-          relative(process.cwd(), actualPath),
-          join(parentAlias, 'cache.db'),
-          fileAlias,
-        ]) {
-          expect(() => new SQLiteCacheService('test-account', alias, true))
-            .toThrow('Another SQLite cache writer is already running.');
-        }
-
-        await first.releaseSyncLock('ignored');
-        expect(() => new SQLiteCacheService('test-account', fileAlias, true))
-          .toThrow('Another SQLite cache writer is already running.');
-
-        await first.close();
-        first = null;
-        const next = new SQLiteCacheService('test-account', join(parentAlias, 'cache.db'), true);
-        await next.close();
-      } finally {
-        await first?.close();
-        rmSync(root, { recursive: true, force: true });
-      }
     });
   });
 

@@ -2,18 +2,14 @@
  * PostgreSQL cache service for the shared analytics cache upstream.
  */
 
-import pg, { type PoolClient } from 'pg';
+import pg from 'pg';
 import type { CacheService } from './cache.interface.js';
-import { CACHE_SCHEMA_VERSION, CACHE_WRITER_LOCK_KEY } from './types.js';
 import type {
   AccountRow,
-  CacheMirrorSnapshot,
   CacheState,
   CacheSyncStatus,
   CustomerSalesData,
-  DocumentNonItemLineRow,
   DocumentRow,
-  DocumentSnapshot,
   ItemDocumentRow,
   ItemRow,
   ItemSalesByPeriodRow,
@@ -22,12 +18,6 @@ import type {
 } from './types.js';
 
 const { Pool } = pg;
-const CACHE_WRITER_APPLICATION_NAME = `salesbinder-cache-v${CACHE_SCHEMA_VERSION}`;
-
-interface SyncLockLease {
-  client: PoolClient;
-  invalidate: () => void;
-}
 
 const DOCUMENT_COLUMNS = [
   'doc_id', 'context_id', 'doc_number', 'issue_date', 'customer_id', 'modified',
@@ -36,23 +26,13 @@ const DOCUMENT_COLUMNS = [
   'user_id', 'salesperson_name', 'customer_name', 'customer_number',
   'supplier_name', 'supplier_number', 'status_id', 'status_name',
   'total_price', 'total_cost', 'subtotal', 'associated_document_id',
-  'external_po_number', 'shipping_location', 'date_sent', 'shipped_percent',
-  'shipment_checked_at', 'source_fetched_at', 'snapshot_version',
-  'snapshot_complete', 'is_cancelled', 'imported_at',
+  'external_po_number', 'shipping_location', 'is_cancelled', 'imported_at',
 ] as const;
 
 const ITEM_DOCUMENT_COLUMNS = [
   'item_id', 'doc_id', 'quantity', 'price', 'document_item_id', 'item_name',
   'item_number', 'item_sku', 'item_location', 'line_description',
   'quantity_received', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
-  'quantity_shipped',
-] as const;
-
-const DOCUMENT_NON_ITEM_LINE_COLUMNS = [
-  'doc_id', 'document_item_id', 'line_type', 'name', 'line_description',
-  'service_category_id', 'unit_id', 'quantity', 'price', 'cost', 'total_amount',
-  'discounted_price', 'discount_percent', 'net_amount', 'tax', 'tax2', 'weight',
-  'source_created', 'source_modified', 'raw_classification',
 ] as const;
 
 const ACCOUNT_COLUMNS = [
@@ -80,33 +60,16 @@ const STOCK_COLUMNS = [
 
 export class PostgresCacheService implements CacheService {
   private pool: InstanceType<typeof Pool>;
-  private readonly syncLockClients = new Map<string, SyncLockLease>();
-  private writerQueue: Promise<void> = Promise.resolve();
   private opened = true;
   private readonly connectionString: string;
 
   constructor(connectionString: string) {
     this.connectionString = connectionString;
-    this.pool = new Pool({
-      connectionString: withCacheWriterApplicationName(connectionString),
-      application_name: CACHE_WRITER_APPLICATION_NAME,
-    });
+    this.pool = new Pool({ connectionString });
   }
 
   async ensureSchema(): Promise<void> {
-    const retainLease = this.syncLockClients.has(CACHE_WRITER_LOCK_KEY);
-    if (!await this.tryAcquireSyncLock(CACHE_WRITER_LOCK_KEY)) {
-      throw new Error('Another cache writer is already running.');
-    }
-    try {
-      await this.withWriterClient((client) => this.ensureSchemaLocked(client));
-    } finally {
-      if (!retainLease) await this.releaseSyncLock(CACHE_WRITER_LOCK_KEY);
-    }
-  }
-
-  private async ensureSchemaLocked(client: PoolClient): Promise<void> {
-    await client.query(`
+    await this.pool.query(`
       CREATE TABLE IF NOT EXISTS accounts (
         account_id TEXT PRIMARY KEY,
         context_id INTEGER NOT NULL,
@@ -154,31 +117,6 @@ export class PostgresCacheService implements CacheService {
         doc_id TEXT NOT NULL,
         quantity NUMERIC NOT NULL,
         price NUMERIC NOT NULL,
-        FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
-      );
-
-      CREATE TABLE IF NOT EXISTS document_non_item_lines (
-        id BIGSERIAL PRIMARY KEY,
-        doc_id TEXT NOT NULL,
-        document_item_id TEXT NOT NULL,
-        line_type TEXT NOT NULL DEFAULT 'non_item',
-        name TEXT NULL,
-        line_description TEXT NULL,
-        service_category_id TEXT NULL,
-        unit_id TEXT NULL,
-        quantity NUMERIC NOT NULL,
-        price NUMERIC NOT NULL,
-        cost NUMERIC NULL,
-        total_amount NUMERIC NOT NULL,
-        discounted_price NUMERIC NULL,
-        discount_percent NUMERIC NULL,
-        net_amount NUMERIC NOT NULL,
-        tax NUMERIC NULL,
-        tax2 NUMERIC NULL,
-        weight NUMERIC NULL,
-        source_created TEXT NULL,
-        source_modified TEXT NULL,
-        raw_classification TEXT NULL,
         FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
       );
 
@@ -236,146 +174,13 @@ export class PostgresCacheService implements CacheService {
         value TEXT NOT NULL
       );
     `);
-    await this.migrateDocumentColumns(client);
-    await this.migrateItemDocumentColumns(client);
-    await this.migrateToV3(client);
-    await this.createCompletenessTriggers(client);
-    await this.createIndexes(client);
-    await this.publishSchemaVersion(client);
+    await this.migrateDocumentColumns();
+    await this.migrateItemDocumentColumns();
+    await this.createIndexes();
   }
 
-  private async createCompletenessTriggers(client: PoolClient): Promise<void> {
-    await client.query(`
-      CREATE OR REPLACE FUNCTION cache_mark_line_snapshot_incomplete()
-      RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        IF current_setting('application_name', true) IS DISTINCT FROM '${CACHE_WRITER_APPLICATION_NAME}' THEN
-          RAISE EXCEPTION 'incompatible SalesBinder cache writer';
-        END IF;
-        IF pg_trigger_depth() > 1 THEN
-          IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
-          RETURN NEW;
-        END IF;
-        IF TG_OP = 'DELETE' THEN
-          UPDATE documents SET snapshot_complete = 0
-           WHERE doc_id = OLD.doc_id AND snapshot_complete <> 0;
-          RETURN OLD;
-        END IF;
-        UPDATE documents SET snapshot_complete = 0
-         WHERE doc_id = NEW.doc_id AND snapshot_complete <> 0;
-        IF TG_OP = 'UPDATE' AND OLD.doc_id IS DISTINCT FROM NEW.doc_id THEN
-          UPDATE documents SET snapshot_complete = 0
-           WHERE doc_id = OLD.doc_id AND snapshot_complete <> 0;
-        END IF;
-        RETURN NEW;
-      END;
-      $$;
-
-      CREATE OR REPLACE FUNCTION cache_mark_header_snapshot_incomplete()
-      RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        IF current_setting('application_name', true) IS DISTINCT FROM '${CACHE_WRITER_APPLICATION_NAME}' THEN
-          RAISE EXCEPTION 'incompatible SalesBinder cache writer';
-        END IF;
-        IF OLD.context_id IS DISTINCT FROM NEW.context_id
-          OR OLD.doc_number IS DISTINCT FROM NEW.doc_number
-          OR OLD.total_price IS DISTINCT FROM NEW.total_price
-          OR OLD.total_cost IS DISTINCT FROM NEW.total_cost
-          OR OLD.subtotal IS DISTINCT FROM NEW.subtotal THEN
-          NEW.snapshot_complete := 0;
-        END IF;
-        RETURN NEW;
-      END;
-      $$;
-
-      CREATE OR REPLACE FUNCTION cache_require_v3_document_writer()
-      RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        IF current_setting('application_name', true) IS DISTINCT FROM '${CACHE_WRITER_APPLICATION_NAME}' THEN
-          RAISE EXCEPTION 'incompatible SalesBinder cache writer';
-        END IF;
-        IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
-        RETURN NEW;
-      END;
-      $$;
-
-      CREATE OR REPLACE FUNCTION cache_guard_shipment_writer()
-      RETURNS trigger LANGUAGE plpgsql AS $$
-      DECLARE writer_name TEXT := current_setting('application_name', true);
-      BEGIN
-        IF writer_name IS DISTINCT FROM '${CACHE_WRITER_APPLICATION_NAME}'
-          AND writer_name IS DISTINCT FROM 'super-admin-sale-analyze' THEN
-          RAISE EXCEPTION 'incompatible SalesBinder shipment writer';
-        END IF;
-        RETURN NEW;
-      END;
-      $$;
-
-      DROP TRIGGER IF EXISTS trg_documents_writer_v3_insert_delete ON documents;
-      CREATE TRIGGER trg_documents_writer_v3_insert_delete
-      BEFORE INSERT OR DELETE ON documents
-      FOR EACH ROW EXECUTE FUNCTION cache_require_v3_document_writer();
-      DROP TRIGGER IF EXISTS trg_documents_writer_v3_truncate ON documents;
-      CREATE TRIGGER trg_documents_writer_v3_truncate
-      BEFORE TRUNCATE ON documents
-      FOR EACH STATEMENT EXECUTE FUNCTION cache_require_v3_document_writer();
-
-      DROP TRIGGER IF EXISTS trg_item_documents_writer_v3_truncate ON item_documents;
-      CREATE TRIGGER trg_item_documents_writer_v3_truncate
-      BEFORE TRUNCATE ON item_documents
-      FOR EACH STATEMENT EXECUTE FUNCTION cache_require_v3_document_writer();
-
-      DROP TRIGGER IF EXISTS trg_non_item_lines_writer_v3_truncate ON document_non_item_lines;
-      CREATE TRIGGER trg_non_item_lines_writer_v3_truncate
-      BEFORE TRUNCATE ON document_non_item_lines
-      FOR EACH STATEMENT EXECUTE FUNCTION cache_require_v3_document_writer();
-
-      DROP TRIGGER IF EXISTS trg_documents_shipment_writer ON documents;
-      CREATE TRIGGER trg_documents_shipment_writer
-      BEFORE UPDATE OF date_sent, shipped_percent, shipment_checked_at ON documents
-      FOR EACH ROW EXECUTE FUNCTION cache_guard_shipment_writer();
-
-      DROP TRIGGER IF EXISTS trg_item_documents_shipment_writer ON item_documents;
-      CREATE TRIGGER trg_item_documents_shipment_writer
-      BEFORE UPDATE OF quantity_shipped ON item_documents
-      FOR EACH ROW EXECUTE FUNCTION cache_guard_shipment_writer();
-
-      DROP TRIGGER IF EXISTS trg_documents_financial_snapshot_incomplete ON documents;
-      CREATE TRIGGER trg_documents_financial_snapshot_incomplete
-      BEFORE UPDATE OF context_id, doc_number, total_price, total_cost, subtotal ON documents
-      FOR EACH ROW EXECUTE FUNCTION cache_mark_header_snapshot_incomplete();
-
-      DROP TRIGGER IF EXISTS trg_item_documents_insert_snapshot_incomplete ON item_documents;
-      CREATE TRIGGER trg_item_documents_insert_snapshot_incomplete
-      AFTER INSERT ON item_documents
-      FOR EACH ROW EXECUTE FUNCTION cache_mark_line_snapshot_incomplete();
-      DROP TRIGGER IF EXISTS trg_item_documents_delete_snapshot_incomplete ON item_documents;
-      CREATE TRIGGER trg_item_documents_delete_snapshot_incomplete
-      AFTER DELETE ON item_documents
-      FOR EACH ROW EXECUTE FUNCTION cache_mark_line_snapshot_incomplete();
-      DROP TRIGGER IF EXISTS trg_item_documents_financial_update_snapshot_incomplete ON item_documents;
-      CREATE TRIGGER trg_item_documents_financial_update_snapshot_incomplete
-      AFTER UPDATE OF item_id, doc_id, document_item_id, quantity, price, cost,
-        total_amount, discounted_price, discount_percent ON item_documents
-      FOR EACH ROW EXECUTE FUNCTION cache_mark_line_snapshot_incomplete();
-
-      DROP TRIGGER IF EXISTS trg_non_item_lines_insert_snapshot_incomplete ON document_non_item_lines;
-      CREATE TRIGGER trg_non_item_lines_insert_snapshot_incomplete
-      AFTER INSERT ON document_non_item_lines
-      FOR EACH ROW EXECUTE FUNCTION cache_mark_line_snapshot_incomplete();
-      DROP TRIGGER IF EXISTS trg_non_item_lines_delete_snapshot_incomplete ON document_non_item_lines;
-      CREATE TRIGGER trg_non_item_lines_delete_snapshot_incomplete
-      AFTER DELETE ON document_non_item_lines
-      FOR EACH ROW EXECUTE FUNCTION cache_mark_line_snapshot_incomplete();
-      DROP TRIGGER IF EXISTS trg_non_item_lines_update_snapshot_incomplete ON document_non_item_lines;
-      CREATE TRIGGER trg_non_item_lines_update_snapshot_incomplete
-      AFTER UPDATE ON document_non_item_lines
-      FOR EACH ROW EXECUTE FUNCTION cache_mark_line_snapshot_incomplete();
-    `);
-  }
-
-  private async migrateDocumentColumns(client: PoolClient): Promise<void> {
-    await client.query(`
+  private async migrateDocumentColumns(): Promise<void> {
+    await this.pool.query(`
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS api_doc_id TEXT NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS cache_source TEXT NOT NULL DEFAULT 'api';
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_name TEXT NULL;
@@ -403,8 +208,8 @@ export class PostgresCacheService implements CacheService {
     `);
   }
 
-  private async migrateItemDocumentColumns(client: PoolClient): Promise<void> {
-    await client.query(`
+  private async migrateItemDocumentColumns(): Promise<void> {
+    await this.pool.query(`
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS document_item_id TEXT NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS item_name TEXT NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS item_number INTEGER NULL;
@@ -419,64 +224,8 @@ export class PostgresCacheService implements CacheService {
     `);
   }
 
-  private async migrateToV3(client: PoolClient): Promise<void> {
-    try {
-      await client.query('BEGIN');
-      await client.query(`
-        ALTER TABLE documents ADD COLUMN IF NOT EXISTS date_sent TEXT NULL;
-        ALTER TABLE documents ADD COLUMN IF NOT EXISTS shipped_percent NUMERIC NULL;
-        ALTER TABLE documents ADD COLUMN IF NOT EXISTS shipment_checked_at TIMESTAMPTZ NULL;
-        ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_fetched_at BIGINT NULL;
-        ALTER TABLE documents ADD COLUMN IF NOT EXISTS snapshot_version INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE documents ADD COLUMN IF NOT EXISTS snapshot_complete INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS quantity_shipped NUMERIC NULL;
-      `);
-      const invalid = await client.query<{ doc_id: string; document_item_id: string }>(`
-        SELECT doc_id, document_item_id
-          FROM (
-            SELECT doc_id, document_item_id FROM item_documents WHERE document_item_id IS NOT NULL
-            UNION ALL
-            SELECT doc_id, document_item_id FROM document_non_item_lines
-          ) AS source_lines
-         WHERE BTRIM(document_item_id) = ''
-         LIMIT 1
-      `);
-      if (invalid.rows[0]) {
-        throw new Error(`Cannot migrate cache schema: blank document line source id in ${invalid.rows[0].doc_id}`);
-      }
-      const duplicate = await client.query<{ doc_id: string; document_item_id: string }>(`
-        SELECT doc_id, document_item_id
-          FROM (
-            SELECT doc_id, document_item_id FROM item_documents WHERE document_item_id IS NOT NULL
-            UNION ALL
-            SELECT doc_id, document_item_id FROM document_non_item_lines
-          ) AS source_lines
-         GROUP BY doc_id, document_item_id
-        HAVING COUNT(*) > 1
-         LIMIT 1
-      `);
-      if (duplicate.rows[0]) {
-        throw new Error(
-          `Cannot migrate cache schema: duplicate document line ${duplicate.rows[0].document_item_id} in ${duplicate.rows[0].doc_id}`
-        );
-      }
-      await client.query('COMMIT');
-    } catch (error) {
-      try { await client.query('ROLLBACK'); } catch { /* preserve the migration failure */ }
-      throw error;
-    }
-  }
-
-  private async publishSchemaVersion(client: PoolClient): Promise<void> {
-    await client.query(
-      `INSERT INTO cache_meta (key, value) VALUES ('cache_schema_version', $1)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [String(CACHE_SCHEMA_VERSION)]
-    );
-  }
-
-  private async createIndexes(client: PoolClient): Promise<void> {
-    await client.query(`
+  private async createIndexes(): Promise<void> {
+    await this.pool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_context_doc_number ON documents(context_id, doc_number);
       CREATE INDEX IF NOT EXISTS idx_documents_context ON documents(context_id);
       CREATE INDEX IF NOT EXISTS idx_documents_modified ON documents(modified);
@@ -491,11 +240,6 @@ export class PostgresCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_name ON item_documents(item_name);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_number ON item_documents(item_number);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_sku ON item_documents(item_sku);
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_item_documents_source_line
-        ON item_documents(doc_id, document_item_id) WHERE document_item_id IS NOT NULL;
-      CREATE INDEX IF NOT EXISTS idx_document_non_item_lines_doc ON document_non_item_lines(doc_id);
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_document_non_item_lines_source_line
-        ON document_non_item_lines(doc_id, document_item_id) WHERE document_item_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_accounts_context_number ON accounts(context_id, account_number);
       CREATE INDEX IF NOT EXISTS idx_accounts_context_name ON accounts(context_id, name);
       CREATE INDEX IF NOT EXISTS idx_accounts_modified ON accounts(modified);
@@ -519,46 +263,11 @@ export class PostgresCacheService implements CacheService {
     }
   }
 
-  async readMirrorSnapshot(): Promise<CacheMirrorSnapshot> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      const [accounts, documents, itemDocuments, nonItemLines, items, stockLocations, state, syncStatus] = await Promise.all([
-        client.query<AccountRow>(`SELECT * FROM accounts`),
-        client.query<DocumentRow>(`SELECT * FROM documents`),
-        client.query<ItemDocumentRow>(`SELECT * FROM item_documents`),
-        client.query<DocumentNonItemLineRow>(`SELECT * FROM document_non_item_lines`),
-        client.query<ItemRow>(`SELECT * FROM items`),
-        client.query<ItemStockLocationRow>(`SELECT * FROM item_stock_locations`),
-        client.query<{ value: string }>(`SELECT value FROM cache_meta WHERE key = 'state'`),
-        client.query<{ value: string }>(`SELECT value FROM cache_meta WHERE key = 'sync_status'`),
-      ]);
-      await client.query('COMMIT');
-      return {
-        accounts: accounts.rows,
-        documents: documents.rows.map(this.coerceDocumentForMirror),
-        itemDocuments: itemDocuments.rows.map((row) => withoutGeneratedId(this.coerceItemDocument(row))),
-        documentNonItemLines: nonItemLines.rows.map((row) => withoutGeneratedId(this.coerceDocumentNonItemLine(row))),
-        items: items.rows.map(this.coerceItem),
-        stockLocations: stockLocations.rows.map(this.coerceStock),
-        state: state.rows[0] ? JSON.parse(state.rows[0].value) as CacheState : null,
-        syncStatus: syncStatus.rows[0] ? JSON.parse(syncStatus.rows[0].value) as CacheSyncStatus : null,
-      };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
   async insertDocument(doc: DocumentRow): Promise<void> {
-    await this.withWriterClient(async (client) => {
-      await client.query(
-        this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
-        this.valuesFor(DOCUMENT_COLUMNS, await this.normalizeDocumentForWrite(client, doc))
-      );
-    });
+    await this.pool.query(
+      this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
+      this.valuesFor(DOCUMENT_COLUMNS, await this.normalizeDocumentForWrite(doc))
+    );
   }
 
   async getDocument(docId: string): Promise<DocumentRow | undefined> {
@@ -586,117 +295,19 @@ export class PostgresCacheService implements CacheService {
   }
 
   async deleteDocument(docId: string): Promise<void> {
-    await this.withWriterClient((client) => client.query(`DELETE FROM documents WHERE doc_id = $1`, [docId]));
+    await this.pool.query(`DELETE FROM documents WHERE doc_id = $1`, [docId]);
   }
 
   async batchInsertDocuments(docs: DocumentRow[]): Promise<void> {
-    await this.withWriterClient((client) => this.batch(client, docs, (doc) => client.query(
-      this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
-      this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(doc))
-    )));
+    await this.batch(docs, (doc) => this.pool.query(this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'), this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(doc))));
   }
 
   async batchDeleteDocuments(docIds: string[]): Promise<void> {
-    await this.withWriterClient((client) => this.batch(
-      client,
-      docIds,
-      (id) => client.query(`DELETE FROM documents WHERE doc_id = $1`, [id])
-    ));
-  }
-
-  async replaceDocumentSnapshot(snapshot: DocumentSnapshot): Promise<void> {
-    await this.withWriterClient(async (client) => {
-      this.validateDocumentSnapshot(snapshot);
-      try {
-        await client.query('BEGIN');
-      let existing: DocumentRow | undefined;
-      if (snapshot.document.api_doc_id) {
-        existing = (await client.query<DocumentRow>(
-          `SELECT * FROM documents WHERE api_doc_id = $1 FOR UPDATE`,
-          [snapshot.document.api_doc_id]
-        )).rows[0];
-      }
-      if (!existing) {
-        existing = (await client.query<DocumentRow>(
-          `SELECT * FROM documents WHERE context_id = $1 AND doc_number = $2 FOR UPDATE`,
-          [snapshot.document.context_id, snapshot.document.doc_number]
-        )).rows[0];
-      }
-      const docId = existing?.doc_id ?? snapshot.document.doc_id;
-      const existingLines = (await client.query<ItemDocumentRow>(
-        `SELECT * FROM item_documents WHERE doc_id = $1 ORDER BY id FOR UPDATE`,
-        [docId]
-      )).rows;
-      await client.query(
-        `SELECT id FROM document_non_item_lines WHERE doc_id = $1 ORDER BY id FOR UPDATE`,
-        [docId]
-      );
-      const existingBySourceId = new Map(
-        existingLines
-          .filter((line) => line.document_item_id)
-          .map((line) => [line.document_item_id!, line])
-      );
-      const preserveReconciledShipment = isShipmentNewer(existing?.shipment_checked_at, snapshot.sourceFetchedAt);
-      const resolvedDocument: DocumentRow = {
-        ...snapshot.document,
-        doc_id: docId,
-        date_sent: preserveReconciledShipment
-          ? existing?.date_sent ?? snapshot.document.date_sent ?? null
-          : authoritativeShipmentValue(snapshot.document.date_sent, existing?.date_sent),
-        shipped_percent: preserveReconciledShipment
-          ? existing?.shipped_percent ?? snapshot.document.shipped_percent ?? null
-          : authoritativeShipmentValue(snapshot.document.shipped_percent, existing?.shipped_percent),
-        shipment_checked_at: existing?.shipment_checked_at ?? null,
-        source_fetched_at: snapshot.sourceFetchedAt,
-        snapshot_version: CACHE_SCHEMA_VERSION,
-        snapshot_complete: 0,
-      };
-      const resolvedItems = snapshot.itemLines.map((line) => {
-        const existingLine = line.document_item_id
-          ? existingBySourceId.get(line.document_item_id)
-          : undefined;
-        return {
-          ...line,
-          doc_id: docId,
-          quantity_shipped: preserveReconciledShipment
-            ? existingLine?.quantity_shipped ?? line.quantity_shipped ?? null
-            : authoritativeShipmentValue(line.quantity_shipped, existingLine?.quantity_shipped),
-        };
-      });
-      const resolvedNonItemLines = snapshot.nonItemLines.map((line) => ({ ...line, doc_id: docId }));
-
-      await client.query(
-        this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
-        this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(resolvedDocument))
-      );
-      await client.query(`DELETE FROM item_documents WHERE doc_id = $1`, [docId]);
-      await client.query(`DELETE FROM document_non_item_lines WHERE doc_id = $1`, [docId]);
-      for (const line of resolvedItems) {
-        await client.query(
-          this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
-          this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(line))
-        );
-      }
-      for (const line of resolvedNonItemLines) {
-        await client.query(
-          this.insertSql('document_non_item_lines', DOCUMENT_NON_ITEM_LINE_COLUMNS),
-          this.valuesFor(DOCUMENT_NON_ITEM_LINE_COLUMNS, this.normalizeDocumentNonItemLine(line))
-        );
-      }
-      await client.query(`UPDATE documents SET snapshot_complete = 1 WHERE doc_id = $1`, [docId]);
-        await client.query('COMMIT');
-      } catch (error) {
-        try { await client.query('ROLLBACK'); } catch { /* preserve the snapshot failure */ }
-        throw error;
-      }
-    });
+    await this.batch(docIds, (id) => this.pool.query(`DELETE FROM documents WHERE doc_id = $1`, [id]));
   }
 
   async insertItemDocument(item: Omit<ItemDocumentRow, 'id'>): Promise<void> {
-    await this.withWriterClient((client) => client.query(
-      this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
-      this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item))
-    ));
+    await this.pool.query(this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS), this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)));
   }
 
   async getItemDocuments(docId: string): Promise<ItemDocumentRow[]> {
@@ -704,55 +315,15 @@ export class PostgresCacheService implements CacheService {
   }
 
   async deleteItemDocuments(docId: string): Promise<void> {
-    await this.withWriterClient((client) => client.query(`DELETE FROM item_documents WHERE doc_id = $1`, [docId]));
+    await this.pool.query(`DELETE FROM item_documents WHERE doc_id = $1`, [docId]);
   }
 
   async batchInsertItemDocuments(items: Omit<ItemDocumentRow, 'id'>[]): Promise<void> {
-    await this.withWriterClient((client) => this.batch(client, items, (item) => client.query(
-      this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
-      this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item))
-    )));
-  }
-
-  async insertDocumentNonItemLine(line: Omit<DocumentNonItemLineRow, 'id'>): Promise<void> {
-    await this.withWriterClient((client) => client.query(
-      this.insertSql('document_non_item_lines', DOCUMENT_NON_ITEM_LINE_COLUMNS),
-      this.valuesFor(DOCUMENT_NON_ITEM_LINE_COLUMNS, this.normalizeDocumentNonItemLine(line))
-    ));
-  }
-
-  async getDocumentNonItemLines(docId: string): Promise<DocumentNonItemLineRow[]> {
-    return (await this.pool.query<DocumentNonItemLineRow>(
-      `SELECT * FROM document_non_item_lines WHERE doc_id = $1`,
-      [docId]
-    )).rows.map(this.coerceDocumentNonItemLine);
-  }
-
-  async getAllDocumentNonItemLines(): Promise<DocumentNonItemLineRow[]> {
-    return (await this.pool.query<DocumentNonItemLineRow>(
-      `SELECT * FROM document_non_item_lines`
-    )).rows.map(this.coerceDocumentNonItemLine);
-  }
-
-  async deleteDocumentNonItemLines(docId: string): Promise<void> {
-    await this.withWriterClient((client) => client.query(
-      `DELETE FROM document_non_item_lines WHERE doc_id = $1`,
-      [docId]
-    ));
-  }
-
-  async batchInsertDocumentNonItemLines(lines: Omit<DocumentNonItemLineRow, 'id'>[]): Promise<void> {
-    await this.withWriterClient((client) => this.batch(client, lines, (line) => client.query(
-      this.insertSql('document_non_item_lines', DOCUMENT_NON_ITEM_LINE_COLUMNS),
-      this.valuesFor(DOCUMENT_NON_ITEM_LINE_COLUMNS, this.normalizeDocumentNonItemLine(line))
-    )));
+    await this.batch(items, (item) => this.pool.query(this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS), this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item))));
   }
 
   async insertAccount(account: AccountRow): Promise<void> {
-    await this.withWriterClient((client) => client.query(
-      this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'),
-      this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account))
-    ));
+    await this.pool.query(this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'), this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account)));
   }
 
   async getAccount(accountId: string): Promise<AccountRow | undefined> {
@@ -776,21 +347,15 @@ export class PostgresCacheService implements CacheService {
   }
 
   async batchInsertAccounts(accounts: AccountRow[]): Promise<void> {
-    await this.withWriterClient((client) => this.batch(client, accounts, (account) => client.query(
-      this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'),
-      this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account))
-    )));
+    await this.batch(accounts, (account) => this.pool.query(this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'), this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account))));
   }
 
   async deleteAccount(accountId: string): Promise<void> {
-    await this.withWriterClient((client) => client.query(`DELETE FROM accounts WHERE account_id = $1`, [accountId]));
+    await this.pool.query(`DELETE FROM accounts WHERE account_id = $1`, [accountId]);
   }
 
   async insertItem(item: ItemRow): Promise<void> {
-    await this.withWriterClient((client) => client.query(
-      this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
-      this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item))
-    ));
+    await this.pool.query(this.upsertSql('items', ITEM_COLUMNS, 'item_id'), this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)));
   }
 
   async getItem(itemId: string): Promise<ItemRow | undefined> {
@@ -807,21 +372,15 @@ export class PostgresCacheService implements CacheService {
   }
 
   async batchInsertItems(items: ItemRow[]): Promise<void> {
-    await this.withWriterClient((client) => this.batch(client, items, (item) => client.query(
-      this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
-      this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item))
-    )));
+    await this.batch(items, (item) => this.pool.query(this.upsertSql('items', ITEM_COLUMNS, 'item_id'), this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item))));
   }
 
   async deleteItem(itemId: string): Promise<void> {
-    await this.withWriterClient((client) => client.query(`DELETE FROM items WHERE item_id = $1`, [itemId]));
+    await this.pool.query(`DELETE FROM items WHERE item_id = $1`, [itemId]);
   }
 
   async insertItemStockLocation(row: ItemStockLocationRow): Promise<void> {
-    await this.withWriterClient((client) => client.query(
-      this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
-      this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row))
-    ));
+    await this.pool.query(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'), this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
   }
 
   async getItemStockLocations(itemId: string): Promise<ItemStockLocationRow[]> {
@@ -833,36 +392,28 @@ export class PostgresCacheService implements CacheService {
   }
 
   async replaceItemStockLocations(itemId: string, rows: ItemStockLocationRow[]): Promise<void> {
-    await this.withWriterClient(async (client) => {
-      try {
-        await client.query('BEGIN');
-        await client.query(`DELETE FROM item_stock_locations WHERE item_id = $1`, [itemId]);
-        for (const row of rows) {
-          await client.query(
-            this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
-            this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row))
-          );
-        }
-        await client.query('COMMIT');
-      } catch (error) {
-        try { await client.query('ROLLBACK'); } catch { /* preserve the stock replacement failure */ }
-        throw error;
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`DELETE FROM item_stock_locations WHERE item_id = $1`, [itemId]);
+      for (const row of rows) {
+        await client.query(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'), this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
       }
-    });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async batchInsertItemStockLocations(rows: ItemStockLocationRow[]): Promise<void> {
-    await this.withWriterClient((client) => this.batch(client, rows, (row) => client.query(
-      this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
-      this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row))
-    )));
+    await this.batch(rows, (row) => this.pool.query(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'), this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row))));
   }
 
   async deleteItemStockLocations(itemId: string): Promise<void> {
-    await this.withWriterClient((client) => client.query(
-      `DELETE FROM item_stock_locations WHERE item_id = $1`,
-      [itemId]
-    ));
+    await this.pool.query(`DELETE FROM item_stock_locations WHERE item_id = $1`, [itemId]);
   }
 
   async getItemDocumentsForPeriod(itemId: string, startDate: string, endDate: string, contextId: number): Promise<ItemDocumentRow[]> {
@@ -966,11 +517,11 @@ export class PostgresCacheService implements CacheService {
   }
 
   async setCacheState(state: CacheState): Promise<void> {
-    await this.withWriterClient((client) => client.query(
+    await this.pool.query(
       `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [JSON.stringify(state)]
-    ));
+    );
   }
 
   async getSyncStatus(): Promise<CacheSyncStatus | null> {
@@ -979,74 +530,23 @@ export class PostgresCacheService implements CacheService {
   }
 
   async setSyncStatus(status: CacheSyncStatus): Promise<void> {
-    await this.withWriterClient((client) => client.query(
+    await this.pool.query(
       `INSERT INTO cache_meta (key, value) VALUES ('sync_status', $1)
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [JSON.stringify(status)]
-    ));
+    );
   }
 
-  async tryAcquireSyncLock(_lockKey: string): Promise<boolean> {
-    return this.enqueueWriterTask(async () => {
-      const lockKey = CACHE_WRITER_LOCK_KEY;
-      const existingLease = this.syncLockClients.get(lockKey);
-      if (existingLease) {
-        try {
-          await this.assertWriterLeaseHeld(existingLease);
-          return true;
-        } catch {
-          // A stale local lease was invalidated; try to acquire a new session below.
-        }
-      }
-      const client = await this.pool.connect();
-      try {
-        const result = await client.query<{ acquired: boolean }>(
-          `SELECT pg_try_advisory_lock(hashtext($1)) AS acquired`,
-          [lockKey]
-        );
-        if (result.rows[0]?.acquired !== true) {
-          client.release();
-          return false;
-        }
-        const lease: SyncLockLease = { client, invalidate: () => undefined };
-        let invalidated = false;
-        lease.invalidate = () => {
-          if (invalidated) return;
-          invalidated = true;
-          if (this.syncLockClients.get(lockKey) === lease) {
-            this.syncLockClients.delete(lockKey);
-          }
-          lease.client.removeListener('error', lease.invalidate);
-          lease.client.removeListener('end', lease.invalidate);
-          try { lease.client.release(true); } catch { /* already removed by the pool */ }
-        };
-        client.once('error', lease.invalidate);
-        client.once('end', lease.invalidate);
-        this.syncLockClients.set(lockKey, lease);
-        return true;
-      } catch (error) {
-        try { client.release(true); } catch { /* already removed by the pool */ }
-        throw error;
-      }
-    });
+  async tryAcquireSyncLock(lockKey: string): Promise<boolean> {
+    const result = await this.pool.query<{ acquired: boolean }>(
+      `SELECT pg_try_advisory_lock(hashtext($1)) AS acquired`,
+      [lockKey]
+    );
+    return result.rows[0]?.acquired === true;
   }
 
-  async releaseSyncLock(_lockKey: string): Promise<void> {
-    await this.enqueueWriterTask(async () => {
-      const lockKey = CACHE_WRITER_LOCK_KEY;
-      const lease = this.syncLockClients.get(lockKey);
-      if (!lease) return;
-      this.syncLockClients.delete(lockKey);
-      lease.client.removeListener('error', lease.invalidate);
-      lease.client.removeListener('end', lease.invalidate);
-      try {
-        await lease.client.query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]);
-        lease.client.release();
-      } catch (error) {
-        try { lease.client.release(true); } catch { /* already removed by the pool */ }
-        throw error;
-      }
-    });
+  async releaseSyncLock(lockKey: string): Promise<void> {
+    await this.pool.query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]);
   }
 
   async getDocumentCount(): Promise<number> {
@@ -1055,10 +555,6 @@ export class PostgresCacheService implements CacheService {
 
   async getItemDocumentCount(): Promise<number> {
     return this.count(`SELECT COUNT(*) as count FROM item_documents`);
-  }
-
-  async getDocumentNonItemLineCount(): Promise<number> {
-    return this.count(`SELECT COUNT(*) as count FROM document_non_item_lines`);
   }
 
   async getAccountCount(contextId?: number): Promise<number> {
@@ -1079,10 +575,6 @@ export class PostgresCacheService implements CacheService {
 
   async close(): Promise<void> {
     this.opened = false;
-    await this.writerQueue;
-    for (const lockKey of [...this.syncLockClients.keys()]) {
-      await this.releaseSyncLock(lockKey);
-    }
     await this.pool.end();
   }
 
@@ -1091,61 +583,7 @@ export class PostgresCacheService implements CacheService {
   }
 
   async truncateAll(): Promise<void> {
-    await this.withWriterClient((client) => client.query(
-      `TRUNCATE TABLE item_stock_locations, document_non_item_lines, item_documents, items, documents, accounts, cache_meta RESTART IDENTITY CASCADE`
-    ));
-  }
-
-  private async withWriterClient<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
-    return this.enqueueWriterTask(async () => {
-      const lease = this.requireWriterLease();
-      await this.assertWriterLeaseHeld(lease);
-      try {
-        return await run(lease.client);
-      } catch (error) {
-        if (this.syncLockClients.get(CACHE_WRITER_LOCK_KEY) === lease) {
-          try { await this.assertWriterLeaseHeld(lease); } catch { /* preserve the mutation failure */ }
-        }
-        throw error;
-      }
-    });
-  }
-
-  private async enqueueWriterTask<T>(run: () => Promise<T>): Promise<T> {
-    const operation = this.writerQueue.then(run, run);
-    this.writerQueue = operation.then(() => undefined, () => undefined);
-    return operation;
-  }
-
-  private requireWriterLease(): SyncLockLease {
-    const lease = this.syncLockClients.get(CACHE_WRITER_LOCK_KEY);
-    if (!lease) {
-      throw new Error('PostgreSQL cache mutation requires the global cache writer lock.');
-    }
-    return lease;
-  }
-
-  private async assertWriterLeaseHeld(lease: SyncLockLease): Promise<void> {
-    try {
-      const result = await lease.client.query<{ held: boolean }>(`
-        SELECT EXISTS (
-          SELECT 1
-            FROM pg_locks
-           WHERE locktype = 'advisory'
-             AND pid = pg_backend_pid()
-             AND mode = 'ExclusiveLock'
-             AND granted
-             AND objsubid = 1
-             AND classid::bigint = ((hashtext($1)::bigint >> 32) & 4294967295::bigint)
-             AND objid::bigint = (hashtext($1)::bigint & 4294967295::bigint)
-        ) AS held
-      `, [CACHE_WRITER_LOCK_KEY]);
-      if (result.rows[0]?.held === true) return;
-    } catch {
-      // The lease is invalidated below so no later operation can reuse it.
-    }
-    lease.invalidate();
-    throw new Error('PostgreSQL cache writer lease was lost before mutation.');
+    await this.pool.query(`TRUNCATE TABLE item_stock_locations, item_documents, items, documents, accounts, cache_meta RESTART IDENTITY CASCADE`);
   }
 
   private async count(sql: string, params: unknown[] = []): Promise<number> {
@@ -1169,15 +607,21 @@ export class PostgresCacheService implements CacheService {
     return columns.map((column) => row[column] ?? null);
   }
 
-  private async batch<T>(client: PoolClient, rows: T[], run: (row: T) => Promise<unknown>): Promise<void> {
+  private async batch<T>(rows: T[], run: (row: T) => Promise<unknown>): Promise<void> {
     if (rows.length === 0) return;
+    const client = await this.pool.connect();
+    const oldPool = this.pool;
     try {
       await client.query('BEGIN');
+      this.pool = client as any;
       for (const row of rows) await run(row);
       await client.query('COMMIT');
     } catch (error) {
-      try { await client.query('ROLLBACK'); } catch { /* preserve the batch failure */ }
+      await client.query('ROLLBACK');
       throw error;
+    } finally {
+      this.pool = oldPool;
+      client.release();
     }
   }
 
@@ -1190,22 +634,20 @@ export class PostgresCacheService implements CacheService {
       account_id: doc.account_id ?? null,
       account_context_id: doc.account_context_id ?? null,
       account_name: doc.account_name ?? doc.customer_name ?? doc.supplier_name ?? null,
-      snapshot_version: doc.snapshot_version ?? 0,
-      snapshot_complete: doc.snapshot_complete ?? 0,
       is_cancelled: doc.is_cancelled ?? 0,
     };
   }
 
-  private async normalizeDocumentForWrite(client: PoolClient, doc: DocumentRow): Promise<Record<string, unknown>> {
+  private async normalizeDocumentForWrite(doc: DocumentRow): Promise<Record<string, unknown>> {
     let existing: { doc_id: string } | undefined;
     if (doc.api_doc_id) {
-      existing = (await client.query<{ doc_id: string }>(
+      existing = (await this.pool.query<{ doc_id: string }>(
         `SELECT doc_id FROM documents WHERE api_doc_id = $1`,
         [doc.api_doc_id]
       )).rows[0];
     }
     if (!existing) {
-      existing = (await client.query<{ doc_id: string }>(
+      existing = (await this.pool.query<{ doc_id: string }>(
         `SELECT doc_id FROM documents WHERE context_id = $1 AND doc_number = $2`,
         [doc.context_id, doc.doc_number]
       )).rows[0];
@@ -1215,34 +657,6 @@ export class PostgresCacheService implements CacheService {
 
   private normalizeItemDocument(item: Omit<ItemDocumentRow, 'id'>): Record<string, unknown> {
     return { ...item, quantity: item.quantity ?? 0, price: item.price ?? 0 };
-  }
-
-  private normalizeDocumentNonItemLine(
-    line: Omit<DocumentNonItemLineRow, 'id'>
-  ): Record<string, unknown> {
-    return {
-      ...line,
-      line_type: 'non_item',
-      quantity: line.quantity ?? 0,
-      price: line.price ?? 0,
-      total_amount: line.total_amount ?? 0,
-      net_amount: line.net_amount ?? 0,
-    };
-  }
-
-  private validateDocumentSnapshot(snapshot: DocumentSnapshot): void {
-    if (!snapshot.document.doc_id || !Number.isFinite(snapshot.sourceFetchedAt)) {
-      throw new Error('Invalid document snapshot identity or source timestamp');
-    }
-    const sourceIds = new Set<string>();
-    for (const line of [...snapshot.itemLines, ...snapshot.nonItemLines]) {
-      const sourceId = line.document_item_id?.trim();
-      if (!sourceId) throw new Error(`Document ${snapshot.document.doc_id} contains a line without source id`);
-      if (sourceIds.has(sourceId)) {
-        throw new Error(`Document ${snapshot.document.doc_id} contains duplicate source line ${sourceId}`);
-      }
-      sourceIds.add(sourceId);
-    }
   }
 
   private normalizeAccount(account: AccountRow): Record<string, unknown> {
@@ -1275,40 +689,6 @@ export class PostgresCacheService implements CacheService {
       total_amount: row.total_amount == null ? null : Number(row.total_amount),
       discounted_price: row.discounted_price == null ? null : Number(row.discounted_price),
       discount_percent: row.discount_percent == null ? null : Number(row.discount_percent),
-      quantity_shipped: row.quantity_shipped == null ? null : Number(row.quantity_shipped),
-    };
-  }
-
-  private coerceDocumentForMirror(row: DocumentRow): DocumentRow {
-    const shipmentCheckedAt = row.shipment_checked_at as unknown;
-    return {
-      ...row,
-      total_price: row.total_price == null ? null : Number(row.total_price),
-      total_cost: row.total_cost == null ? null : Number(row.total_cost),
-      subtotal: row.subtotal == null ? null : Number(row.subtotal),
-      shipped_percent: row.shipped_percent == null ? null : Number(row.shipped_percent),
-      source_fetched_at: row.source_fetched_at == null ? null : Number(row.source_fetched_at),
-      snapshot_version: row.snapshot_version == null ? 0 : Number(row.snapshot_version),
-      snapshot_complete: row.snapshot_complete == null ? 0 : Number(row.snapshot_complete),
-      shipment_checked_at: shipmentCheckedAt instanceof Date
-        ? shipmentCheckedAt.toISOString()
-        : shipmentCheckedAt == null ? null : String(shipmentCheckedAt),
-    };
-  }
-
-  private coerceDocumentNonItemLine(row: DocumentNonItemLineRow): DocumentNonItemLineRow {
-    return {
-      ...row,
-      quantity: Number(row.quantity),
-      price: Number(row.price),
-      cost: row.cost == null ? null : Number(row.cost),
-      total_amount: Number(row.total_amount),
-      discounted_price: row.discounted_price == null ? null : Number(row.discounted_price),
-      discount_percent: row.discount_percent == null ? null : Number(row.discount_percent),
-      net_amount: Number(row.net_amount),
-      tax: row.tax == null ? null : Number(row.tax),
-      tax2: row.tax2 == null ? null : Number(row.tax2),
-      weight: row.weight == null ? null : Number(row.weight),
     };
   }
 
@@ -1340,26 +720,4 @@ export class PostgresCacheService implements CacheService {
       valuation: row.valuation == null ? null : Number(row.valuation),
     };
   }
-}
-
-function isShipmentNewer(value: unknown, sourceFetchedAt: number): boolean {
-  if (!value) return false;
-  const timestamp = value instanceof Date ? value.getTime() : new Date(String(value)).getTime();
-  return Number.isFinite(timestamp) && timestamp > sourceFetchedAt * 1000;
-}
-
-function authoritativeShipmentValue<T>(incoming: T | null | undefined, existing: T | null | undefined): T | null {
-  return incoming === undefined ? existing ?? null : incoming;
-}
-
-export function withCacheWriterApplicationName(connectionString: string): string {
-  const url = new URL(connectionString);
-  url.searchParams.set('application_name', CACHE_WRITER_APPLICATION_NAME);
-  return url.toString();
-}
-
-function withoutGeneratedId<T extends { id?: number }>(row: T): Omit<T, 'id'> {
-  const { id, ...rest } = row;
-  void id;
-  return rest;
 }

@@ -3,7 +3,6 @@ import { ContextId, DocumentContextId } from '../types/common.types.js';
 import type { DeletedLogEntry, DeletedLogListResponse } from '../types/deleted-log.types.js';
 import type { CacheService } from './cache.interface.js';
 import type { CacheState } from './types.js';
-import { CACHE_SCHEMA_VERSION } from './types.js';
 
 export interface DeletedLogSyncResult {
   deletedRecordsProcessed: number;
@@ -20,16 +19,8 @@ export class DeletedLogSyncService {
   ) {}
 
   async sync(): Promise<DeletedLogSyncResult> {
-    const syncStartedAt = Math.floor(Date.now() / 1000);
     const state = await this.cache.getCacheState();
-    const lastDeletedSync = state?.lastDeletedSync;
-    const needsFullHistory = !state
-      || state.accountName !== this.accountName
-      || state.schemaVersion !== CACHE_SCHEMA_VERSION
-      || lastDeletedSync == null;
-    const since = needsFullHistory || lastDeletedSync == null
-      ? 0
-      : Math.max(0, lastDeletedSync - this.syncLookbackSeconds);
+    const since = Math.max(0, (state?.lastDeletedSync ?? state?.lastSync ?? 0) - this.syncLookbackSeconds);
     const contexts = [
       ContextId.Customer,
       ContextId.Supplier,
@@ -44,7 +35,7 @@ export class DeletedLogSyncService {
       processed += await this.syncContext(contextId, since);
     }
 
-    await this.cache.setCacheState(this.mergeState(state, syncStartedAt));
+    await this.cache.setCacheState(this.mergeState(state, Math.floor(Date.now() / 1000)));
     return { deletedRecordsProcessed: processed };
   }
 
@@ -102,8 +93,8 @@ export class DeletedLogSyncService {
       lastFullSync: state?.lastFullSync ?? now,
       documentCount: state?.documentCount ?? 0,
       itemDocumentCount: state?.itemDocumentCount ?? 0,
-      accountName: this.accountName,
-      schemaVersion: CACHE_SCHEMA_VERSION,
+      accountName: state?.accountName ?? this.accountName,
+      schemaVersion: 2,
       lastDeletedSync: now,
     };
   }

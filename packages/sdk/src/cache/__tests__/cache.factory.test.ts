@@ -2,11 +2,7 @@
  * Cache factory unit tests
  */
 
-import { mkdtempSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
 import { createCacheService, getPostgresReadUrl } from '../cache.factory.js';
-import { SQLiteCacheService } from '../sqlite-cache.service.js';
 
 describe('Cache factory', () => {
   const dbUrlEnv = ['SALESBINDER', 'DB', 'URL'].join('_');
@@ -42,36 +38,10 @@ describe('Cache factory', () => {
   it('defaults reads to SQLite even when PostgreSQL URL is configured', async () => {
     process.env[dbUrlEnv] = 'postgres://example/db';
     delete process.env[readBackendEnv];
-    const dir = mkdtempSync(join(tmpdir(), 'salesbinder-cache-factory-'));
-    const dbPath = join(dir, 'cache.db');
-    const writer = new SQLiteCacheService('factory-test', dbPath, true);
-    await writer.close();
 
-    const cache = await createCacheService('factory-test', dbPath);
+    const cache = await createCacheService('factory-test');
 
     expect(cache.getDbPath()).not.toContain('postgres://');
     await cache.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it('can explicitly create a lease-bound SQLite writer', async () => {
-    delete process.env[readBackendEnv];
-    const dir = mkdtempSync(join(tmpdir(), 'salesbinder-cache-writer-factory-'));
-    const dbPath = join(dir, 'cache.db');
-    const writer = await createCacheService('factory-writer', dbPath, true);
-    await writer.setCacheState({
-      lastSync: 1,
-      lastFullSync: 1,
-      documentCount: 0,
-      itemDocumentCount: 0,
-      accountName: 'factory-writer',
-      schemaVersion: 3,
-    });
-    await writer.close();
-
-    const reader = await createCacheService('factory-writer', dbPath);
-    expect((await reader.getCacheState())?.accountName).toBe('factory-writer');
-    await reader.close();
-    rmSync(dir, { recursive: true, force: true });
   });
 });

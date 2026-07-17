@@ -3,7 +3,6 @@ import { ContextId } from '../types/common.types.js';
 import type { Customer, CustomerListResponse } from '../types/customers.types.js';
 import type { CacheService } from './cache.interface.js';
 import type { AccountRow, CacheState } from './types.js';
-import { CACHE_SCHEMA_VERSION } from './types.js';
 
 export interface AccountSyncResult {
   accountsProcessed: number;
@@ -21,18 +20,12 @@ export class AccountIndexerService {
 
   async sync(full = false): Promise<AccountSyncResult> {
     const state = await this.cache.getCacheState();
-    const effectiveFull = full
-      || !state
-      || state.accountName !== this.accountName
-      || state.schemaVersion !== CACHE_SCHEMA_VERSION
-      || !state.lastAccountSync;
-    const syncStartedAt = Math.floor(Date.now() / 1000);
-    const since = effectiveFull ? 0 : Math.max(0, state.lastAccountSync! - this.syncLookbackSeconds);
+    const since = full ? 0 : Math.max(0, (state?.lastAccountSync ?? state?.lastSync ?? 0) - this.syncLookbackSeconds);
     const customers = await this.syncContext(ContextId.Customer, since);
     const suppliers = await this.syncContext(ContextId.Supplier, since);
     const now = Math.floor(Date.now() / 1000);
 
-    await this.cache.setCacheState(this.mergeState(state, syncStartedAt, now));
+    await this.cache.setCacheState(this.mergeState(state, now));
 
     return {
       accountsProcessed: customers + suppliers,
@@ -107,19 +100,16 @@ export class AccountIndexerService {
     };
   }
 
-  private mergeState(state: CacheState | null, syncWatermark: number, now: number): CacheState {
+  private mergeState(state: CacheState | null, now: number): CacheState {
     return {
       ...state,
       lastSync: state?.lastSync ?? now,
       lastFullSync: state?.lastFullSync ?? now,
       documentCount: state?.documentCount ?? 0,
       itemDocumentCount: state?.itemDocumentCount ?? 0,
-      // Document reconciliation owns these completion signals. Preserve an
-      // existing mismatch so running accounts first cannot downgrade a
-      // required historical document backfill into a delta sync.
       accountName: state?.accountName ?? this.accountName,
-      schemaVersion: state?.schemaVersion ?? CACHE_SCHEMA_VERSION,
-      lastAccountSync: syncWatermark,
+      schemaVersion: 2,
+      lastAccountSync: now,
     };
   }
 }
