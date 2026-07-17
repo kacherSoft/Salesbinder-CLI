@@ -3,9 +3,7 @@
  */
 
 /** Current cache schema and authoritative document snapshot contract. */
-export const CACHE_SCHEMA_VERSION = 4;
-/** State marker used until every required sync stage publishes the current contract. */
-export const CACHE_PENDING_SCHEMA_VERSION = 0;
+export const CACHE_SCHEMA_VERSION = 3;
 export const CACHE_WRITER_LOCK_KEY = 'salesbinder-cache-writer-v3';
 
 /** Database schema row for documents table */
@@ -237,72 +235,7 @@ export interface CacheState {
   lastItemSync?: number;
   lastFullItemSync?: number;
   lastDeletedSync?: number;
-  /** Document/line snapshot contract published after documents and deletions finish. */
-  documentSnapshotVersion?: number;
-  /** Durable marker that the whole-cache authoritative refresh has not completed. */
-  fullSyncPending?: boolean;
   documentSyncCheckpoint?: DocumentSyncCheckpoint;
-}
-
-/** Shipment reconciliation may only carry across the same source document identity. */
-export function isShipmentIdentityCompatible(
-  existingApiDocumentId: string | null | undefined,
-  incomingApiDocumentId: string | null | undefined
-): boolean {
-  return existingApiDocumentId == null || existingApiDocumentId === incomingApiDocumentId;
-}
-
-/**
- * Cache rows are not tenant-namespaced, so silently switching an owned cache
- * would leave rows that exist only in the previous account.
- */
-export function assertCacheAccountCompatible(
-  state: Pick<CacheState, 'accountName'> | null,
-  requestedAccountName: string
-): void {
-  const cachedAccountName = state?.accountName?.trim();
-  if (cachedAccountName && cachedAccountName !== requestedAccountName) {
-    throw new Error(
-      `Cache belongs to account "${cachedAccountName}". `
-      + `Use a separate database/cache for "${requestedAccountName}" or explicitly clear `
-      + 'the existing cache before switching accounts.'
-    );
-  }
-}
-
-type CacheOwnershipProbe = {
-  getDocumentCount(): Promise<number>;
-  getItemDocumentCount(): Promise<number>;
-  getDocumentNonItemLineCount(): Promise<number>;
-  getAccountCount(contextId?: number): Promise<number>;
-  getItemCount(): Promise<number>;
-  getStockLocationCount(): Promise<number>;
-};
-
-/** Reject unknown ownership when tenant-bearing rows exist without usable cache metadata. */
-export async function assertCacheMutationCompatible(
-  cache: CacheOwnershipProbe,
-  state: Pick<CacheState, 'accountName'> | null,
-  requestedAccountName: string
-): Promise<void> {
-  assertCacheAccountCompatible(state, requestedAccountName);
-  if (state?.accountName?.trim()) return;
-
-  const counts = await Promise.all([
-    cache.getDocumentCount(),
-    cache.getItemDocumentCount(),
-    cache.getDocumentNonItemLineCount(),
-    cache.getAccountCount(),
-    cache.getItemCount(),
-    cache.getStockLocationCount(),
-  ]);
-  if (counts.some((count) => count > 0)) {
-    throw new Error(
-      'Cache contains data with no account ownership metadata. '
-      + `Use a separate database/cache for "${requestedAccountName}" or explicitly clear `
-      + 'the existing cache before syncing.'
-    );
-  }
 }
 
 /** Writer sync status stored in cache_meta. */
@@ -331,7 +264,6 @@ export interface CacheSyncStatus {
 export interface SyncOptions {
   full?: boolean; // Force full sync
   onProgress?: (current: number, total: number) => void; // Progress callback
-  preserveExistingEnrichment?: boolean; // Disable when pre-run cache identity is incompatible
 }
 
 /** Sync result interface */

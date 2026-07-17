@@ -8,8 +8,6 @@
 
 import { PostgresCacheService } from './postgres-cache.service.js';
 import { SQLiteCacheService } from './sqlite-cache.service.js';
-import type { CacheMirrorSnapshot } from './types.js';
-import { CACHE_SCHEMA_VERSION } from './types.js';
 
 /** Result of a PG → SQLite pull */
 export interface PgPullResult {
@@ -23,59 +21,6 @@ export interface PgPullResult {
   duration: string;
   skipped?: boolean;
   skipReason?: string;
-}
-
-export function assertMirrorSnapshotReady(
-  snapshot: CacheMirrorSnapshot,
-  requestedAccountName: string
-): void {
-  const state = snapshot.state;
-  if (!state) {
-    throw new Error(
-      'PostgreSQL cache has no completed cache state; run `salesbinder cache sync` before pulling.'
-    );
-  }
-  if (state.accountName !== requestedAccountName) {
-    throw new Error(
-      `PostgreSQL cache belongs to account "${state.accountName}", not "${requestedAccountName}".`
-    );
-  }
-  if (state.schemaVersion !== CACHE_SCHEMA_VERSION) {
-    throw new Error(
-      `PostgreSQL cache schema ${state.schemaVersion} is incomplete or obsolete; `
-      + 'run `salesbinder cache sync` before pulling.'
-    );
-  }
-  if (state.fullSyncPending) {
-    throw new Error(
-      'PostgreSQL cache has an incomplete full sync; '
-      + 'run `salesbinder cache sync` before pulling.'
-    );
-  }
-  if (state.documentSyncCheckpoint) {
-    throw new Error(
-      'PostgreSQL cache has an incomplete document sync; '
-      + 'run `salesbinder cache sync` before pulling.'
-    );
-  }
-  if (!snapshot.syncStatus) {
-    throw new Error(
-      'PostgreSQL cache has no successful sync status; '
-      + 'run `salesbinder cache sync` before pulling.'
-    );
-  }
-  if (snapshot.syncStatus.accountName !== requestedAccountName) {
-    throw new Error(
-      `PostgreSQL cache sync status belongs to account "${snapshot.syncStatus.accountName}", `
-      + `not "${requestedAccountName}".`
-    );
-  }
-  if (snapshot.syncStatus.status !== 'success') {
-    throw new Error(
-      `PostgreSQL cache sync is ${snapshot.syncStatus.status}; `
-      + 'wait for or rerun `salesbinder cache sync` before pulling.'
-    );
-  }
 }
 
 /**
@@ -96,10 +41,11 @@ export async function pullFromPostgres(
   try {
     // Open both connections
     pg = new PostgresCacheService(pgConnectionString);
+    await pg.ensureSchema();
+    sqlite = new SQLiteCacheService(sqliteAccountName, sqliteCustomPath, true);
+
     // Read one repeatable-read PostgreSQL image, then atomically replace SQLite.
     const snapshot = await pg.readMirrorSnapshot();
-    assertMirrorSnapshotReady(snapshot, sqliteAccountName);
-    sqlite = new SQLiteCacheService(sqliteAccountName, sqliteCustomPath, true);
     sqlite.replaceMirrorSnapshot(snapshot);
     // Store the pull timestamp in cache_meta so we can check next time
     sqlite.setRawMeta('pg_pull_timestamp', String(Date.now()));

@@ -7,7 +7,7 @@ import { mkdirSync, chmodSync, existsSync, realpathSync } from 'fs';
 import { basename, dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import type { CacheService } from './cache.interface.js';
-import { CACHE_SCHEMA_VERSION, isShipmentIdentityCompatible } from './types.js';
+import { CACHE_SCHEMA_VERSION } from './types.js';
 import type {
   AccountRow,
   CacheMirrorSnapshot,
@@ -549,52 +549,42 @@ export class SQLiteCacheService implements CacheService {
   }
 
   private createCompletenessTriggers(): void {
-    const versionedWriterTriggers = this.db.prepare(`
-      SELECT name FROM sqlite_master
-       WHERE type = 'trigger' AND name LIKE 'trg_%_writer_v%'
-    `).all() as Array<{ name: string }>;
-    for (const { name } of versionedWriterTriggers) {
-      if (/^trg_(documents|item_documents|non_item_lines)_writer_v\d+_(insert|update|delete)$/.test(name)) {
-        this.db.exec(`DROP TRIGGER "${name}"`);
-      }
-    }
-
     this.db.exec(`
-      CREATE TRIGGER trg_documents_writer_v${CACHE_SCHEMA_VERSION}_insert
+      CREATE TRIGGER IF NOT EXISTS trg_documents_writer_v3_insert
       BEFORE INSERT ON documents
       WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
       BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
-      CREATE TRIGGER trg_documents_writer_v${CACHE_SCHEMA_VERSION}_update
+      CREATE TRIGGER IF NOT EXISTS trg_documents_writer_v3_update
       BEFORE UPDATE ON documents
       WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
       BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
-      CREATE TRIGGER trg_documents_writer_v${CACHE_SCHEMA_VERSION}_delete
+      CREATE TRIGGER IF NOT EXISTS trg_documents_writer_v3_delete
       BEFORE DELETE ON documents
       WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
       BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
 
-      CREATE TRIGGER trg_item_documents_writer_v${CACHE_SCHEMA_VERSION}_insert
+      CREATE TRIGGER IF NOT EXISTS trg_item_documents_writer_v3_insert
       BEFORE INSERT ON item_documents
       WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
       BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
-      CREATE TRIGGER trg_item_documents_writer_v${CACHE_SCHEMA_VERSION}_update
+      CREATE TRIGGER IF NOT EXISTS trg_item_documents_writer_v3_update
       BEFORE UPDATE ON item_documents
       WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
       BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
-      CREATE TRIGGER trg_item_documents_writer_v${CACHE_SCHEMA_VERSION}_delete
+      CREATE TRIGGER IF NOT EXISTS trg_item_documents_writer_v3_delete
       BEFORE DELETE ON item_documents
       WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
       BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
 
-      CREATE TRIGGER trg_non_item_lines_writer_v${CACHE_SCHEMA_VERSION}_insert
+      CREATE TRIGGER IF NOT EXISTS trg_non_item_lines_writer_v3_insert
       BEFORE INSERT ON document_non_item_lines
       WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
       BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
-      CREATE TRIGGER trg_non_item_lines_writer_v${CACHE_SCHEMA_VERSION}_update
+      CREATE TRIGGER IF NOT EXISTS trg_non_item_lines_writer_v3_update
       BEFORE UPDATE ON document_non_item_lines
       WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
       BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
-      CREATE TRIGGER trg_non_item_lines_writer_v${CACHE_SCHEMA_VERSION}_delete
+      CREATE TRIGGER IF NOT EXISTS trg_non_item_lines_writer_v3_delete
       BEFORE DELETE ON document_non_item_lines
       WHEN salesbinder_cache_writer_version() <> ${CACHE_SCHEMA_VERSION}
       BEGIN SELECT RAISE(ABORT, 'incompatible SalesBinder cache writer'); END;
@@ -714,35 +704,25 @@ export class SQLiteCacheService implements CacheService {
         .get(sourceDoc.context_id, sourceDoc.doc_number) as DocumentRow | undefined;
       const existing = existingByApiId ?? existingByNumber;
       const docId = existing?.doc_id ?? sourceDoc.doc_id;
-      const compatibleShipmentSource = existing
-        && isShipmentIdentityCompatible(existing.api_doc_id, sourceDoc.api_doc_id)
-        ? existing
-        : undefined;
-      const existingLines = compatibleShipmentSource ? this.db
+      const existingLines = this.db
         .prepare(`SELECT * FROM item_documents WHERE doc_id = ?`)
-        .all(docId) as ItemDocumentRow[] : [];
+        .all(docId) as ItemDocumentRow[];
       const existingBySourceId = new Map(
         existingLines
           .filter((line) => line.document_item_id)
           .map((line) => [line.document_item_id!, line])
       );
-      const preserveReconciledShipment = isShipmentNewer(
-        compatibleShipmentSource?.shipment_checked_at,
-        incoming.sourceFetchedAt
-      );
+      const preserveReconciledShipment = isShipmentNewer(existing?.shipment_checked_at, incoming.sourceFetchedAt);
       const resolvedDocument: DocumentRow = {
         ...sourceDoc,
         doc_id: docId,
         date_sent: preserveReconciledShipment
-          ? compatibleShipmentSource?.date_sent ?? sourceDoc.date_sent ?? null
-          : authoritativeShipmentValue(sourceDoc.date_sent, compatibleShipmentSource?.date_sent),
+          ? existing?.date_sent ?? sourceDoc.date_sent ?? null
+          : authoritativeShipmentValue(sourceDoc.date_sent, existing?.date_sent),
         shipped_percent: preserveReconciledShipment
-          ? compatibleShipmentSource?.shipped_percent ?? sourceDoc.shipped_percent ?? null
-          : authoritativeShipmentValue(
-              sourceDoc.shipped_percent,
-              compatibleShipmentSource?.shipped_percent
-            ),
-        shipment_checked_at: compatibleShipmentSource?.shipment_checked_at ?? null,
+          ? existing?.shipped_percent ?? sourceDoc.shipped_percent ?? null
+          : authoritativeShipmentValue(sourceDoc.shipped_percent, existing?.shipped_percent),
+        shipment_checked_at: existing?.shipment_checked_at ?? null,
         source_fetched_at: incoming.sourceFetchedAt,
         snapshot_version: CACHE_SCHEMA_VERSION,
         snapshot_complete: 0,
@@ -1144,6 +1124,7 @@ export class SQLiteCacheService implements CacheService {
       if (snapshot.state) {
         const state: CacheState = {
           ...snapshot.state,
+          schemaVersion: CACHE_SCHEMA_VERSION,
           documentCount: snapshot.documents.length,
           itemDocumentCount: snapshot.itemDocuments.length,
           nonItemDocumentCount: snapshot.documentNonItemLines.length,

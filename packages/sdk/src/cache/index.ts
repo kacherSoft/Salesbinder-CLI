@@ -11,7 +11,7 @@ export {
 export type { SQLiteCacheMaintenanceLease } from './sqlite-cache.service.js';
 export { PostgresCacheService } from './postgres-cache.service.js';
 export { createCacheService, createPostgresCacheService, getPostgresReadUrl } from './cache.factory.js';
-export { assertMirrorSnapshotReady, pullFromPostgres } from './pg-to-sqlite-sync.service.js';
+export { pullFromPostgres } from './pg-to-sqlite-sync.service.js';
 export type { PgPullResult } from './pg-to-sqlite-sync.service.js';
 export { DocumentIndexerService } from './document-indexer.service.js';
 export { AccountIndexerService } from './account-indexer.service.js';

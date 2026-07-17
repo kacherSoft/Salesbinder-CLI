@@ -4,7 +4,7 @@
  * Strategy:
  * - Default reads use SQLite (fast, offline-capable)
  * - Shared readers can opt into PostgreSQL with the read-backend env flag
- * - Use createPostgresCacheService(accountName) for an ownership-checked PG writer
+ * - Use createPostgresCacheService() when you need direct PostgreSQL writes
  */
 
 import type { CacheService } from './cache.interface.js';
@@ -42,7 +42,7 @@ export async function createCacheService(
         if (!await pg.tryAcquireSyncLock(CACHE_WRITER_LOCK_KEY)) {
           throw new Error('Another cache writer is already running.');
         }
-        await pg.ensureSchema(accountName);
+        await pg.ensureSchema();
       }
       return pg;
     } catch (error) {
@@ -59,9 +59,7 @@ export async function createCacheService(
  * Only call this when you need to WRITE to PostgreSQL directly.
  * Returns null if SALESBINDER_DB_URL is not set.
  */
-export async function createPostgresCacheService(
-  accountName: string
-): Promise<PostgresCacheService | null> {
+export async function createPostgresCacheService(): Promise<PostgresCacheService | null> {
   const dbUrl = process.env.SALESBINDER_DB_URL;
   if (!dbUrl) return null;
   const service = new PostgresCacheService(dbUrl);
@@ -69,7 +67,7 @@ export async function createPostgresCacheService(
     if (!await service.tryAcquireSyncLock(CACHE_WRITER_LOCK_KEY)) {
       throw new Error('Another cache writer is already running.');
     }
-    await service.ensureSchema(accountName);
+    await service.ensureSchema();
     return service;
   } catch (error) {
     await service.close();
