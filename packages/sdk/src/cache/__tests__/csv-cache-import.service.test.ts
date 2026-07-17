@@ -3,7 +3,12 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { CsvCacheImportService } from '../csv-cache-import.service.js';
 import { SQLiteCacheService } from '../sqlite-cache.service.js';
-import { DocumentContextId } from '../types.js';
+import {
+  CACHE_PENDING_SCHEMA_VERSION,
+  CACHE_SCHEMA_VERSION,
+  DocumentContextId,
+  type CacheState,
+} from '../types.js';
 
 describe('CsvCacheImportService', () => {
   let dir: string;
@@ -20,6 +25,7 @@ describe('CsvCacheImportService', () => {
   });
 
   afterEach(async () => {
+    jest.restoreAllMocks();
     await cache.close();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -138,7 +144,8 @@ describe('CsvCacheImportService', () => {
     ]);
     expect(await cache.getCacheState()).toEqual(expect.objectContaining({
       accountName: 'test',
-      schemaVersion: 3,
+      schemaVersion: CACHE_PENDING_SCHEMA_VERSION,
+      fullSyncPending: true,
     }));
     expect((await cache.getCacheState())?.lastAccountSync).toBeUndefined();
     expect((await cache.getCacheState())?.lastItemSync).toBeUndefined();
@@ -146,8 +153,102 @@ describe('CsvCacheImportService', () => {
     expect((await cache.getCacheState())?.lastDocumentSync).toBeUndefined();
     expect((await cache.getCacheState())?.lastFullDocumentSync).toBeUndefined();
     expect((await cache.getCacheState())?.lastDeletedSync).toBeUndefined();
+    expect(await cache.getDocumentsByContext(DocumentContextId.Invoice)).toEqual([
+      expect.objectContaining({
+        snapshot_version: CACHE_SCHEMA_VERSION,
+        snapshot_complete: 0,
+      }),
+    ]);
+  });
+
+  it('marks a previously ready cache pending before the first CSV row mutation', async () => {
+    await cache.setCacheState(readyState());
+    jest.spyOn(cache, 'batchInsertAccounts').mockRejectedValue(new Error('first batch failed'));
+
+    await expect(importer.importDirectory(dir, { accountName: 'test' }))
+      .rejects.toThrow('first batch failed');
+
+    expect(await cache.getCacheState()).toMatchObject({
+      accountName: 'test',
+      schemaVersion: CACHE_PENDING_SCHEMA_VERSION,
+      fullSyncPending: true,
+      documentSnapshotVersion: 0,
+    });
+    expect((await cache.getCacheState())?.lastAccountSync).toBeUndefined();
+    expect((await cache.getCacheState())?.lastDocumentSync).toBeUndefined();
+    expect((await cache.getCacheState())?.lastItemSync).toBeUndefined();
+    expect(await cache.getAccountCount()).toBe(0);
+    expect(await cache.getDocumentCount()).toBe(0);
+  });
+
+  it('keeps pending state after a committed partial CSV import fails', async () => {
+    await cache.setCacheState(readyState());
+    jest.spyOn(cache, 'batchInsertItems').mockRejectedValue(new Error('item batch failed'));
+
+    await expect(importer.importDirectory(dir, { accountName: 'test' }))
+      .rejects.toThrow('item batch failed');
+
+    expect(await cache.getCacheState()).toMatchObject({
+      accountName: 'test',
+      schemaVersion: CACHE_PENDING_SCHEMA_VERSION,
+      fullSyncPending: true,
+      documentSnapshotVersion: 0,
+    });
+    expect(await cache.getAccountCount()).toBe(2);
+    expect(await cache.getItemCount()).toBe(0);
+    expect(await cache.getDocumentCount()).toBe(0);
+  });
+
+  it('rejects importing into a cache owned by another account', async () => {
+    const initialState = {
+      lastSync: 100,
+      lastFullSync: 100,
+      documentCount: 0,
+      itemDocumentCount: 0,
+      accountName: 'other-account',
+      schemaVersion: CACHE_SCHEMA_VERSION,
+    };
+    await cache.setCacheState(initialState);
+
+    await expect(importer.importDirectory(dir, { accountName: 'test' }))
+      .rejects.toThrow(/separate database\/cache.*explicitly clear/i);
+
+    expect(await cache.getCacheState()).toEqual(initialState);
+    expect(await cache.getDocumentCount()).toBe(0);
+  });
+
+  it('rejects importing into populated rows with unknown ownership', async () => {
+    await cache.insertAccount({
+      account_id: 'orphan-account',
+      context_id: 2,
+      name: 'Unknown owner',
+    });
+
+    await expect(importer.importDirectory(dir, { accountName: 'test' }))
+      .rejects.toThrow(/no account ownership metadata.*explicitly clear/i);
+
+    expect(await cache.getAccount('orphan-account')).toBeDefined();
+    expect(await cache.getCacheState()).toBeNull();
   });
 });
+
+function readyState(): CacheState {
+  return {
+    lastSync: 100,
+    lastFullSync: 100,
+    documentCount: 0,
+    itemDocumentCount: 0,
+    accountName: 'test',
+    schemaVersion: CACHE_SCHEMA_VERSION,
+    lastAccountSync: 90,
+    lastDocumentSync: 90,
+    lastFullDocumentSync: 80,
+    lastDeletedSync: 90,
+    lastItemSync: 90,
+    lastFullItemSync: 80,
+    documentSnapshotVersion: CACHE_SCHEMA_VERSION,
+  };
+}
 
 function writeFixtureSet(dir: string): void {
   writeFileSync(join(dir, 'customers.csv'), [

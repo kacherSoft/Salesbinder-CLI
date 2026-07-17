@@ -3,16 +3,186 @@
  */
 
 import type { Command } from 'commander';
-import type { CacheService } from '@salesbinder/sdk';
+import type { CacheService, CacheState, SyncResult } from '@salesbinder/sdk';
 import { formatJson, formatError } from '../../output/json.formatter.js';
 import { existsSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
-export const requiresFullItemSync = (
-  itemFull: boolean,
-  documentSyncType: 'full' | 'delta',
-) => itemFull || documentSyncType === 'full';
+const CUSTOMER_CONTEXT_ID = 2;
+const SUPPLIER_CONTEXT_ID = 10;
+
+const REQUIRED_FULL_WATERMARKS: Array<keyof CacheState> = [
+  'lastFullSync',
+  'lastAccountSync',
+  'lastDocumentSync',
+  'lastFullDocumentSync',
+  'lastDeletedSync',
+  'lastItemSync',
+  'lastFullItemSync',
+];
+
+export function requiresAuthoritativeFullSync(
+  state: CacheState | null,
+  accountName: string,
+  schemaVersion: number,
+  explicitlyFull = false
+): boolean {
+  return explicitlyFull
+    || !state
+    || state.accountName !== accountName
+    || state.schemaVersion !== schemaVersion
+    || state.fullSyncPending === true
+    || REQUIRED_FULL_WATERMARKS.some((field) => !state[field]);
+}
+
+export async function markAuthoritativeFullSyncPending(
+  cache: CacheService,
+  state: CacheState | null,
+  accountName: string,
+  pendingSchemaVersion: number
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  const [documentCount, itemDocumentCount] = await Promise.all([
+    cache.getDocumentCount(),
+    cache.getItemDocumentCount(),
+  ]);
+  await cache.setCacheState({
+    ...state,
+    lastSync: state?.lastSync ?? now,
+    lastFullSync: state?.lastFullSync ?? 0,
+    documentCount,
+    itemDocumentCount,
+    accountName,
+    schemaVersion: pendingSchemaVersion,
+    fullSyncPending: true,
+  });
+}
+
+export async function publishCompletedCacheState(
+  cache: CacheService,
+  accountName: string,
+  schemaVersion: number
+): Promise<void> {
+  const state = await cache.getCacheState();
+  if (!state || state.accountName !== accountName) {
+    throw new Error('Cannot publish cache readiness without matching cache state.');
+  }
+  const missingWatermarks = REQUIRED_FULL_WATERMARKS.filter((field) => !state[field]);
+  if (missingWatermarks.length > 0 || state.documentSyncCheckpoint) {
+    throw new Error(
+      `Cannot publish cache readiness; incomplete stages: ${missingWatermarks.join(', ') || 'documents'}.`
+    );
+  }
+  const [
+    documentCount,
+    itemDocumentCount,
+    nonItemDocumentCount,
+    accountCount,
+    customerCount,
+    supplierCount,
+    itemCount,
+    stockLocationCount,
+  ] = await Promise.all([
+    cache.getDocumentCount(),
+    cache.getItemDocumentCount(),
+    cache.getDocumentNonItemLineCount(),
+    cache.getAccountCount(),
+    cache.getAccountCount(CUSTOMER_CONTEXT_ID),
+    cache.getAccountCount(SUPPLIER_CONTEXT_ID),
+    cache.getItemCount(),
+    cache.getStockLocationCount(),
+  ]);
+  const completedState: CacheState = {
+    ...state,
+    accountName,
+    schemaVersion,
+    documentCount,
+    itemDocumentCount,
+    nonItemDocumentCount,
+    accountCount,
+    customerCount,
+    supplierCount,
+    itemCount,
+    stockLocationCount,
+  };
+  delete completedState.fullSyncPending;
+  await cache.setCacheState(completedState);
+}
+
+export async function publishCompletedDocumentState(
+  cache: CacheService,
+  accountName: string,
+  documentSnapshotVersion: number
+): Promise<void> {
+  const state = await cache.getCacheState();
+  if (
+    !state
+    || state.accountName !== accountName
+    || !state.lastDocumentSync
+    || !state.lastFullDocumentSync
+    || state.documentSyncCheckpoint
+  ) {
+    throw new Error('Cannot publish document snapshot readiness before document sync completes.');
+  }
+  await cache.setCacheState({ ...state, documentSnapshotVersion });
+}
+
+export async function markDocumentSnapshotPending(
+  cache: CacheService,
+  accountName: string
+): Promise<void> {
+  const state = await cache.getCacheState();
+  if (!state || state.accountName !== accountName) {
+    throw new Error('Cannot mark document snapshot pending without matching cache state.');
+  }
+  await cache.setCacheState({ ...state, documentSnapshotVersion: 0 });
+}
+
+interface CacheSyncStageOperations {
+  syncAccounts(full: boolean): Promise<{
+    accountsProcessed: number;
+    customersProcessed: number;
+    suppliersProcessed: number;
+  }>;
+  markDocumentsPending(): Promise<void>;
+  syncDocuments(full: boolean): Promise<SyncResult>;
+  syncDeleted(full: boolean): Promise<{ deletedRecordsProcessed: number }>;
+  publishDocumentsReady(): Promise<void>;
+  syncItems(full: boolean): Promise<{ itemsProcessed: number; stockRowsProcessed: number }>;
+  publishReady(): Promise<void>;
+  onDeletionReconciliationError?(error: unknown): void;
+}
+
+export async function runCacheSyncStages(
+  operations: CacheSyncStageOperations,
+  forceFullRun: boolean
+) {
+  const accountResult = await operations.syncAccounts(forceFullRun);
+  await operations.markDocumentsPending();
+  let result: SyncResult;
+  try {
+    result = await operations.syncDocuments(forceFullRun);
+  } catch (error) {
+    try {
+      await operations.syncDeleted(forceFullRun);
+    } catch (deletedError) {
+      operations.onDeletionReconciliationError?.(deletedError);
+    }
+    throw error;
+  }
+  const deletedResult = await operations.syncDeleted(forceFullRun);
+  if (!result.success) {
+    throw Object.assign(
+      new Error(`Document sync incomplete: ${result.failedDocuments} document(s) require retry.`),
+      { syncResult: result }
+    );
+  }
+  await operations.publishDocumentsReady();
+  const itemResult = await operations.syncItems(forceFullRun);
+  await operations.publishReady();
+  return { accountResult, result, deletedResult, itemResult };
+}
 
 /**
  * Register cache management commands
@@ -53,13 +223,24 @@ Use --full to force complete resync.`)
           DeletedLogSyncService,
           PostgresCacheService,
           SQLiteCacheService,
+          CACHE_PENDING_SCHEMA_VERSION,
           CACHE_SCHEMA_VERSION,
           CACHE_WRITER_LOCK_KEY,
+          assertCacheMutationCompatible,
           pullFromPostgres,
           loadPreferences,
         } = await import('@salesbinder/sdk');
 
         const accountName = program.opts().account || 'default';
+        const prefs = loadPreferences();
+        const lookbackEnv = process.env[['SALESBINDER', 'SYNC', 'LOOKBACK', 'SECONDS'].join('_')];
+        const syncLookbackSeconds = lookbackEnv
+          ? parseInt(lookbackEnv, 10)
+          : (prefs?.syncLookbackSeconds ?? 604800);
+        const detailRequestsPerSecond = Number(options.detailRate);
+        if (!Number.isFinite(detailRequestsPerSecond) || detailRequestsPerSecond <= 0) {
+          throw new Error('--detail-rate must be a positive number.');
+        }
         const client = new SalesBinderClient(accountName);
         const dbUrl = process.env.SALESBINDER_DB_URL;
 
@@ -73,12 +254,28 @@ Use --full to force complete resync.`)
           if (!lockAcquired) {
             throw new Error('Another cache writer is already running.');
           }
-          await pgService.ensureSchema();
+          await pgService.ensureSchema(accountName);
         } else {
           cacheService = new SQLiteCacheService(accountName, undefined, true);
           console.error('Syncing API → SQLite...');
         }
 
+        const initialState = await cacheService.getCacheState();
+        await assertCacheMutationCompatible(cacheService, initialState, accountName);
+        const forceFullRun = requiresAuthoritativeFullSync(
+          initialState,
+          accountName,
+          CACHE_SCHEMA_VERSION,
+          Boolean(options.full)
+        );
+        if (forceFullRun) {
+          await markAuthoritativeFullSyncPending(
+            cacheService,
+            initialState,
+            accountName,
+            CACHE_PENDING_SCHEMA_VERSION
+          );
+        }
         syncStartedAt = Date.now();
         syncRunId = `${accountName}-${syncStartedAt}`;
         await cacheService.setSyncStatus({
@@ -91,14 +288,6 @@ Use --full to force complete resync.`)
           message: 'Sync running',
         });
 
-        // Load stale threshold from config
-        const prefs = loadPreferences();
-        const lookbackEnv = process.env[['SALESBINDER', 'SYNC', 'LOOKBACK', 'SECONDS'].join('_')];
-        const syncLookbackSeconds = lookbackEnv ? parseInt(lookbackEnv, 10) : (prefs?.syncLookbackSeconds ?? 604800);
-        const detailRequestsPerSecond = Number(options.detailRate);
-        if (!Number.isFinite(detailRequestsPerSecond) || detailRequestsPerSecond <= 0) {
-          throw new Error('--detail-rate must be a positive number.');
-        }
         const accountIndexer = new AccountIndexerService(client, cacheService, accountName, syncLookbackSeconds);
         const indexer = new DocumentIndexerService(
           client,
@@ -110,20 +299,18 @@ Use --full to force complete resync.`)
         );
         const itemIndexer = new ItemIndexerService(client, cacheService, accountName, syncLookbackSeconds);
         const deletedLogSync = new DeletedLogSyncService(client, cacheService, accountName, syncLookbackSeconds);
+        const cacheForPublication = cacheService;
 
-        const initialState = await cacheService.getCacheState();
-        const cacheIdentityMismatch = !initialState
-          || initialState.accountName !== accountName
-          || initialState.schemaVersion !== CACHE_SCHEMA_VERSION;
-        const accountFull = Boolean(options.full || cacheIdentityMismatch || !initialState?.lastAccountSync);
-        const documentFull = Boolean(options.full || cacheIdentityMismatch || !initialState?.lastDocumentSync);
-        const itemFull = Boolean(options.full || cacheIdentityMismatch || !initialState?.lastItemSync);
-
-        const accountResult = await accountIndexer.sync(accountFull);
-        let result: import('@salesbinder/sdk').SyncResult;
-        try {
-          result = await indexer.sync({
-            full: documentFull,
+        const preserveExistingEnrichment = initialState?.accountName === accountName;
+        const { accountResult, result, deletedResult, itemResult } = await runCacheSyncStages({
+          syncAccounts: (full) => accountIndexer.sync(full),
+          markDocumentsPending: () => markDocumentSnapshotPending(
+            cacheForPublication,
+            accountName
+          ),
+          syncDocuments: (full) => indexer.sync({
+            full,
+            preserveExistingEnrichment,
             onProgress: (current, total) => {
               if (total > 0) {
                 const percent = Math.round((current / total) * 100);
@@ -132,26 +319,26 @@ Use --full to force complete resync.`)
                 console.error(`Processed: ${current} documents`);
               }
             },
-          });
-        } catch (error) {
-          try {
-            await deletedLogSync.sync();
-          } catch (deletedError: any) {
-            console.error(`Deletion reconciliation also failed: ${deletedError?.message || deletedError}`);
-          }
-          throw error;
-        }
-        const deletedResult = await deletedLogSync.sync();
-        if (!result.success) {
-          throw Object.assign(
-            new Error(`Document sync incomplete: ${result.failedDocuments} document(s) require retry.`),
-            { syncResult: result }
-          );
-        }
-        // A resumed document-full checkpoint carries the original historical
-        // intent even when this invocation omitted --full. Complete the item
-        // master at the same scope before reporting the cache as successful.
-        const itemResult = await itemIndexer.sync(requiresFullItemSync(itemFull, result.type));
+          }),
+          syncDeleted: (full) => deletedLogSync.sync(full),
+          publishDocumentsReady: () => publishCompletedDocumentState(
+            cacheForPublication,
+            accountName,
+            CACHE_SCHEMA_VERSION
+          ),
+          syncItems: (full) => itemIndexer.sync(full, preserveExistingEnrichment),
+          publishReady: () => publishCompletedCacheState(
+            cacheForPublication,
+            accountName,
+            CACHE_SCHEMA_VERSION
+          ),
+          onDeletionReconciliationError: (deletedError: unknown) => {
+            console.error(
+              'Deletion reconciliation also failed:',
+              deletedError instanceof Error ? deletedError.message : String(deletedError)
+            );
+          },
+        }, forceFullRun);
         const cloudSyncFinishedAt = Math.floor(Date.now() / 1000);
         await cacheService.setSyncStatus({
           status: 'success',
@@ -316,7 +503,6 @@ Next sync will perform a full resync.`)
               throw new Error('Another cache writer is already running.');
             }
             try {
-              await pgCache.ensureSchema();
               await pgCache.truncateAll();
             } finally {
               await pgCache.releaseSyncLock(lockKey);
@@ -428,7 +614,7 @@ No historical SalesBinder API requests are made.`)
               throw new Error('Another cache writer is already running.');
             }
             releaseMaintenanceLock = () => pgCache.releaseSyncLock(lockKey);
-            await pgCache.ensureSchema();
+            await pgCache.ensureSchema(accountName);
           } else {
             cacheService = new SQLiteCacheService(accountName, undefined, true);
           }

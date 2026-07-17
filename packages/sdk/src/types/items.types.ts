@@ -25,6 +25,11 @@ export interface Item {
     id?: string;
     name?: string;
   };
+  quantity_reserved?: number | null;
+  quantity_available?: number | null;
+  quantity_incoming?: number | null;
+  in_transit?: number | null;
+  valuation?: number | null;
   created: string;
   modified: string;
   location?: {
@@ -45,7 +50,16 @@ export interface ItemVariationLocation {
   id?: number | string;
   item_variation_id?: string;
   location_id?: string;
+  location?: {
+    id?: string;
+    name?: string;
+  } | null;
   quantity?: number;
+  quantity_reserved?: number | null;
+  quantity_available?: number | null;
+  quantity_incoming?: number | null;
+  in_transit?: number | null;
+  valuation?: number | null;
   threshold?: number;
 }
 

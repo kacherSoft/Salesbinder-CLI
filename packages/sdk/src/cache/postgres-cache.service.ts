@@ -4,7 +4,12 @@
 
 import pg, { type PoolClient } from 'pg';
 import type { CacheService } from './cache.interface.js';
-import { CACHE_SCHEMA_VERSION, CACHE_WRITER_LOCK_KEY } from './types.js';
+import {
+  assertCacheAccountCompatible,
+  CACHE_SCHEMA_VERSION,
+  CACHE_WRITER_LOCK_KEY,
+  isShipmentIdentityCompatible,
+} from './types.js';
 import type {
   AccountRow,
   CacheMirrorSnapshot,
@@ -23,6 +28,15 @@ import type {
 
 const { Pool } = pg;
 const CACHE_WRITER_APPLICATION_NAME = `salesbinder-cache-v${CACHE_SCHEMA_VERSION}`;
+const TENANT_CACHE_TABLES = [
+  'accounts',
+  'documents',
+  'item_documents',
+  'document_non_item_lines',
+  'items',
+  'item_stock_locations',
+] as const;
+const ALL_CACHE_TABLES = [...TENANT_CACHE_TABLES, 'cache_meta'] as const;
 
 interface SyncLockLease {
   client: PoolClient;
@@ -93,15 +107,101 @@ export class PostgresCacheService implements CacheService {
     });
   }
 
-  async ensureSchema(): Promise<void> {
+  async ensureSchema(requestedAccountName: string): Promise<void> {
+    if (!requestedAccountName.trim()) {
+      throw new Error('Cache schema initialization requires a non-empty account name.');
+    }
     const retainLease = this.syncLockClients.has(CACHE_WRITER_LOCK_KEY);
     if (!await this.tryAcquireSyncLock(CACHE_WRITER_LOCK_KEY)) {
       throw new Error('Another cache writer is already running.');
     }
     try {
-      await this.withWriterClient((client) => this.ensureSchemaLocked(client));
+      await this.withWriterClient(async (client) => {
+        await this.assertOwnershipBeforeSchemaLocked(client, requestedAccountName);
+        await this.ensureSchemaLocked(client);
+      });
     } finally {
       if (!retainLease) await this.releaseSyncLock(CACHE_WRITER_LOCK_KEY);
+    }
+  }
+
+  private async assertOwnershipBeforeSchemaLocked(
+    client: PoolClient,
+    requestedAccountName: string
+  ): Promise<void> {
+    const relationResult = await client.query<Record<string, boolean>>(
+      `SELECT ${ALL_CACHE_TABLES.map((table, index) => (
+        `to_regclass($${index + 1}) IS NOT NULL AS "${table}"`
+      )).join(', ')}`,
+      [...ALL_CACHE_TABLES]
+    );
+    const relations = relationResult.rows[0] ?? {};
+    let state: Pick<CacheState, 'accountName'> | null = null;
+
+    if (relations.cache_meta) {
+      const stateResult = await client.query<{ value: string }>(
+        `SELECT value FROM cache_meta WHERE key = 'state' LIMIT 1`
+      );
+      if (stateResult.rows[0]) {
+        try {
+          const parsed = JSON.parse(stateResult.rows[0].value) as unknown;
+          if (
+            !parsed
+            || typeof parsed !== 'object'
+            || Array.isArray(parsed)
+            || (
+              'accountName' in parsed
+              && typeof (parsed as { accountName?: unknown }).accountName !== 'string'
+            )
+          ) {
+            throw new Error('invalid ownership metadata');
+          }
+          state = parsed as Pick<CacheState, 'accountName'>;
+        } catch {
+          throw new Error(
+            'Cache account ownership metadata is malformed. '
+            + 'Explicitly clear the cache before initializing this schema.'
+          );
+        }
+      }
+      const versionResult = await client.query<{ value: string }>(
+        `SELECT value FROM cache_meta WHERE key = 'cache_schema_version' LIMIT 1`
+      );
+      if (versionResult.rows[0]) {
+        const rawVersion = versionResult.rows[0].value.trim();
+        const cacheSchemaVersion = /^\d+$/.test(rawVersion)
+          ? Number(rawVersion)
+          : Number.NaN;
+        if (!Number.isSafeInteger(cacheSchemaVersion)) {
+          throw new Error(
+            'Cache schema version metadata is malformed. '
+            + 'Explicitly clear the cache before initializing this schema.'
+          );
+        }
+        if (cacheSchemaVersion > CACHE_SCHEMA_VERSION) {
+          throw new Error(
+            `Cache schema version ${cacheSchemaVersion} is newer than this writer `
+            + `version ${CACHE_SCHEMA_VERSION}; upgrade the SalesBinder writer before syncing.`
+          );
+        }
+      }
+    }
+
+    assertCacheAccountCompatible(state, requestedAccountName);
+    if (state?.accountName?.trim()) return;
+
+    for (const table of TENANT_CACHE_TABLES) {
+      if (!relations[table]) continue;
+      const populated = await client.query<{ populated: boolean }>(
+        `SELECT EXISTS (SELECT 1 FROM ${table} LIMIT 1) AS populated`
+      );
+      if (populated.rows[0]?.populated) {
+        throw new Error(
+          'Cache contains data with no account ownership metadata. '
+          + `Use a separate database/cache for "${requestedAccountName}" or explicitly clear `
+          + 'the existing cache before syncing.'
+        );
+      }
     }
   }
 
@@ -236,12 +336,38 @@ export class PostgresCacheService implements CacheService {
         value TEXT NOT NULL
       );
     `);
+    await this.createSchemaVersionDowngradeGuard(client);
     await this.migrateDocumentColumns(client);
     await this.migrateItemDocumentColumns(client);
     await this.migrateToV3(client);
     await this.createCompletenessTriggers(client);
     await this.createIndexes(client);
     await this.publishSchemaVersion(client);
+  }
+
+  private async createSchemaVersionDowngradeGuard(client: PoolClient): Promise<void> {
+    await client.query(`
+      CREATE OR REPLACE FUNCTION cache_reject_schema_version_downgrade()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF OLD.key = 'cache_schema_version'
+          AND NEW.key = 'cache_schema_version'
+          AND OLD.value ~ '^[0-9]+$'
+          AND NEW.value ~ '^[0-9]+$'
+          AND NEW.value::INTEGER < OLD.value::INTEGER
+        THEN
+          RAISE EXCEPTION 'SalesBinder cache schema downgrade from % to % is not allowed',
+            OLD.value, NEW.value;
+        END IF;
+        RETURN NEW;
+      END;
+      $$;
+
+      DROP TRIGGER IF EXISTS cache_schema_version_monotonic_guard ON cache_meta;
+      CREATE TRIGGER cache_schema_version_monotonic_guard
+      BEFORE UPDATE ON cache_meta
+      FOR EACH ROW EXECUTE FUNCTION cache_reject_schema_version_downgrade();
+    `);
   }
 
   private async createCompletenessTriggers(client: PoolClient): Promise<void> {
@@ -623,10 +749,16 @@ export class PostgresCacheService implements CacheService {
         )).rows[0];
       }
       const docId = existing?.doc_id ?? snapshot.document.doc_id;
-      const existingLines = (await client.query<ItemDocumentRow>(
-        `SELECT * FROM item_documents WHERE doc_id = $1 ORDER BY id FOR UPDATE`,
-        [docId]
-      )).rows;
+      const compatibleShipmentSource = existing
+        && isShipmentIdentityCompatible(existing.api_doc_id, snapshot.document.api_doc_id)
+        ? existing
+        : undefined;
+      const existingLines = compatibleShipmentSource
+        ? (await client.query<ItemDocumentRow>(
+            `SELECT * FROM item_documents WHERE doc_id = $1 ORDER BY id FOR UPDATE`,
+            [docId]
+          )).rows
+        : [];
       await client.query(
         `SELECT id FROM document_non_item_lines WHERE doc_id = $1 ORDER BY id FOR UPDATE`,
         [docId]
@@ -636,17 +768,28 @@ export class PostgresCacheService implements CacheService {
           .filter((line) => line.document_item_id)
           .map((line) => [line.document_item_id!, line])
       );
-      const preserveReconciledShipment = isShipmentNewer(existing?.shipment_checked_at, snapshot.sourceFetchedAt);
+      const preserveReconciledShipment = isShipmentNewer(
+        compatibleShipmentSource?.shipment_checked_at,
+        snapshot.sourceFetchedAt
+      );
       const resolvedDocument: DocumentRow = {
         ...snapshot.document,
         doc_id: docId,
         date_sent: preserveReconciledShipment
-          ? existing?.date_sent ?? snapshot.document.date_sent ?? null
-          : authoritativeShipmentValue(snapshot.document.date_sent, existing?.date_sent),
+          ? compatibleShipmentSource?.date_sent ?? snapshot.document.date_sent ?? null
+          : authoritativeShipmentValue(
+              snapshot.document.date_sent,
+              compatibleShipmentSource?.date_sent
+            ),
         shipped_percent: preserveReconciledShipment
-          ? existing?.shipped_percent ?? snapshot.document.shipped_percent ?? null
-          : authoritativeShipmentValue(snapshot.document.shipped_percent, existing?.shipped_percent),
-        shipment_checked_at: existing?.shipment_checked_at ?? null,
+          ? compatibleShipmentSource?.shipped_percent
+            ?? snapshot.document.shipped_percent
+            ?? null
+          : authoritativeShipmentValue(
+              snapshot.document.shipped_percent,
+              compatibleShipmentSource?.shipped_percent
+            ),
+        shipment_checked_at: compatibleShipmentSource?.shipment_checked_at ?? null,
         source_fetched_at: snapshot.sourceFetchedAt,
         snapshot_version: CACHE_SCHEMA_VERSION,
         snapshot_complete: 0,
@@ -1091,9 +1234,20 @@ export class PostgresCacheService implements CacheService {
   }
 
   async truncateAll(): Promise<void> {
-    await this.withWriterClient((client) => client.query(
-      `TRUNCATE TABLE item_stock_locations, document_non_item_lines, item_documents, items, documents, accounts, cache_meta RESTART IDENTITY CASCADE`
-    ));
+    await this.withWriterClient(async (client) => {
+      const relationResult = await client.query<Record<string, boolean>>(
+        `SELECT ${ALL_CACHE_TABLES.map((table, index) => (
+          `to_regclass($${index + 1}) IS NOT NULL AS "${table}"`
+        )).join(', ')}`,
+        [...ALL_CACHE_TABLES]
+      );
+      const relations = relationResult.rows[0] ?? {};
+      const existing = ALL_CACHE_TABLES.filter((table) => relations[table]);
+      if (existing.length === 0) return;
+      await client.query(
+        `TRUNCATE TABLE ${existing.join(', ')} RESTART IDENTITY CASCADE`
+      );
+    });
   }
 
   private async withWriterClient<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {

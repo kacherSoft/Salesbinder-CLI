@@ -13,7 +13,12 @@ import type {
   SyncOptions,
   SyncResult,
 } from './types.js';
-import { CACHE_SCHEMA_VERSION, DocumentContextId } from './types.js';
+import {
+  assertCacheMutationCompatible,
+  CACHE_PENDING_SCHEMA_VERSION,
+  CACHE_SCHEMA_VERSION,
+  DocumentContextId,
+} from './types.js';
 import type { Document, DocumentListResponse } from '../types/documents.types.js';
 
 /**
@@ -53,6 +58,7 @@ export class DocumentIndexerService {
    */
   async sync(options: SyncOptions = {}): Promise<SyncResult> {
     const state = await this.cache.getCacheState();
+    await assertCacheMutationCompatible(this.cache, state, this.accountName);
     const pendingSyncType = state?.documentSyncCheckpoint?.accountName === this.accountName
       ? state.documentSyncCheckpoint.syncType
       : undefined;
@@ -73,7 +79,11 @@ export class DocumentIndexerService {
    */
   async isCacheStale(): Promise<boolean> {
     const state = await this.cache.getCacheState();
-    if (!state?.lastDocumentSync) return true;
+    if (
+      !state?.lastDocumentSync
+      || state.accountName !== this.accountName
+      || state.schemaVersion !== CACHE_SCHEMA_VERSION
+    ) return true;
     const staleTime = Math.floor(Date.now() / 1000) - this.staleThreshold;
     return state.lastDocumentSync < staleTime;
   }
@@ -95,6 +105,8 @@ export class DocumentIndexerService {
   private async runSync(type: 'full' | 'delta', options: SyncOptions): Promise<SyncResult> {
     const startTime = Date.now();
     const state = await this.cache.getCacheState();
+    const allowExistingEnrichment = options.preserveExistingEnrichment !== false
+      && state?.accountName === this.accountName;
     const resumable = state?.documentSyncCheckpoint?.accountName === this.accountName
       && state.documentSyncCheckpoint.syncType === type;
     const sourceModifiedSince = type === 'full'
@@ -128,6 +140,7 @@ export class DocumentIndexerService {
       Object.entries(checkpoint.retryDocumentIdentities ?? {})
         .filter(([documentId]) => retryDocumentIds.has(documentId))
     );
+    const retryListedDocuments = new Map<string, Document>();
     const contexts = [
       { id: DocumentContextId.Estimate, name: 'Estimate' },
       { id: DocumentContextId.Invoice, name: 'Invoice' },
@@ -144,6 +157,8 @@ export class DocumentIndexerService {
           type === 'full' && checkpoint.phase === 'primary',
           retryDocumentIds,
           retryDocumentIdentities,
+          retryListedDocuments,
+          allowExistingEnrichment,
           options
         );
         documentsProcessed += pass.documents;
@@ -155,6 +170,8 @@ export class DocumentIndexerService {
           checkpoint,
           retryDocumentIds,
           retryDocumentIdentities,
+          retryListedDocuments,
+          allowExistingEnrichment,
           options
         );
         documentsProcessed += retried.documents;
@@ -206,6 +223,8 @@ export class DocumentIndexerService {
     useFullList: boolean,
     retryDocumentIds: Set<string>,
     retryDocumentIdentities: Map<string, { contextId: number; documentNumber: number }>,
+    retryListedDocuments: Map<string, Document>,
+    allowExistingEnrichment: boolean,
     options: SyncOptions
   ): Promise<{ documents: number; documentsDeleted: number; itemLines: number; nonItemLines: number }> {
     let documents = 0;
@@ -246,12 +265,14 @@ export class DocumentIndexerService {
           if (seenDocumentIds.has(document.id)) continue;
           seenDocumentIds.add(document.id);
           try {
-            const saved = await this.fetchAndReplaceDocument(document.id, {
-              contextId: document.context_id,
-              documentNumber: document.document_number,
-            });
+            const saved = await this.fetchAndReplaceDocument(
+              document.id,
+              document,
+              allowExistingEnrichment
+            );
             retryDocumentIds.delete(document.id);
             retryDocumentIdentities.delete(document.id);
+            retryListedDocuments.delete(document.id);
             documents++;
             if (saved.deleted) documentsDeleted++;
             itemLines += saved.itemLines;
@@ -263,6 +284,7 @@ export class DocumentIndexerService {
               contextId: document.context_id,
               documentNumber: document.document_number,
             });
+            retryListedDocuments.set(document.id, document);
             console.error(`Failed to replace document ${document.id}:`, error?.message || error);
           }
         }
@@ -292,6 +314,8 @@ export class DocumentIndexerService {
     checkpoint: DocumentSyncCheckpoint,
     retryDocumentIds: Set<string>,
     retryDocumentIdentities: Map<string, { contextId: number; documentNumber: number }>,
+    retryListedDocuments: Map<string, Document>,
+    allowExistingEnrichment: boolean,
     options: SyncOptions
   ): Promise<{ documents: number; documentsDeleted: number; itemLines: number; nonItemLines: number }> {
     let documents = 0;
@@ -300,12 +324,24 @@ export class DocumentIndexerService {
     let nonItemLines = 0;
     for (const documentId of [...retryDocumentIds]) {
       try {
+        const identity = retryDocumentIdentities.get(documentId);
+        const inMemoryListed = retryListedDocuments.get(documentId);
+        const listedDocument = inMemoryListed
+          ?? await this.refetchListedDocument(documentId, identity);
+        if (!listedDocument) {
+          console.error(
+            `Retry deferred for document ${documentId}: list metadata could not be refreshed`
+          );
+          continue;
+        }
         const saved = await this.fetchAndReplaceDocument(
           documentId,
-          retryDocumentIdentities.get(documentId)
+          listedDocument,
+          allowExistingEnrichment
         );
         retryDocumentIds.delete(documentId);
         retryDocumentIdentities.delete(documentId);
+        retryListedDocuments.delete(documentId);
         documents++;
         if (saved.deleted) documentsDeleted++;
         itemLines += saved.itemLines;
@@ -321,36 +357,73 @@ export class DocumentIndexerService {
     return { documents, documentsDeleted, itemLines, nonItemLines };
   }
 
+  private async refetchListedDocument(
+    documentId: string,
+    identity?: { contextId: number; documentNumber: number }
+  ): Promise<Document | undefined> {
+    if (!identity) return undefined;
+    try {
+      const response = await this.client.documents.list({
+        contextId: identity.contextId as DocumentContextId,
+        documentNumber: identity.documentNumber,
+        exact: true,
+        page: 1,
+        pageLimit: 50,
+      });
+      return this.flattenDocumentArray(response.documents)
+        .find((document) => document.id === documentId);
+    } catch {
+      return undefined;
+    }
+  }
+
   private async fetchAndReplaceDocument(
     documentId: string,
-    listedIdentity?: { contextId: number; documentNumber: number }
+    listedDocument: Document | undefined,
+    allowExistingEnrichment: boolean
   ): Promise<{ itemLines: number; nonItemLines: number; deleted: boolean }> {
     let sourceFetchedAt = Math.floor(Date.now() / 1000);
     let firstRequestStart = true;
-    let fullDocument: Document;
-    try {
-      fullDocument = await this.client.documents.get(documentId, {
-        beforeRequestStart: async () => {
-          await this.waitForDetailRequestSlot();
-          if (firstRequestStart) {
-            sourceFetchedAt = Math.floor(Date.now() / 1000);
-            firstRequestStart = false;
-          }
-        },
-      });
-    } catch (error: any) {
-      if (!isNotFoundError(error)) throw error;
-      const cachedByApiId = await this.cache.getDocumentByApiId(documentId);
-      const cachedByNumber = !cachedByApiId && listedIdentity
-        ? await this.cache.getDocumentByNumber(listedIdentity.contextId, listedIdentity.documentNumber)
-        : undefined;
-      await this.cache.deleteDocument(cachedByApiId?.doc_id ?? cachedByNumber?.doc_id ?? documentId);
-      return { itemLines: 0, nonItemLines: 0, deleted: true };
-    }
+    const fullDocument = await this.client.documents.get(documentId, {
+      beforeRequestStart: async () => {
+        await this.waitForDetailRequestSlot();
+        if (firstRequestStart) {
+          sourceFetchedAt = Math.floor(Date.now() / 1000);
+          firstRequestStart = false;
+        }
+      },
+    });
     if (fullDocument.id !== documentId) {
       throw new Error(`Document detail identity mismatch for ${documentId}`);
     }
-    const snapshot = this.processDocument(fullDocument, sourceFetchedAt);
+    const compatibleListed = isCompatibleListedDocument(fullDocument, listedDocument)
+      ? listedDocument
+      : undefined;
+    const existingByApiId = allowExistingEnrichment
+      ? await this.cache.getDocumentByApiId(documentId)
+      : undefined;
+    const existingByNumber = allowExistingEnrichment
+      ? await this.cache.getDocumentByNumber(
+          fullDocument.context_id,
+          fullDocument.document_number
+        )
+      : undefined;
+    const existing = [existingByApiId, existingByNumber]
+      .find((candidate) => isCompatibleExistingDocument(fullDocument, candidate));
+    const existingLines = existing
+      ? await this.cache.getItemDocuments(existing.doc_id)
+      : [];
+    const existingNonItemLines = existing
+      ? await this.cache.getDocumentNonItemLines(existing.doc_id)
+      : [];
+    const snapshot = this.processDocument(
+      fullDocument,
+      sourceFetchedAt,
+      compatibleListed,
+      existing,
+      existingLines,
+      existingNonItemLines
+    );
     await this.cache.replaceDocumentSnapshot(snapshot);
     return {
       itemLines: snapshot.itemLines.length,
@@ -374,8 +447,8 @@ export class DocumentIndexerService {
       documentCount: await this.cache.getDocumentCount(),
       itemDocumentCount: await this.cache.getItemDocumentCount(),
       nonItemDocumentCount: await this.cache.getDocumentNonItemLineCount(),
-      accountName: this.accountName,
-      schemaVersion: CACHE_SCHEMA_VERSION,
+      accountName: state?.accountName?.trim() ? state.accountName : this.accountName,
+      schemaVersion: state?.schemaVersion ?? CACHE_PENDING_SCHEMA_VERSION,
       documentSyncCheckpoint: undefined,
     });
   }
@@ -402,8 +475,8 @@ export class DocumentIndexerService {
       lastFullSync: state?.lastFullSync ?? 0,
       documentCount: state?.documentCount ?? 0,
       itemDocumentCount: state?.itemDocumentCount ?? 0,
-      accountName: this.accountName,
-      schemaVersion: CACHE_SCHEMA_VERSION,
+      accountName: state?.accountName?.trim() ? state.accountName : this.accountName,
+      schemaVersion: state?.schemaVersion ?? CACHE_PENDING_SCHEMA_VERSION,
       documentSyncCheckpoint: checkpoint,
     });
   }
@@ -417,18 +490,86 @@ export class DocumentIndexerService {
   /**
    * Process a document into database rows
    */
-  private processDocument(doc: Document, sourceFetchedAt: number): DocumentSnapshot {
+  private processDocument(
+    doc: Document,
+    sourceFetchedAt: number,
+    listedDoc?: Document,
+    existing?: DocumentRow,
+    existingLines: ItemDocumentRow[] = [],
+    existingNonItemLines: DocumentNonItemLineRow[] = []
+  ): DocumentSnapshot {
     if (!Array.isArray(doc.document_items)) {
       throw new Error(`Authoritative detail for document ${doc.id} omitted document_items`);
+    }
+    if (typeof doc.customer_id !== 'string' || !doc.customer_id.trim()) {
+      throw new Error(`Authoritative detail for document ${doc.id} omitted customer_id`);
     }
     // Normalize issue_date to YYYY-MM-DD format for consistent querying
     const issueDate = doc.issue_date ? doc.issue_date.split('T')[0] : doc.issue_date;
     const accountContextId = doc.context_id === DocumentContextId.PurchaseOrder ? 10 : 2;
-    const accountName = doc.customer?.name ?? null;
-    const salespersonName = doc.user?.name
-      ?? [doc.user?.first_name, doc.user?.last_name].filter(Boolean).join(' ')
-      ?? null;
-    const statusName = doc.status?.name ?? null;
+    const userId = resolveRelationshipIdentity<string>(
+      doc,
+      listedDoc,
+      'user_id',
+      'user',
+      existing?.user_id
+    );
+    const statusId = resolveRelationshipIdentity<number>(
+      doc,
+      listedDoc,
+      'status_id',
+      'status',
+      existing?.status_id
+    );
+    const compatibleExistingAccount = (existing?.account_id ?? existing?.customer_id) === doc.customer_id
+      ? existing
+      : undefined;
+    const accountName = resolvePresence(
+      compatibleRelationshipFieldPresence<string, string>(
+        doc,
+        'customer_id',
+        'customer',
+        'name',
+        doc.customer_id
+      ),
+      compatibleRelationshipFieldPresence<string, string>(
+        listedDoc,
+        'customer_id',
+        'customer',
+        'name',
+        doc.customer_id
+      ),
+      compatibleExistingAccount?.account_name
+        ?? compatibleExistingAccount?.customer_name
+        ?? compatibleExistingAccount?.supplier_name
+    );
+    const accountNumber = resolvePresence(
+      compatibleRelationshipFieldPresence<number, string>(
+        doc,
+        'customer_id',
+        'customer',
+        'customer_number',
+        doc.customer_id
+      ),
+      compatibleRelationshipFieldPresence<number, string>(
+        listedDoc,
+        'customer_id',
+        'customer',
+        'customer_number',
+        doc.customer_id
+      ),
+      compatibleExistingAccount?.account_number
+    );
+    const salespersonName = resolvePresence(
+      compatibleUserNamePresence(doc, userId),
+      compatibleUserNamePresence(listedDoc, userId),
+      existing && existing.user_id === userId ? existing.salesperson_name : undefined
+    );
+    const statusName = resolvePresence(
+      compatibleStatusNamePresence(doc, statusId),
+      compatibleStatusNamePresence(listedDoc, statusId),
+      existing && existing.status_id === statusId ? existing.status_name : undefined
+    );
     const headerSubtotal = finiteDocumentNumber(doc.total_price, 'total_price', doc.id);
     const headerCogs = finiteDocumentNumber(doc.total_cost, 'total_cost', doc.id);
     
@@ -440,28 +581,60 @@ export class DocumentIndexerService {
       customer_id: doc.customer_id,
       api_doc_id: doc.id,
       cache_source: 'api',
-      document_name: doc.name ?? null,
+      document_name: resolveDirect<string | null>(doc, listedDoc, 'name', existing?.document_name),
+      custom_doc_number: resolveDirect<string | null>(
+        doc,
+        listedDoc,
+        'custom_doc_number',
+        existing?.custom_doc_number
+      ),
       account_id: doc.customer_id,
       account_context_id: accountContextId,
-      account_name: accountName,
-      account_number: doc.customer?.customer_number ?? null,
-      user_id: doc.user_id,
-      salesperson_name: salespersonName || null,
+      account_name: accountName ?? null,
+      account_number: accountNumber ?? null,
+      user_id: userId ?? null,
+      salesperson_name: salespersonName ?? null,
       customer_name: doc.context_id === DocumentContextId.PurchaseOrder ? null : accountName,
-      customer_number: doc.context_id === DocumentContextId.PurchaseOrder ? null : doc.customer?.customer_number ?? null,
+      customer_number: doc.context_id === DocumentContextId.PurchaseOrder ? null : accountNumber,
       supplier_name: doc.context_id === DocumentContextId.PurchaseOrder ? accountName : null,
-      supplier_number: doc.context_id === DocumentContextId.PurchaseOrder ? doc.customer?.customer_number ?? null : null,
-      status_id: doc.status_id,
-      status_name: statusName,
+      supplier_number: doc.context_id === DocumentContextId.PurchaseOrder ? accountNumber : null,
+      status_id: statusId ?? null,
+      status_name: statusName ?? null,
       total_price: headerSubtotal,
       total_cost: headerCogs,
       subtotal: headerSubtotal,
-      date_sent: doc.date_sent,
-      shipped_percent: doc.shipped_percent,
+      associated_document_id: resolveDirect<string | null>(
+        doc,
+        listedDoc,
+        'associated_document_id',
+        existing?.associated_document_id
+      ),
+      external_po_number: resolveDirect<string | null>(
+        doc,
+        listedDoc,
+        'external_po_number',
+        existing?.external_po_number
+      ),
+      shipping_location: resolveDirect<string | null>(
+        doc,
+        listedDoc,
+        'shipping_location',
+        existing?.shipping_location
+      ),
+      date_sent: resolveDirect<string | null>(doc, listedDoc, 'date_sent', existing?.date_sent),
+      shipped_percent: resolveDirect<number | null>(
+        doc,
+        listedDoc,
+        'shipped_percent',
+        existing?.shipped_percent
+      ),
       source_fetched_at: sourceFetchedAt,
       snapshot_version: CACHE_SCHEMA_VERSION,
       snapshot_complete: 1,
-      is_cancelled: statusName && /cancelled|canceled/i.test(statusName) ? 1 : 0,
+      is_cancelled: statusName === undefined
+        ? existing && existing.status_id === statusId ? existing.is_cancelled ?? 0 : 0
+        : typeof statusName === 'string' && /cancelled|canceled/i.test(statusName) ? 1 : 0,
+      imported_at: existing?.imported_at ?? null,
       modified: Math.floor(new Date(doc.modified).getTime() / 1000),
     };
     if (!Number.isFinite(docRow.modified)) {
@@ -469,6 +642,23 @@ export class DocumentIndexerService {
     }
 
     const sourceIds = new Set<string>();
+    const listedLinesById = new Map(
+      (listedDoc?.document_items ?? [])
+        .filter((line) => line.id)
+        .map((line) => [line.id, line])
+    );
+    const existingLinesById = new Map(
+      existingLines.flatMap((line) => (
+        line.document_item_id ? [[line.document_item_id, line] as const] : []
+      ))
+    );
+    const existingNonItemLinesById = new Map(
+      existingNonItemLines.flatMap((line) => (
+        line.doc_id === existing?.doc_id && line.document_item_id
+          ? [[line.document_item_id, line] as const]
+          : []
+      ))
+    );
     const itemLines: Omit<ItemDocumentRow, 'id'>[] = [];
     const nonItemLines: Omit<DocumentNonItemLineRow, 'id'>[] = [];
     for (const item of doc.document_items) {
@@ -486,15 +676,54 @@ export class DocumentIndexerService {
 
       if (item.item_id) {
         const cost = finiteNumber(item.cost, 'cost', doc.id, item.id);
+        const listedCandidate = listedLinesById.get(item.id);
+        const listedLine = listedCandidate?.document_id === doc.id
+          && listedCandidate.item_id === item.item_id
+          ? listedCandidate
+          : undefined;
+        const existingCandidate = existingLinesById.get(item.id);
+        const existingLine = existingCandidate?.doc_id === existing?.doc_id
+          && existingCandidate?.item_id === item.item_id
+          ? existingCandidate
+          : undefined;
+        const lineDescription = resolveDirect<string | null>(
+          item,
+          listedLine,
+          'description',
+          existingLine?.line_description
+        );
         itemLines.push({
           item_id: item.item_id,
           doc_id: doc.id,
           document_item_id: item.id,
           quantity,
           price,
-          item_name: item.name ?? item.description ?? null,
-          line_description: item.description ?? null,
-          quantity_received: item.quantity_partially_received ?? null,
+          item_name: resolveLineItemName(item, listedLine, existingLine?.item_name),
+          item_number: resolveDirect<number | null>(
+            item,
+            listedLine,
+            'item_number',
+            existingLine?.item_number
+          ),
+          item_sku: resolveDirect<string | null>(
+            item,
+            listedLine,
+            'item_sku',
+            existingLine?.item_sku
+          ),
+          item_location: resolveDirect<string | null>(
+            item,
+            listedLine,
+            'item_location',
+            existingLine?.item_location
+          ),
+          line_description: lineDescription ?? null,
+          quantity_received: resolveDirect<number | null>(
+            item,
+            listedLine,
+            'quantity_partially_received',
+            existingLine?.quantity_received
+          ) ?? null,
           quantity_shipped: item.quantity_partially_shipped,
           cost,
           total_amount: totalAmount,
@@ -504,31 +733,82 @@ export class DocumentIndexerService {
         continue;
       }
 
+      const listedCandidate = listedLinesById.get(item.id);
+      const listedLine = listedCandidate?.document_id === doc.id && !listedCandidate.item_id
+        ? listedCandidate
+        : undefined;
+      const existingLine = existingNonItemLinesById.get(item.id);
+      const name = resolveDirect<string | null>(item, listedLine, 'name', existingLine?.name) ?? null;
+      const lineDescription = resolveDirect<string | null>(
+        item,
+        listedLine,
+        'description',
+        existingLine?.line_description
+      ) ?? null;
+      const serviceCategoryId = resolveDirect<string | null>(
+        item,
+        listedLine,
+        'service_category_id',
+        existingLine?.service_category_id
+      ) ?? null;
+      const unitId = resolveDirect<string | null>(
+        item,
+        listedLine,
+        'unit_id',
+        existingLine?.unit_id
+      ) ?? null;
+      const cost = resolveDirect<number | null>(item, listedLine, 'cost', existingLine?.cost) ?? null;
+      const discountedPrice = resolveDirect<number | null>(
+        item,
+        listedLine,
+        'discounted_price',
+        existingLine?.discounted_price
+      ) ?? null;
+      const tax = resolveDirect<number | null>(item, listedLine, 'tax', existingLine?.tax) ?? null;
+      const tax2 = resolveDirect<number | null>(item, listedLine, 'tax2', existingLine?.tax2) ?? null;
+      const weight = resolveDirect<number | null>(
+        item,
+        listedLine,
+        'weight',
+        existingLine?.weight
+      ) ?? null;
+      const sourceCreated = resolveDirect<string | null>(
+        item,
+        listedLine,
+        'created',
+        existingLine?.source_created
+      ) ?? null;
+      const sourceModified = resolveDirect<string | null>(
+        item,
+        listedLine,
+        'modified',
+        existingLine?.source_modified
+      ) ?? null;
       nonItemLines.push({
         doc_id: doc.id,
         document_item_id: item.id,
         line_type: 'non_item',
-        name: item.name ?? null,
-        line_description: item.description ?? null,
-        service_category_id: item.service_category_id ?? null,
-        unit_id: item.unit_id ?? null,
+        name,
+        line_description: lineDescription,
+        service_category_id: serviceCategoryId,
+        unit_id: unitId,
         quantity,
         price,
-        cost: item.cost ?? null,
+        cost,
         total_amount: totalAmount,
-        discounted_price: item.discounted_price ?? null,
+        discounted_price: discountedPrice,
         discount_percent: discountPercent,
         net_amount: totalAmount * (1 - discountPercent / 100),
-        tax: item.tax ?? null,
-        tax2: item.tax2 ?? null,
-        weight: item.weight ?? null,
-        source_created: item.created ?? null,
-        source_modified: item.modified ?? null,
+        tax,
+        tax2,
+        weight,
+        source_created: sourceCreated,
+        source_modified: sourceModified,
         raw_classification: JSON.stringify({
           has_item_id: false,
-          source_name: item.name ?? null,
-          service_category_id: item.service_category_id ?? null,
-          unit_id: item.unit_id ?? null,
+          source_name: name,
+          service_category_id: serviceCategoryId,
+          unit_id: unitId,
           item_variations_location_id: item.item_variations_location_id ?? null,
           item_variation_data: item.item_variation_data ?? null,
         }),
@@ -574,6 +854,178 @@ function finiteDocumentNumber(value: unknown, field: string, docId: string): num
   return numeric;
 }
 
-function isNotFoundError(error: unknown): boolean {
-  return (error as { response?: { status?: number } } | null)?.response?.status === 404;
+type Presence<T> = { present: true; value: T } | { present: false };
+
+function directPresence<T>(source: unknown, key: string): Presence<T> {
+  if (!source || typeof source !== 'object' || !Object.prototype.hasOwnProperty.call(source, key)) {
+    return { present: false };
+  }
+  return { present: true, value: (source as Record<string, unknown>)[key] as T };
+}
+
+function nestedIdentityPresence<TIdentity>(
+  source: unknown,
+  relationshipKey: string
+): Presence<TIdentity | null> {
+  const relationship = directPresence<unknown>(source, relationshipKey);
+  if (!relationship.present || !relationship.value || typeof relationship.value !== 'object') {
+    return { present: false };
+  }
+  return directPresence<TIdentity | null>(relationship.value, 'id');
+}
+
+function resolveRelationshipIdentity<TIdentity>(
+  detail: unknown,
+  listed: unknown,
+  identityKey: string,
+  relationshipKey: string,
+  existing: TIdentity | null | undefined
+): TIdentity | null | undefined {
+  const resolved = firstPresentValue<TIdentity | null>(
+    directPresence<TIdentity | null>(detail, identityKey),
+    nestedIdentityPresence<TIdentity>(detail, relationshipKey),
+    directPresence<TIdentity | null>(listed, identityKey),
+    nestedIdentityPresence<TIdentity>(listed, relationshipKey)
+  );
+  return resolved.present ? resolved.value : existing;
+}
+
+function compatibleRelationshipObjectPresence<TIdentity>(
+  source: unknown,
+  identityKey: string,
+  relationshipKey: string,
+  expectedIdentity: TIdentity | null | undefined
+): Presence<Record<string, unknown> | null> {
+  const directIdentity = directPresence<TIdentity | null>(source, identityKey);
+  if (expectedIdentity === null && directIdentity.present && directIdentity.value === null) {
+    return { present: true, value: null };
+  }
+  if (
+    directIdentity.present
+    && (directIdentity.value === null || directIdentity.value !== expectedIdentity)
+  ) {
+    return { present: false };
+  }
+  const relationship = directPresence<unknown>(source, relationshipKey);
+  if (!relationship.present || relationship.value === null || typeof relationship.value !== 'object') {
+    return { present: false };
+  }
+  const nestedIdentity = directPresence<TIdentity | null>(relationship.value, 'id');
+  if (expectedIdentity === null && nestedIdentity.present && nestedIdentity.value === null) {
+    return { present: true, value: null };
+  }
+  if (
+    nestedIdentity.present
+    && nestedIdentity.value !== expectedIdentity
+  ) {
+    return { present: false };
+  }
+  return {
+    present: true,
+    value: relationship.value as Record<string, unknown>,
+  };
+}
+
+function compatibleRelationshipFieldPresence<TValue, TIdentity>(
+  source: unknown,
+  identityKey: string,
+  relationshipKey: string,
+  fieldKey: string,
+  expectedIdentity: TIdentity | null | undefined
+): Presence<TValue | null> {
+  const relationship = compatibleRelationshipObjectPresence(
+    source,
+    identityKey,
+    relationshipKey,
+    expectedIdentity
+  );
+  if (!relationship.present) return { present: false };
+  if (relationship.value === null) return { present: true, value: null };
+  return directPresence<TValue | null>(relationship.value, fieldKey);
+}
+
+function compatibleUserNamePresence(
+  source: unknown,
+  expectedUserId: string | null | undefined
+): Presence<string | null> {
+  const user = compatibleRelationshipObjectPresence(source, 'user_id', 'user', expectedUserId);
+  if (!user.present) return { present: false };
+  if (user.value === null) return { present: true, value: null };
+  const directName = directPresence<string | null>(user.value, 'name');
+  if (directName.present) return directName;
+  const firstName = directPresence<string | null>(user.value, 'first_name');
+  const lastName = directPresence<string | null>(user.value, 'last_name');
+  if (!firstName.present && !lastName.present) return { present: false };
+  const joined = [firstName.present ? firstName.value : null, lastName.present ? lastName.value : null]
+    .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+    .join(' ');
+  return { present: true, value: joined || null };
+}
+
+function compatibleStatusNamePresence(
+  source: unknown,
+  expectedStatusId: number | null | undefined
+): Presence<string | null> {
+  return compatibleRelationshipFieldPresence<string, number>(
+    source,
+    'status_id',
+    'status',
+    'name',
+    expectedStatusId
+  );
+}
+
+function resolvePresence<T>(
+  detail: Presence<T>,
+  listed: Presence<T>,
+  existing: T | undefined
+): T | undefined {
+  if (detail.present) return detail.value;
+  if (listed.present) return listed.value;
+  return existing;
+}
+
+function resolveDirect<T>(
+  detail: unknown,
+  listed: unknown,
+  key: string,
+  existing: T | undefined
+): T | undefined {
+  return resolvePresence(directPresence<T>(detail, key), directPresence<T>(listed, key), existing);
+}
+
+function resolveLineItemName(
+  detail: unknown,
+  listed: unknown,
+  existing: string | null | undefined
+): string | null {
+  const value = firstPresentValue<string | null>(
+    directPresence<string | null>(detail, 'name'),
+    directPresence<string | null>(listed, 'name'),
+    directPresence<string | null>(detail, 'description'),
+    directPresence<string | null>(listed, 'description')
+  );
+  return value.present ? value.value : existing ?? null;
+}
+
+function firstPresentValue<T>(...values: Presence<T>[]): Presence<T> {
+  return values.find((value) => value.present) ?? { present: false };
+}
+
+function isCompatibleListedDocument(detail: Document, listed?: Document): listed is Document {
+  return Boolean(
+    listed
+    && listed.id === detail.id
+    && listed.context_id === detail.context_id
+    && listed.document_number === detail.document_number
+  );
+}
+
+function isCompatibleExistingDocument(detail: Document, existing?: DocumentRow): existing is DocumentRow {
+  return Boolean(
+    existing
+    && existing.context_id === detail.context_id
+    && existing.doc_number === detail.document_number
+    && (!existing.api_doc_id || existing.api_doc_id === detail.id)
+  );
 }

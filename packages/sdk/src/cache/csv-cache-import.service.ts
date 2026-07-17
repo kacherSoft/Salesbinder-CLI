@@ -3,7 +3,12 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import type { CacheService } from './cache.interface.js';
 import type { AccountRow, DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
-import { CACHE_SCHEMA_VERSION, DocumentContextId } from './types.js';
+import {
+  assertCacheMutationCompatible,
+  CACHE_PENDING_SCHEMA_VERSION,
+  CACHE_SCHEMA_VERSION,
+  DocumentContextId,
+} from './types.js';
 import { ContextId } from '../types/common.types.js';
 import { parseCsvFile } from './csv-cache-import.parser.js';
 import type { CsvImportOptions, CsvImportResult, CsvImportWarnings, CsvRow } from './csv-cache-import.types.js';
@@ -159,8 +164,31 @@ export class CsvCacheImportService {
 
   private async write(prepared: PreparedImport, accountName: string): Promise<void> {
     const cache = this.requireCache();
+    const initialState = await cache.getCacheState();
+    await assertCacheMutationCompatible(cache, initialState, accountName);
     const { documents, lineItems } = await this.resolveExistingDocuments(prepared, cache);
     const protectedRows = await this.excludeApiOwnedRows(prepared, cache);
+
+    const pendingState = { ...initialState };
+    delete pendingState.lastAccountSync;
+    delete pendingState.lastDocumentSync;
+    delete pendingState.lastFullDocumentSync;
+    delete pendingState.lastItemSync;
+    delete pendingState.lastFullItemSync;
+    delete pendingState.lastDeletedSync;
+    delete pendingState.documentSyncCheckpoint;
+    pendingState.documentSnapshotVersion = 0;
+    const importStartedAt = Math.floor(Date.now() / 1000);
+    await cache.setCacheState({
+      ...pendingState,
+      lastSync: initialState?.lastSync ?? importStartedAt,
+      lastFullSync: initialState?.lastFullSync ?? 0,
+      documentCount: await cache.getDocumentCount(),
+      itemDocumentCount: await cache.getItemDocumentCount(),
+      accountName,
+      schemaVersion: CACHE_PENDING_SCHEMA_VERSION,
+      fullSyncPending: true,
+    });
 
     await cache.batchInsertAccounts(protectedRows.accounts);
     await cache.batchInsertItems(protectedRows.items);
@@ -174,23 +202,16 @@ export class CsvCacheImportService {
     await cache.batchInsertItemDocuments(lineItems);
 
     const now = Math.floor(Date.now() / 1000);
-    const previousState = { ...(await cache.getCacheState()) };
-    delete previousState.lastAccountSync;
-    delete previousState.lastDocumentSync;
-    delete previousState.lastFullDocumentSync;
-    delete previousState.lastItemSync;
-    delete previousState.lastFullItemSync;
-    delete previousState.lastDeletedSync;
-    delete previousState.documentSyncCheckpoint;
     await cache.setCacheState({
-      ...previousState,
+      ...pendingState,
       lastSync: now,
-      lastFullSync: now,
+      lastFullSync: initialState?.lastFullSync ?? 0,
       documentCount: await cache.getDocumentCount(),
       itemDocumentCount: await cache.getItemDocumentCount(),
       nonItemDocumentCount: await cache.getDocumentNonItemLineCount(),
       accountName,
-      schemaVersion: CACHE_SCHEMA_VERSION,
+      schemaVersion: CACHE_PENDING_SCHEMA_VERSION,
+      fullSyncPending: true,
       accountCount: await cache.getAccountCount(),
       customerCount: await cache.getAccountCount(ContextId.Customer),
       supplierCount: await cache.getAccountCount(ContextId.Supplier),
