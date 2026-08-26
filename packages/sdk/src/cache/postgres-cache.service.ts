@@ -2,7 +2,7 @@
  * PostgreSQL cache service for the shared analytics cache upstream.
  */
 
-import pg from 'pg';
+import pg, { type PoolClient } from 'pg';
 import type { CacheService } from './cache.interface.js';
 import type {
   AccountRow,
@@ -16,6 +16,12 @@ import type {
   ItemStockLocationRow,
   PriceDistributionRow,
 } from './types.js';
+import { PAYMENT_SYNC_STATUS_KEY, PAYMENT_TRANSACTION_COLUMNS } from './payment-cache.constants.js';
+import type { PaymentSyncStatus, PaymentTransactionRow } from './payment-sync.types.js';
+import {
+  assertPaymentRowsMatchDocument,
+  assertUniquePaymentTransactionIds,
+} from './payment-sync.helpers.js';
 
 const { Pool } = pg;
 
@@ -26,7 +32,7 @@ const DOCUMENT_COLUMNS = [
   'user_id', 'salesperson_name', 'customer_name', 'customer_number',
   'supplier_name', 'supplier_number', 'status_id', 'status_name',
   'total_price', 'total_cost', 'subtotal', 'associated_document_id',
-  'external_po_number', 'shipping_location', 'is_cancelled', 'imported_at',
+  'external_po_number', 'shipping_location', 'is_cancelled', 'archived', 'imported_at',
 ] as const;
 
 const ITEM_DOCUMENT_COLUMNS = [
@@ -48,7 +54,7 @@ const ITEM_COLUMNS = [
   'item_id', 'item_number', 'name', 'description', 'sku', 'serial_number', 'barcode',
   'category_id', 'category_name', 'quantity', 'quantity_reserved', 'quantity_available',
   'quantity_incoming', 'in_transit', 'threshold', 'cost', 'price', 'valuation',
-  'published', 'created', 'modified', 'cache_source', 'imported_at',
+  'published', 'archived', 'created', 'modified', 'cache_source', 'imported_at',
 ] as const;
 
 const STOCK_COLUMNS = [
@@ -61,6 +67,7 @@ const STOCK_COLUMNS = [
 export class PostgresCacheService implements CacheService {
   private pool: InstanceType<typeof Pool>;
   private opened = true;
+  private readonly syncLockClients = new Map<string, PoolClient>();
   private readonly connectionString: string;
 
   constructor(connectionString: string) {
@@ -140,6 +147,7 @@ export class PostgresCacheService implements CacheService {
         price NUMERIC NULL,
         valuation NUMERIC NULL,
         published INTEGER NULL,
+        archived INTEGER NULL,
         created TEXT NULL,
         modified BIGINT NULL,
         cache_source TEXT NOT NULL DEFAULT 'api',
@@ -169,12 +177,23 @@ export class PostgresCacheService implements CacheService {
         FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS payment_transactions (
+        transaction_id TEXT PRIMARY KEY,
+        doc_id TEXT NOT NULL,
+        amount NUMERIC NOT NULL,
+        transaction_date TEXT NOT NULL,
+        reference TEXT NULL,
+        imported_at BIGINT NOT NULL,
+        FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS cache_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
     `);
     await this.migrateDocumentColumns();
+    await this.migrateItemColumns();
     await this.migrateItemDocumentColumns();
     await this.createIndexes();
   }
@@ -204,7 +223,14 @@ export class PostgresCacheService implements CacheService {
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS external_po_number TEXT NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS shipping_location TEXT NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_cancelled INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE documents ADD COLUMN IF NOT EXISTS archived INTEGER NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS imported_at BIGINT NULL;
+    `);
+  }
+
+  private async migrateItemColumns(): Promise<void> {
+    await this.pool.query(`
+      ALTER TABLE items ADD COLUMN IF NOT EXISTS archived INTEGER NULL;
     `);
   }
 
@@ -235,11 +261,14 @@ export class PostgresCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);
       CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status_id);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_api_doc_id ON documents(api_doc_id) WHERE api_doc_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_documents_archived ON documents(archived);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item ON item_documents(item_id);
       CREATE INDEX IF NOT EXISTS idx_item_documents_doc ON item_documents(doc_id);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_name ON item_documents(item_name);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_number ON item_documents(item_number);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_sku ON item_documents(item_sku);
+      CREATE INDEX IF NOT EXISTS idx_payment_transactions_doc_id ON payment_transactions(doc_id);
+      CREATE INDEX IF NOT EXISTS idx_payment_transactions_date_doc ON payment_transactions(transaction_date, doc_id);
       CREATE INDEX IF NOT EXISTS idx_accounts_context_number ON accounts(context_id, account_number);
       CREATE INDEX IF NOT EXISTS idx_accounts_context_name ON accounts(context_id, name);
       CREATE INDEX IF NOT EXISTS idx_accounts_modified ON accounts(modified);
@@ -248,6 +277,7 @@ export class PostgresCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_items_name ON items(name);
       CREATE INDEX IF NOT EXISTS idx_items_sku ON items(sku);
       CREATE INDEX IF NOT EXISTS idx_items_item_number ON items(item_number);
+      CREATE INDEX IF NOT EXISTS idx_items_archived ON items(archived);
       CREATE INDEX IF NOT EXISTS idx_stock_item ON item_stock_locations(item_id);
       CREATE INDEX IF NOT EXISTS idx_stock_location ON item_stock_locations(location_id);
     `);
@@ -320,6 +350,52 @@ export class PostgresCacheService implements CacheService {
 
   async batchInsertItemDocuments(items: Omit<ItemDocumentRow, 'id'>[]): Promise<void> {
     await this.batch(items, (item) => this.pool.query(this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS), this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item))));
+  }
+
+  async getPaymentTransactions(docId: string): Promise<PaymentTransactionRow[]> {
+    return (await this.pool.query<PaymentTransactionRow>(
+      `SELECT * FROM payment_transactions WHERE doc_id = $1 ORDER BY transaction_date ASC, transaction_id ASC`,
+      [docId],
+    )).rows.map((row) => this.coercePaymentTransaction(row));
+  }
+
+  async getAllPaymentTransactions(): Promise<PaymentTransactionRow[]> {
+    return (await this.pool.query<PaymentTransactionRow>(
+      `SELECT * FROM payment_transactions ORDER BY transaction_date ASC, transaction_id ASC`,
+    )).rows.map((row) => this.coercePaymentTransaction(row));
+  }
+
+  async replacePaymentTransactions(docId: string, transactions: PaymentTransactionRow[]): Promise<void> {
+    assertPaymentRowsMatchDocument(docId, transactions);
+    assertUniquePaymentTransactionIds(transactions);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SELECT doc_id FROM documents WHERE doc_id = $1 FOR UPDATE`, [docId]);
+      await client.query(`DELETE FROM payment_transactions WHERE doc_id = $1`, [docId]);
+      for (const transaction of transactions) {
+        await client.query(
+          this.insertSql('payment_transactions', PAYMENT_TRANSACTION_COLUMNS),
+          this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction)),
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async batchInsertPaymentTransactions(transactions: PaymentTransactionRow[]): Promise<void> {
+    assertUniquePaymentTransactionIds(transactions);
+    await this.batch(transactions, (transaction) =>
+      this.pool.query(
+        this.insertSql('payment_transactions', PAYMENT_TRANSACTION_COLUMNS),
+        this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction)),
+      ),
+    );
   }
 
   async insertAccount(account: AccountRow): Promise<void> {
@@ -537,16 +613,48 @@ export class PostgresCacheService implements CacheService {
     );
   }
 
-  async tryAcquireSyncLock(lockKey: string): Promise<boolean> {
-    const result = await this.pool.query<{ acquired: boolean }>(
-      `SELECT pg_try_advisory_lock(hashtext($1)) AS acquired`,
-      [lockKey]
+  async getPaymentSyncStatus(): Promise<PaymentSyncStatus | null> {
+    const result = await this.pool.query<{ value: string }>(`SELECT value FROM cache_meta WHERE key = $1`, [PAYMENT_SYNC_STATUS_KEY]);
+    return result.rows.length ? JSON.parse(result.rows[0].value) as PaymentSyncStatus : null;
+  }
+
+  async setPaymentSyncStatus(status: PaymentSyncStatus): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO cache_meta (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [PAYMENT_SYNC_STATUS_KEY, JSON.stringify(status)],
     );
-    return result.rows[0]?.acquired === true;
+  }
+
+  async tryAcquireSyncLock(lockKey: string): Promise<boolean> {
+    if (this.syncLockClients.has(lockKey)) return false;
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query<{ acquired: boolean }>(
+        `SELECT pg_try_advisory_lock(hashtext($1)) AS acquired`,
+        [lockKey],
+      );
+      if (result.rows[0]?.acquired !== true) {
+        client.release();
+        return false;
+      }
+      this.syncLockClients.set(lockKey, client);
+      return true;
+    } catch (error) {
+      client.release();
+      throw error;
+    }
   }
 
   async releaseSyncLock(lockKey: string): Promise<void> {
-    await this.pool.query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]);
+    const client = this.syncLockClients.get(lockKey);
+    if (!client) return;
+    try {
+      await client.query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]);
+    } finally {
+      this.syncLockClients.delete(lockKey);
+      client.release();
+    }
   }
 
   async getDocumentCount(): Promise<number> {
@@ -555,6 +663,10 @@ export class PostgresCacheService implements CacheService {
 
   async getItemDocumentCount(): Promise<number> {
     return this.count(`SELECT COUNT(*) as count FROM item_documents`);
+  }
+
+  async getPaymentTransactionCount(): Promise<number> {
+    return this.count(`SELECT COUNT(*) as count FROM payment_transactions`);
   }
 
   async getAccountCount(contextId?: number): Promise<number> {
@@ -575,6 +687,9 @@ export class PostgresCacheService implements CacheService {
 
   async close(): Promise<void> {
     this.opened = false;
+    for (const lockKey of [...this.syncLockClients.keys()]) {
+      await this.releaseSyncLock(lockKey);
+    }
     await this.pool.end();
   }
 
@@ -583,7 +698,7 @@ export class PostgresCacheService implements CacheService {
   }
 
   async truncateAll(): Promise<void> {
-    await this.pool.query(`TRUNCATE TABLE item_stock_locations, item_documents, items, documents, accounts, cache_meta RESTART IDENTITY CASCADE`);
+    await this.pool.query(`TRUNCATE TABLE payment_transactions, item_stock_locations, item_documents, items, documents, accounts, cache_meta RESTART IDENTITY CASCADE`);
   }
 
   private async count(sql: string, params: unknown[] = []): Promise<number> {
@@ -598,7 +713,9 @@ export class PostgresCacheService implements CacheService {
   private upsertSql(table: string, columns: readonly string[], conflictColumn: string): string {
     const updates = columns
       .filter((column) => column !== conflictColumn)
-      .map((column) => `${column} = EXCLUDED.${column}`)
+      .map((column) => column === 'archived' && (table === 'documents' || table === 'items')
+        ? `${column} = COALESCE(EXCLUDED.${column}, ${table}.${column})`
+        : `${column} = EXCLUDED.${column}`)
       .join(', ');
     return `${this.insertSql(table, columns)} ON CONFLICT (${conflictColumn}) DO UPDATE SET ${updates}`;
   }
@@ -635,6 +752,7 @@ export class PostgresCacheService implements CacheService {
       account_context_id: doc.account_context_id ?? null,
       account_name: doc.account_name ?? doc.customer_name ?? doc.supplier_name ?? null,
       is_cancelled: doc.is_cancelled ?? 0,
+      archived: doc.archived ?? null,
     };
   }
 
@@ -664,7 +782,7 @@ export class PostgresCacheService implements CacheService {
   }
 
   private normalizeItem(item: ItemRow): Record<string, unknown> {
-    return { ...item, cache_source: item.cache_source ?? 'api' };
+    return { ...item, archived: item.archived ?? null, cache_source: item.cache_source ?? 'api' };
   }
 
   private normalizeStock(row: ItemStockLocationRow): Record<string, unknown> {
@@ -676,6 +794,13 @@ export class PostgresCacheService implements CacheService {
       quantity_incoming: row.quantity_incoming ?? 0,
       in_transit: row.in_transit ?? 0,
       cache_source: row.cache_source ?? 'api',
+    };
+  }
+
+  private normalizePaymentTransaction(row: PaymentTransactionRow): Record<string, unknown> {
+    return {
+      ...row,
+      reference: row.reference ?? null,
     };
   }
 
@@ -718,6 +843,15 @@ export class PostgresCacheService implements CacheService {
       price: row.price == null ? null : Number(row.price),
       cost: row.cost == null ? null : Number(row.cost),
       valuation: row.valuation == null ? null : Number(row.valuation),
+    };
+  }
+
+  private coercePaymentTransaction(row: PaymentTransactionRow): PaymentTransactionRow {
+    return {
+      ...row,
+      amount: Number(row.amount),
+      reference: row.reference ?? null,
+      imported_at: Number(row.imported_at),
     };
   }
 }

@@ -3,6 +3,7 @@ import { ContextId } from '../types/common.types.js';
 import type { Customer, CustomerListResponse } from '../types/customers.types.js';
 import type { CacheService } from './cache.interface.js';
 import type { AccountRow, CacheState } from './types.js';
+import { CACHE_SCHEMA_VERSION } from './types.js';
 
 export interface AccountSyncResult {
   accountsProcessed: number;
@@ -108,7 +109,7 @@ export class AccountIndexerService {
       documentCount: state?.documentCount ?? 0,
       itemDocumentCount: state?.itemDocumentCount ?? 0,
       accountName: state?.accountName ?? this.accountName,
-      schemaVersion: 2,
+      schemaVersion: CACHE_SCHEMA_VERSION,
       lastAccountSync: now,
     };
   }

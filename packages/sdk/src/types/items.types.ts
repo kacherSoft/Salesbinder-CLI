@@ -20,6 +20,7 @@ export interface Item {
   cost: number;
   price: number;
   published?: boolean;
+  archived?: boolean;
   category_id?: string;
   category?: {
     id?: string;

@@ -8,12 +8,14 @@ import { formatJson, formatError } from '../../output/json.formatter.js';
 import { existsSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { registerCachePaymentSyncCommand } from './cache-payment-sync.command.js';
 
 /**
  * Register cache management commands
  */
 export function registerCacheCommands(program: Command): void {
   const cache = program.command('cache').description('Local cache management');
+  registerCachePaymentSyncCommand(cache, program);
 
   // Sync command
   cache
@@ -36,6 +38,7 @@ Use --full to force complete resync.`)
       let syncRunId: string | null = null;
       let syncLockKey: string | null = null;
       let syncStartedAt: number | null = null;
+      let syncTarget: 'postgresql' | 'sqlite' | null = null;
       let lockAcquired = false;
 
       try {
@@ -58,6 +61,7 @@ Use --full to force complete resync.`)
         // Determine sync target: PG if available, else SQLite
         const pgService = await createPostgresCacheService();
         if (pgService) {
+          syncTarget = 'postgresql';
           cacheService = pgService;
           console.error('Syncing API → PostgreSQL...');
           syncLockKey = `salesbinder-cache-sync:${accountName}`;
@@ -66,8 +70,15 @@ Use --full to force complete resync.`)
             throw new Error('Another cache sync is already running for this account.');
           }
         } else {
-          cacheService = new SQLiteCacheService(accountName);
+          syncTarget = 'sqlite';
+          const sqliteService = new SQLiteCacheService(accountName);
+          cacheService = sqliteService;
           console.error('Syncing API → SQLite...');
+          syncLockKey = `salesbinder-cache-sync:${accountName}`;
+          lockAcquired = await sqliteService.tryAcquireSyncLock(syncLockKey);
+          if (!lockAcquired) {
+            throw new Error('Another cache sync is already running for this account.');
+          }
         }
 
         syncStartedAt = Date.now();
@@ -76,7 +87,7 @@ Use --full to force complete resync.`)
           status: 'running',
           runId: syncRunId!,
           accountName,
-          syncTarget: pgService ? 'postgresql' : 'sqlite',
+          syncTarget,
           startedAt: Math.floor(syncStartedAt! / 1000),
           updatedAt: Math.floor(syncStartedAt! / 1000),
           message: 'Sync running',
@@ -116,7 +127,7 @@ Use --full to force complete resync.`)
           status: 'success',
           runId: syncRunId!,
           accountName,
-          syncTarget: pgService ? 'postgresql' : 'sqlite',
+          syncTarget,
           startedAt: Math.floor(syncStartedAt! / 1000),
           updatedAt: cloudSyncFinishedAt,
           finishedAt: cloudSyncFinishedAt,
@@ -138,6 +149,7 @@ Use --full to force complete resync.`)
           accounts?: number;
           documents?: number;
           itemDocuments?: number;
+          paymentTransactions?: number;
           items?: number;
           stockRows?: number;
           duration?: string;
@@ -151,6 +163,7 @@ Use --full to force complete resync.`)
               accounts: pullResult.accountsPulled,
               documents: pullResult.documentsPulled,
               itemDocuments: pullResult.itemDocumentsPulled,
+              paymentTransactions: pullResult.paymentTransactionsPulled,
               items: pullResult.itemsPulled,
               stockRows: pullResult.stockRowsPulled,
               duration: pullResult.duration,
@@ -165,7 +178,7 @@ Use --full to force complete resync.`)
 
         const output = {
           success: true,
-          sync_target: pgService ? 'postgresql' : 'sqlite',
+          sync_target: syncTarget,
           sync_type: result.type,
           sync_lookback_seconds: result.syncLookbackSeconds,
           accounts_processed: accountResult.accountsProcessed,
@@ -190,6 +203,7 @@ Use --full to force complete resync.`)
               accounts: pullInfo.accounts,
               documents: pullInfo.documents,
               item_documents: pullInfo.itemDocuments,
+              payment_transactions: pullInfo.paymentTransactions,
               items: pullInfo.items,
               stock_rows: pullInfo.stockRows,
               duration: pullInfo.duration,
@@ -201,13 +215,13 @@ Use --full to force complete resync.`)
         console.log(formatJson(output));
       } catch (error) {
         try {
-          if (cacheService && syncRunId) {
+          if (cacheService && syncRunId && syncTarget) {
             const now = Math.floor(Date.now() / 1000);
             await cacheService.setSyncStatus({
               status: 'failed',
               runId: syncRunId,
               accountName: program.opts().account || 'default',
-              syncTarget: syncLockKey ? 'postgresql' : 'sqlite',
+              syncTarget,
               startedAt: syncStartedAt ? Math.floor(syncStartedAt / 1000) : now,
               updatedAt: now,
               finishedAt: now,
@@ -219,18 +233,9 @@ Use --full to force complete resync.`)
           // Preserve original sync error.
         }
         console.error(formatError(error as Error));
-        process.exit(1);
+        process.exitCode = 1;
       } finally {
-        try {
-          if (lockAcquired && syncLockKey && cacheService && 'releaseSyncLock' in cacheService) {
-            await (cacheService as any).releaseSyncLock(syncLockKey);
-          }
-          if (cacheService && typeof cacheService.close === 'function') {
-            await cacheService.close();
-          }
-        } catch {
-          // Ignore cleanup errors
-        }
+        await releaseCacheWriterLockAndClose(cacheService, syncLockKey, lockAcquired);
       }
     });
 
@@ -246,16 +251,26 @@ For SQLite: removes the local cache file.
 For PostgreSQL: truncates all cache tables.
 Next sync will perform a full resync.`)
     .action(async () => {
+      let cacheService: CacheService | null = null;
+      let lockKey: string | null = null;
+      let lockAcquired = false;
+
       try {
         const dbUrl = process.env.SALESBINDER_DB_URL;
+        const accountName = program.opts().account || 'default';
 
         if (dbUrl) {
           // PostgreSQL: truncate tables
           const { PostgresCacheService } = await import('@salesbinder/sdk');
           const pgCache = new PostgresCacheService(dbUrl);
+          cacheService = pgCache;
+          lockKey = `salesbinder-cache-sync:${accountName}`;
+          lockAcquired = await pgCache.tryAcquireSyncLock(lockKey);
+          if (!lockAcquired) {
+            throw new Error('Another cache sync is already running for this account.');
+          }
           await pgCache.ensureSchema();
           await pgCache.truncateAll();
-          await pgCache.close();
 
           console.log(
             formatJson({
@@ -267,7 +282,6 @@ Next sync will perform a full resync.`)
           );
         } else {
           // SQLite: delete file
-          const accountName = program.opts().account || 'default';
           const sanitizedAccount = accountName.replace(/[^a-zA-Z0-9_-]/g, '_');
           const cacheDir = join(homedir(), '.salesbinder', 'cache');
           const cacheFile = join(cacheDir, `salesbinder-${sanitizedAccount}.db`);
@@ -285,6 +299,15 @@ Next sync will perform a full resync.`)
               })
             );
             return;
+          }
+
+          const { SQLiteCacheService } = await import('@salesbinder/sdk');
+          const sqliteCache = new SQLiteCacheService(accountName);
+          cacheService = sqliteCache;
+          lockKey = `salesbinder-cache-sync:${accountName}`;
+          lockAcquired = await sqliteCache.tryAcquireSyncLock(lockKey);
+          if (!lockAcquired) {
+            throw new Error('Another cache sync is already running for this account.');
           }
 
           // Get file size before deletion
@@ -307,7 +330,9 @@ Next sync will perform a full resync.`)
         }
       } catch (error) {
         console.error(formatError(error as Error));
-        process.exit(1);
+        process.exitCode = 1;
+      } finally {
+        await releaseCacheWriterLockAndClose(cacheService, lockKey, lockAcquired);
       }
     });
 
@@ -327,6 +352,9 @@ No historical SalesBinder API requests are made.`)
     .option('--target <backend>', 'Cache backend: sqlite or postgresql')
     .action(async (directory: string, options: { dryRun?: boolean; target?: string }) => {
       let cacheService: CacheService | null = null;
+      let ensurePostgresSchema: (() => Promise<void>) | null = null;
+      let lockKey: string | null = null;
+      let lockAcquired = false;
 
       try {
         const { CsvCacheImportService, SQLiteCacheService, PostgresCacheService } = await import('@salesbinder/sdk');
@@ -342,11 +370,20 @@ No historical SalesBinder API requests are made.`)
         if (target === 'postgresql') {
           if (!dbUrl) throw new Error('Database URL environment variable is required for --target postgresql.');
           const pgCache = new PostgresCacheService(dbUrl);
-          await pgCache.ensureSchema();
           cacheService = pgCache;
+          ensurePostgresSchema = () => pgCache.ensureSchema();
         } else {
           cacheService = new SQLiteCacheService(accountName);
         }
+
+        if (!options.dryRun) {
+          lockKey = `salesbinder-cache-sync:${accountName}`;
+          lockAcquired = await cacheService.tryAcquireSyncLock(lockKey);
+          if (!lockAcquired) {
+            throw new Error('Another cache sync is already running for this account.');
+          }
+        }
+        if (ensurePostgresSchema) await ensurePostgresSchema();
 
         console.error(`${options.dryRun ? 'Validating' : 'Importing'} CSV exports -> ${target}...`);
         const importer = new CsvCacheImportService(cacheService);
@@ -355,21 +392,12 @@ No historical SalesBinder API requests are made.`)
           accountName,
         });
 
-        await cacheService.close();
-        cacheService = null;
-
         console.log(formatJson({ ...result, backend: target }));
       } catch (error) {
         console.error(formatError(error as Error));
-        process.exit(1);
+        process.exitCode = 1;
       } finally {
-        try {
-          if (cacheService && typeof cacheService.close === 'function') {
-            await cacheService.close();
-          }
-        } catch {
-          // Ignore cleanup errors
-        }
+        await releaseCacheWriterLockAndClose(cacheService, lockKey, lockAcquired);
       }
     });
 
@@ -417,6 +445,7 @@ Displays:
 
           const state = await cacheService.getCacheState();
           const syncStatus = await cacheService.getSyncStatus();
+          const paymentSyncStatus = await cacheService.getPaymentSyncStatus();
           const stale = await indexer.isCacheStale();
           const counts = await collectCacheCounts(cacheService);
 
@@ -447,6 +476,7 @@ Displays:
                   freshness: stale ? 'STALE' : 'FRESH',
                   stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
                   sync_status: syncStatus,
+                  payment_sync_status: paymentSyncStatus ?? 'not_initialized',
                 }
               : {
                   message: 'Cache exists but no metadata found. May need full sync.',
@@ -492,6 +522,7 @@ Displays:
 
           const state = await cacheService.getCacheState();
           const syncStatus = await cacheService.getSyncStatus();
+          const paymentSyncStatus = await cacheService.getPaymentSyncStatus();
           const stale = await indexer.isCacheStale();
           const counts = await collectCacheCounts(cacheService);
 
@@ -514,6 +545,7 @@ Displays:
                   freshness: stale ? 'STALE' : 'FRESH',
                   stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
                   sync_status: syncStatus,
+                  payment_sync_status: paymentSyncStatus ?? 'not_initialized',
                 }
               : {
                   message: 'Cache exists but no metadata found. May need full sync.',
@@ -568,10 +600,11 @@ This pull is explicit; normal cache reads and normal cache sync do not refresh S
             accounts_pulled: result.accountsPulled,
             documents_pulled: result.documentsPulled,
             item_documents_pulled: result.itemDocumentsPulled,
+            payment_transactions_pulled: result.paymentTransactionsPulled,
             items_pulled: result.itemsPulled,
             stock_rows_pulled: result.stockRowsPulled,
             duration: result.duration,
-            message: `Pull complete: ${result.documentsPulled} documents, ${result.itemDocumentsPulled} line items in ${result.duration}`,
+            message: `Pull complete: ${result.documentsPulled} documents, ${result.itemDocumentsPulled} line items, ${result.paymentTransactionsPulled} payments in ${result.duration}`,
           })
         );
       } catch (error) {
@@ -581,6 +614,25 @@ This pull is explicit; normal cache reads and normal cache sync do not refresh S
     });
 }
 
+async function releaseCacheWriterLockAndClose(
+  cacheService: CacheService | null,
+  lockKey: string | null,
+  lockAcquired: boolean,
+): Promise<void> {
+  try {
+    if (cacheService && lockKey && lockAcquired) {
+      await cacheService.releaseSyncLock(lockKey);
+    }
+  } catch {
+    // Closing the service below is the final lock-release fallback.
+  }
+  try {
+    if (cacheService) await cacheService.close();
+  } catch {
+    // Ignore cleanup errors after the command result is set.
+  }
+}
+
 async function collectCacheCounts(cacheService: CacheService) {
   const [
     documentCount,
@@ -588,6 +640,7 @@ async function collectCacheCounts(cacheService: CacheService) {
     poCount,
     estimateCount,
     lineItemCount,
+    paymentTransactionCount,
     accountCount,
     customerCount,
     supplierCount,
@@ -599,6 +652,7 @@ async function collectCacheCounts(cacheService: CacheService) {
     cacheService.getDocumentCountByContext(11),
     cacheService.getDocumentCountByContext(4),
     cacheService.getItemDocumentCount(),
+    cacheService.getPaymentTransactionCount(),
     cacheService.getAccountCount(),
     cacheService.getAccountCount(2),
     cacheService.getAccountCount(10),
@@ -612,6 +666,7 @@ async function collectCacheCounts(cacheService: CacheService) {
     purchase_order_document_count: poCount,
     estimate_document_count: estimateCount,
     line_item_count: lineItemCount,
+    payment_transaction_count: paymentTransactionCount,
     account_count: accountCount,
     customer_count: customerCount,
     supplier_count: supplierCount,

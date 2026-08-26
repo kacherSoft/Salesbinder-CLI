@@ -3,6 +3,7 @@ import type { SalesBinderClient } from '../resources/index.js';
 import type { Item, ItemListResponse, ItemVariationLocation } from '../types/items.types.js';
 import type { CacheService } from './cache.interface.js';
 import type { CacheState, ItemRow, ItemStockLocationRow } from './types.js';
+import { CACHE_SCHEMA_VERSION } from './types.js';
 
 export interface ItemSyncResult {
   itemsProcessed: number;
@@ -83,6 +84,7 @@ export class ItemIndexerService {
       cost: item.cost,
       price: item.price,
       published: item.published == null ? null : item.published ? 1 : 0,
+      archived: item.archived == null ? null : item.archived ? 1 : 0,
       created: item.created,
       modified: toUnix(item.modified),
       cache_source: 'api',
@@ -150,7 +152,7 @@ export class ItemIndexerService {
       documentCount: state?.documentCount ?? 0,
       itemDocumentCount: state?.itemDocumentCount ?? 0,
       accountName: state?.accountName ?? this.accountName,
-      schemaVersion: 2,
+      schemaVersion: CACHE_SCHEMA_VERSION,
       itemCount: await this.cache.getItemCount(),
       stockLocationCount: await this.cache.getStockLocationCount(),
       lastItemSync: now,

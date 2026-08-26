@@ -3,7 +3,10 @@
  */
 
 import { SQLiteCacheService } from '../sqlite-cache.service.js';
+import { PostgresCacheService } from '../postgres-cache.service.js';
 import { DocumentContextId, DocumentRow, CacheState } from '../types.js';
+import type { PaymentSyncStatus, PaymentTransactionRow } from '../payment-sync.types.js';
+import Database from 'better-sqlite3';
 import { rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -36,6 +39,94 @@ describe('SQLiteCacheService', () => {
     it('should return correct db path', () => {
       expect(service.getDbPath()).toBe(testDbPath);
     });
+
+    it('creates nullable archive columns and lookup indexes', () => {
+      const db = new Database(testDbPath, { readonly: true });
+      try {
+        const documentColumns = db.pragma('table_info(documents)') as Array<{ name: string; notnull: number }>;
+        const itemColumns = db.pragma('table_info(items)') as Array<{ name: string; notnull: number }>;
+        const indexes = [
+          ...(db.pragma('index_list(documents)') as Array<{ name: string }>),
+          ...(db.pragma('index_list(items)') as Array<{ name: string }>),
+        ].map(({ name }) => name);
+
+        expect(documentColumns).toEqual(expect.arrayContaining([
+          expect.objectContaining({ name: 'archived', notnull: 0 }),
+        ]));
+        expect(itemColumns).toEqual(expect.arrayContaining([
+          expect.objectContaining({ name: 'archived', notnull: 0 }),
+        ]));
+        expect(indexes).toEqual(expect.arrayContaining(['idx_documents_archived', 'idx_items_archived']));
+      } finally {
+        db.close();
+      }
+    });
+
+    it('migrates schema v3 lifecycle state as unknown without losing records', async () => {
+      await service.insertDocument({
+        doc_id: 'legacy-doc', context_id: DocumentContextId.Invoice, doc_number: 7001,
+        issue_date: '2026-01-01', customer_id: 'customer-1', modified: 1,
+      });
+      await service.insertItem({ item_id: 'legacy-item', name: 'Legacy item' });
+      await service.close();
+
+      const versionThreeDb = new Database(testDbPath);
+      versionThreeDb.exec(`
+        DROP INDEX idx_documents_archived;
+        DROP INDEX idx_items_archived;
+        ALTER TABLE documents DROP COLUMN archived;
+        ALTER TABLE items DROP COLUMN archived;
+        PRAGMA user_version = 3;
+      `);
+      versionThreeDb.close();
+
+      service = new SQLiteCacheService('test-account', testDbPath);
+      const migratedDb = new Database(testDbPath, { readonly: true });
+      expect(migratedDb.pragma('user_version', { simple: true })).toBe(4);
+      migratedDb.close();
+      expect((await service.getDocument('legacy-doc'))?.archived).toBeNull();
+      expect((await service.getItem('legacy-item'))?.archived).toBeNull();
+    });
+
+    it.each([
+      [1, createLegacyV1Database],
+      [2, createLegacyV2Database],
+    ] as const)('migrates genuine schema v%s fixtures to v4 without losing rows', async (version, createLegacyDatabase) => {
+      await service.close();
+      rmSync(testDbPath, { force: true });
+      createLegacyDatabase(testDbPath);
+
+      service = new SQLiteCacheService('test-account', testDbPath);
+
+      const migratedDb = new Database(testDbPath, { readonly: true });
+      try {
+        expect(migratedDb.pragma('user_version', { simple: true })).toBe(4);
+        expect((migratedDb.pragma('table_info(payment_transactions)') as Array<{ name: string }>))
+          .toEqual(expect.arrayContaining([expect.objectContaining({ name: 'transaction_id' })]));
+        expect(await service.getDocument(`legacy-v${version}-doc`)).toMatchObject({
+          doc_id: `legacy-v${version}-doc`,
+          archived: null,
+        });
+        expect(await service.getItem(`legacy-v${version}-item`)).toMatchObject({
+          item_id: `legacy-v${version}-item`,
+          archived: null,
+        });
+        expect(await service.getItemDocuments(`legacy-v${version}-doc`)).toHaveLength(1);
+      } finally {
+        migratedDb.close();
+      }
+    });
+  });
+
+  describe('Item lifecycle state', () => {
+    it('preserves known archive state when an item source reports unknown', async () => {
+      await service.insertItem({ item_id: 'item-1', name: 'Item', archived: 1 });
+      await service.insertItem({ item_id: 'item-1', name: 'Renamed', archived: null });
+      expect(await service.getItem('item-1')).toMatchObject({ name: 'Renamed', archived: 1 });
+
+      await service.insertItem({ item_id: 'item-1', name: 'Active item', archived: 0 });
+      expect((await service.getItem('item-1'))?.archived).toBe(0);
+    });
   });
 
   describe('Cache metadata', () => {
@@ -57,6 +148,18 @@ describe('SQLiteCacheService', () => {
 
     it('returns null when sync status has not been written', async () => {
       expect(await service.getSyncStatus()).toBeNull();
+    });
+
+    it('serializes payment syncs across service instances', async () => {
+      const competingService = new SQLiteCacheService('test-account', testDbPath);
+      try {
+        expect(await service.tryAcquireSyncLock('payment-sync')).toBe(true);
+        expect(await competingService.tryAcquireSyncLock('payment-sync')).toBe(false);
+        await service.releaseSyncLock('payment-sync');
+        expect(await competingService.tryAcquireSyncLock('payment-sync')).toBe(true);
+      } finally {
+        await competingService.close();
+      }
     });
   });
 
@@ -85,6 +188,15 @@ describe('SQLiteCacheService', () => {
       expect(retrieved?.issue_date).toBe('2026-01-29');
     });
 
+    it('preserves known archive state when a document source reports unknown', async () => {
+      await service.insertDocument({ ...testDoc, archived: 1 });
+      await service.insertDocument({ ...testDoc, archived: null, issue_date: '2026-01-29' });
+      expect(await service.getDocument('test-doc-1')).toMatchObject({ archived: 1, issue_date: '2026-01-29' });
+
+      await service.insertDocument({ ...testDoc, archived: 0 });
+      expect((await service.getDocument('test-doc-1'))?.archived).toBe(0);
+    });
+
     it('should delete document', async () => {
       await service.insertDocument(testDoc);
       await service.deleteDocument('test-doc-1');
@@ -109,6 +221,230 @@ describe('SQLiteCacheService', () => {
       const invoices = await service.getDocumentsByContext(DocumentContextId.Invoice);
       expect(invoices).toHaveLength(1);
       expect(invoices[0].doc_id).toBe('test-doc-1');
+    });
+  });
+
+  describe('Payment transactions', () => {
+    const payment = (
+      transactionId: string,
+      docId = 'payment-doc-1',
+      overrides: Partial<PaymentTransactionRow> = {},
+    ): PaymentTransactionRow => ({
+      transaction_id: transactionId,
+      doc_id: docId,
+      amount: 25.5,
+      transaction_date: '2026-02-01',
+      reference: null,
+      imported_at: 1770000000,
+      ...overrides,
+    });
+
+    beforeEach(async () => {
+      await service.batchInsertDocuments([
+        { doc_id: 'payment-doc-1', context_id: DocumentContextId.Invoice, doc_number: 9001, issue_date: '2026-02-01', customer_id: 'cust-1', modified: 1 },
+        { doc_id: 'payment-doc-2', context_id: DocumentContextId.Invoice, doc_number: 9002, issue_date: '2026-02-02', customer_id: 'cust-2', modified: 1 },
+      ]);
+    });
+
+    it('creates the payment schema, foreign key, and query indexes', () => {
+      const db = new Database(testDbPath, { readonly: true });
+      try {
+        const columns = (db.pragma('table_info(payment_transactions)') as Array<{ name: string }>)
+          .map(({ name }) => name);
+        const foreignKeys = db.pragma('foreign_key_list(payment_transactions)') as Array<{
+          table: string; from: string; to: string; on_delete: string;
+        }>;
+        const docIndex = (db.pragma('index_info(idx_payment_transactions_doc_id)') as Array<{ name: string }>)
+          .map(({ name }) => name);
+        const dateIndex = (db.pragma('index_info(idx_payment_transactions_date_doc)') as Array<{ name: string }>)
+          .map(({ name }) => name);
+
+        expect(columns).toEqual(['transaction_id', 'doc_id', 'amount', 'transaction_date', 'reference', 'imported_at']);
+        expect(foreignKeys).toEqual(expect.arrayContaining([
+          expect.objectContaining({ table: 'documents', from: 'doc_id', to: 'doc_id', on_delete: 'CASCADE' }),
+        ]));
+        expect(docIndex).toEqual(['doc_id']);
+        expect(dateIndex).toEqual(['transaction_date', 'doc_id']);
+      } finally {
+        db.close();
+      }
+    });
+
+    it('migrates an existing version 2 database without losing documents', async () => {
+      await service.close();
+      const versionTwoDb = new Database(testDbPath);
+      versionTwoDb.exec('DROP TABLE payment_transactions; PRAGMA user_version = 2;');
+      versionTwoDb.close();
+
+      service = new SQLiteCacheService('test-account', testDbPath);
+      const migratedDb = new Database(testDbPath, { readonly: true });
+      try {
+        const version = migratedDb.pragma('user_version', { simple: true });
+        const columns = (migratedDb.pragma('table_info(payment_transactions)') as Array<{ name: string }>)
+          .map(({ name }) => name);
+        const indexes = (migratedDb.pragma('index_list(payment_transactions)') as Array<{ name: string }>)
+          .map(({ name }) => name);
+
+        expect(version).toBe(4);
+        expect(columns).toEqual(['transaction_id', 'doc_id', 'amount', 'transaction_date', 'reference', 'imported_at']);
+        expect(indexes).toEqual(expect.arrayContaining([
+          'idx_payment_transactions_doc_id', 'idx_payment_transactions_date_doc',
+        ]));
+        expect(await service.getDocument('payment-doc-1')).toBeDefined();
+      } finally {
+        migratedDb.close();
+      }
+    });
+
+    it('round-trips payment sync status metadata', async () => {
+      const status: PaymentSyncStatus = {
+        status: 'failed', mode: 'full', startedAt: 100, updatedAt: 120, finishedAt: 120,
+        lastSuccessfulSync: 90, cursor: 'payment-doc-1', processedDocuments: 1,
+        totalDocuments: 2, error: 'upstream unavailable',
+      };
+
+      expect(await service.getPaymentSyncStatus()).toBeNull();
+      await service.setPaymentSyncStatus(status);
+      expect(await service.getPaymentSyncStatus()).toEqual(status);
+    });
+
+    it('round-trips and deterministically orders payment rows', async () => {
+      const txnA = payment('txn-a', 'payment-doc-1', { transaction_date: '2026-02-01', amount: 10 });
+      const txnB = payment('txn-b', 'payment-doc-1', { transaction_date: '2026-02-02', reference: 'wire' });
+      const txnC = payment('txn-c', 'payment-doc-2', { transaction_date: '2026-02-01' });
+      await service.batchInsertPaymentTransactions([txnB, txnC, txnA]);
+
+      expect(await service.getPaymentTransactions('payment-doc-1')).toEqual([txnA, txnB]);
+      expect(await service.getAllPaymentTransactions()).toEqual([txnA, txnC, txnB]);
+      expect(await service.getPaymentTransactionCount()).toBe(3);
+    });
+
+    it('rolls back deletion and partial inserts when replacement fails', async () => {
+      await service.replacePaymentTransactions('payment-doc-1', [payment('original')]);
+      const invalid = payment('invalid', 'payment-doc-1', { amount: Number.NaN });
+
+      expect(() => service.replacePaymentTransactions('payment-doc-1', [payment('new'), invalid]))
+        .toThrow(/payment_transactions\.amount/);
+      expect(await service.getPaymentTransactions('payment-doc-1')).toEqual([payment('original')]);
+    });
+
+    it('rejects cross-document rows without deleting existing payments', async () => {
+      await service.replacePaymentTransactions('payment-doc-1', [payment('original')]);
+
+      expect(() => service.replacePaymentTransactions('payment-doc-1', [payment('wrong', 'payment-doc-2')]))
+        .toThrow('received rows for a different document');
+      expect((await service.getPaymentTransactions('payment-doc-1')).map((row) => row.transaction_id))
+        .toEqual(['original']);
+    });
+
+    it('rejects duplicate replacement IDs before deleting existing payments', async () => {
+      await service.replacePaymentTransactions('payment-doc-1', [payment('original')]);
+
+      expect(() => service.replacePaymentTransactions('payment-doc-1', [
+        payment('duplicate', 'payment-doc-1', { amount: 1 }),
+        payment('duplicate', 'payment-doc-1', { amount: 2 }),
+      ])).toThrow('Duplicate payment transaction ID duplicate in one write operation.');
+
+      expect(await service.getPaymentTransactions('payment-doc-1')).toEqual([payment('original')]);
+    });
+
+    it('rejects duplicate batch IDs before mutating payment rows', async () => {
+      await service.batchInsertPaymentTransactions([payment('original')]);
+
+      expect(() => service.batchInsertPaymentTransactions([
+        payment('new', 'payment-doc-1'),
+        payment('new', 'payment-doc-2'),
+      ])).toThrow('Duplicate payment transaction ID new in one write operation.');
+
+      expect(await service.getAllPaymentTransactions()).toEqual([payment('original')]);
+    });
+
+    it('rejects replacement IDs already assigned to another invoice without moving payments', async () => {
+      await service.replacePaymentTransactions('payment-doc-1', [payment('doc-1-original')]);
+      await service.replacePaymentTransactions('payment-doc-2', [payment('shared-existing-id', 'payment-doc-2')]);
+
+      expect(() => service.replacePaymentTransactions('payment-doc-1', [
+        payment('shared-existing-id', 'payment-doc-1'),
+      ])).toThrow(/payment_transactions\.transaction_id|UNIQUE constraint failed/);
+
+      expect(await service.getPaymentTransactions('payment-doc-1')).toEqual([payment('doc-1-original')]);
+      expect(await service.getPaymentTransactions('payment-doc-2')).toEqual([payment('shared-existing-id', 'payment-doc-2')]);
+    });
+
+    it('rolls back batch rows when one payment ID already belongs to another invoice', async () => {
+      await service.batchInsertPaymentTransactions([payment('shared-existing-id', 'payment-doc-2')]);
+
+      expect(() => service.batchInsertPaymentTransactions([
+        payment('batch-new', 'payment-doc-1'),
+        payment('shared-existing-id', 'payment-doc-1'),
+      ])).toThrow(/payment_transactions\.transaction_id|UNIQUE constraint failed/);
+
+      expect(await service.getPaymentTransactions('payment-doc-1')).toEqual([]);
+      expect(await service.getPaymentTransactions('payment-doc-2')).toEqual([payment('shared-existing-id', 'payment-doc-2')]);
+    });
+
+    it('rejects duplicate PostgreSQL batch IDs before opening a transaction', async () => {
+      const pgService = Object.create(PostgresCacheService.prototype) as PostgresCacheService;
+      const query = jest.fn();
+      const connect = jest.fn();
+      (pgService as unknown as { pool: { query: jest.Mock; connect: jest.Mock } }).pool = { query, connect };
+
+      await expect(pgService.batchInsertPaymentTransactions([
+        payment('pg-duplicate'),
+        payment('pg-duplicate', 'payment-doc-2'),
+      ])).rejects.toThrow('Duplicate payment transaction ID pg-duplicate in one write operation.');
+      expect(query).not.toHaveBeenCalled();
+      expect(connect).not.toHaveBeenCalled();
+    });
+
+    it('uses plain PostgreSQL inserts for payment batches so existing IDs cannot be overwritten', async () => {
+      const pgService = Object.create(PostgresCacheService.prototype) as PostgresCacheService;
+      const query = jest.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] as unknown[] }));
+      const client = {
+        query,
+        release: jest.fn(),
+      };
+      (pgService as unknown as { pool: { connect: jest.Mock; query: jest.Mock } }).pool = {
+        connect: jest.fn(async () => client),
+        query: jest.fn(),
+      };
+
+      await pgService.batchInsertPaymentTransactions([payment('pg-new')]);
+
+      const insertSql = client.query.mock.calls
+        .map(([sql]) => String(sql))
+        .find((sql) => sql.startsWith('INSERT INTO payment_transactions'));
+      expect(insertSql).toBeDefined();
+      expect(insertSql).not.toContain('ON CONFLICT');
+    });
+
+    it('uses plain PostgreSQL inserts for payment replacements after deleting that invoice only', async () => {
+      const pgService = Object.create(PostgresCacheService.prototype) as PostgresCacheService;
+      const query = jest.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] as unknown[] }));
+      const client = {
+        query,
+        release: jest.fn(),
+      };
+      (pgService as unknown as { pool: { connect: jest.Mock } }).pool = {
+        connect: jest.fn(async () => client),
+      };
+
+      await pgService.replacePaymentTransactions('payment-doc-1', [payment('pg-replacement')]);
+
+      const statements = client.query.mock.calls.map(([sql]) => String(sql));
+      expect(statements).toContain('DELETE FROM payment_transactions WHERE doc_id = $1');
+      expect(statements.find((sql) => sql.startsWith('INSERT INTO payment_transactions'))).not.toContain('ON CONFLICT');
+    });
+
+    it('uses an empty replacement to clear only the requested invoice', async () => {
+      await service.batchInsertPaymentTransactions([
+        payment('txn-1'), payment('txn-2', 'payment-doc-2'),
+      ]);
+
+      await service.replacePaymentTransactions('payment-doc-1', []);
+
+      expect(await service.getPaymentTransactions('payment-doc-1')).toEqual([]);
+      expect((await service.getAllPaymentTransactions()).map((row) => row.transaction_id)).toEqual(['txn-2']);
     });
   });
 
@@ -525,3 +861,150 @@ describe('SQLiteCacheService', () => {
     });
   });
 });
+
+function createLegacyV1Database(dbPath: string): void {
+  const db = new Database(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE documents (
+        doc_id TEXT PRIMARY KEY,
+        context_id INTEGER NOT NULL,
+        doc_number INTEGER NOT NULL,
+        issue_date TEXT NOT NULL,
+        customer_id TEXT NOT NULL,
+        modified INTEGER NOT NULL,
+        UNIQUE(context_id, doc_number)
+      );
+      CREATE TABLE item_documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id TEXT NOT NULL,
+        doc_id TEXT NOT NULL,
+        quantity REAL NOT NULL,
+        price REAL NOT NULL,
+        FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+      );
+      ${legacyItemsTableSql()}
+      INSERT INTO documents (doc_id, context_id, doc_number, issue_date, customer_id, modified)
+        VALUES ('legacy-v1-doc', ${DocumentContextId.Invoice}, 4101, '2026-01-01', 'legacy-customer', 100);
+      INSERT INTO items (item_id, item_number, name, sku, modified)
+        VALUES ('legacy-v1-item', 501, 'Legacy v1 item', 'LEG-V1', 100);
+      INSERT INTO item_documents (item_id, doc_id, quantity, price)
+        VALUES ('legacy-v1-item', 'legacy-v1-doc', 2, 12.5);
+      PRAGMA user_version = 1;
+    `);
+  } finally {
+    db.close();
+  }
+}
+
+function createLegacyV2Database(dbPath: string): void {
+  const db = new Database(dbPath);
+  try {
+    db.exec(`
+      ${legacyV2DocumentsTableSql()}
+      ${legacyV2ItemDocumentsTableSql()}
+      ${legacyItemsTableSql()}
+      INSERT INTO documents (doc_id, context_id, doc_number, issue_date, customer_id, modified, api_doc_id, cache_source, is_cancelled)
+        VALUES ('legacy-v2-doc', ${DocumentContextId.Invoice}, 4201, '2026-02-01', 'legacy-customer', 200, 'api-v2-doc', 'api', 0);
+      INSERT INTO items (item_id, item_number, name, sku, modified)
+        VALUES ('legacy-v2-item', 502, 'Legacy v2 item', 'LEG-V2', 200);
+      INSERT INTO item_documents (item_id, doc_id, quantity, price, document_item_id, item_name, item_number, item_sku)
+        VALUES ('legacy-v2-item', 'legacy-v2-doc', 3, 15, 'line-v2', 'Legacy v2 item', 502, 'LEG-V2');
+      PRAGMA user_version = 2;
+    `);
+  } finally {
+    db.close();
+  }
+}
+
+function legacyV2DocumentsTableSql(): string {
+  return `
+    CREATE TABLE documents (
+      doc_id TEXT PRIMARY KEY,
+      context_id INTEGER NOT NULL,
+      doc_number INTEGER NOT NULL,
+      issue_date TEXT NOT NULL,
+      customer_id TEXT NOT NULL,
+      modified INTEGER NOT NULL,
+      api_doc_id TEXT NULL UNIQUE,
+      cache_source TEXT NOT NULL DEFAULT 'api',
+      document_name TEXT NULL,
+      custom_doc_number TEXT NULL,
+      account_id TEXT NULL,
+      account_context_id INTEGER NULL,
+      account_name TEXT NULL,
+      account_number INTEGER NULL,
+      user_id TEXT NULL,
+      salesperson_name TEXT NULL,
+      customer_name TEXT NULL,
+      customer_number INTEGER NULL,
+      supplier_name TEXT NULL,
+      supplier_number INTEGER NULL,
+      status_id INTEGER NULL,
+      status_name TEXT NULL,
+      total_price REAL NULL,
+      total_cost REAL NULL,
+      subtotal REAL NULL,
+      associated_document_id TEXT NULL,
+      external_po_number TEXT NULL,
+      shipping_location TEXT NULL,
+      is_cancelled INTEGER NOT NULL DEFAULT 0,
+      imported_at INTEGER NULL,
+      UNIQUE(context_id, doc_number)
+    );
+  `;
+}
+
+function legacyV2ItemDocumentsTableSql(): string {
+  return `
+    CREATE TABLE item_documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      item_id TEXT NOT NULL,
+      doc_id TEXT NOT NULL,
+      quantity REAL NOT NULL,
+      price REAL NOT NULL,
+      document_item_id TEXT NULL,
+      item_name TEXT NULL,
+      item_number INTEGER NULL,
+      item_sku TEXT NULL,
+      item_location TEXT NULL,
+      line_description TEXT NULL,
+      quantity_received REAL NULL,
+      cost REAL NULL,
+      total_amount REAL NULL,
+      discounted_price REAL NULL,
+      discount_percent REAL NULL,
+      FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+    );
+  `;
+}
+
+function legacyItemsTableSql(): string {
+  return `
+    CREATE TABLE items (
+      item_id TEXT PRIMARY KEY,
+      item_number INTEGER NULL,
+      name TEXT NOT NULL,
+      description TEXT NULL,
+      sku TEXT NULL,
+      serial_number TEXT NULL,
+      barcode TEXT NULL,
+      category_id TEXT NULL,
+      category_name TEXT NULL,
+      quantity REAL NULL,
+      quantity_reserved REAL NULL,
+      quantity_available REAL NULL,
+      quantity_incoming REAL NULL,
+      in_transit REAL NULL,
+      threshold REAL NULL,
+      cost REAL NULL,
+      price REAL NULL,
+      valuation REAL NULL,
+      published INTEGER NULL,
+      created TEXT NULL,
+      modified INTEGER NULL,
+      cache_source TEXT NOT NULL DEFAULT 'api',
+      imported_at INTEGER NULL
+    );
+  `;
+}

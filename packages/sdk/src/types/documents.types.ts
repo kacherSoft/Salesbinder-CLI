@@ -40,6 +40,15 @@ export interface DocumentContext {
   name: string;
 }
 
+/** Document payment transaction */
+export interface DocumentTransaction {
+  id: string;
+  document_id: string;
+  amount: number | string;
+  transaction_date: string;
+  reference?: string | null;
+}
+
 /** Document resource */
 export interface Document {
   id: string;
@@ -56,12 +65,16 @@ export interface Document {
   total_tax: number;
   total_tax2: number;
   total_price: number;
+  /** Total amount paid across transactions; this is not the transaction row count. */
   total_transactions: number;
   created: string;
   modified: string;
   status?: DocumentStatus;
   context?: DocumentContext;
   document_items?: DocumentItem[];
+  transactions?: DocumentTransaction[];
+  /** Optional legacy/observed field; the v3 documents contract does not guarantee it. */
+  archived?: boolean;
   customer?: {
     id?: string;
     name?: string;

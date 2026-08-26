@@ -5,8 +5,17 @@
 import type { SalesBinderClient } from '../resources/index.js';
 import type { CacheService } from './cache.interface.js';
 import type { DocumentRow, ItemDocumentRow, SyncOptions, SyncResult, CacheState } from './types.js';
-import { DocumentContextId } from './types.js';
+import { CACHE_SCHEMA_VERSION, DocumentContextId } from './types.js';
 import type { Document, DocumentListResponse } from '../types/documents.types.js';
+import {
+  delay,
+  isPaymentSyncInitialized,
+  normalizeDocumentPaymentTransactions,
+  nowInSeconds,
+  sanitizePaymentSyncError,
+} from './payment-sync.helpers.js';
+import { PAYMENT_DETAIL_DELAY_MS } from './payment-cache.constants.js';
+import type { PaymentSyncMode } from './payment-sync.types.js';
 
 /**
  * Document indexer service for syncing API data to cache
@@ -64,6 +73,11 @@ export class DocumentIndexerService {
     const startTime = Date.now();
     let totalDocuments = 0;
     let totalLineItems = 0;
+    let paymentDocumentsUpdated = 0;
+    let lastPaymentCursor: string | null = null;
+    const paymentRefreshStartedAt = nowInSeconds();
+    const previousPaymentStatus = await this.cache.getPaymentSyncStatus();
+    const refreshInvoicePayments = isPaymentSyncInitialized(previousPaymentStatus);
 
     try {
       const contexts = [
@@ -108,24 +122,30 @@ export class DocumentIndexerService {
               let fullDoc = doc;
               
               // Only fetch individual document if line items are missing
-              if (!doc.document_items || doc.document_items.length === 0) {
+              if (this.shouldFetchDocumentDetail(doc, refreshInvoicePayments)) {
                 fullDoc = await this.client.documents.get(doc.id);
                 // Add small delay after individual fetch to avoid rate limits
-                await this.delay(200);
+                await delay(PAYMENT_DETAIL_DELAY_MS);
               }
 
               // Process document
               const { docRow, itemRows } = this.processDocument(fullDoc);
 
-              const savedItems = await this.writeDocument(docRow, itemRows);
+              const { resolvedDocId, savedItems } = await this.writeDocument(docRow, itemRows);
+              const savedPayments = await this.writeInvoicePayments(fullDoc, resolvedDocId, refreshInvoicePayments);
 
               totalDocuments++;
               totalLineItems += savedItems;
+              if (savedPayments !== null) {
+                paymentDocumentsUpdated++;
+                lastPaymentCursor = resolvedDocId;
+              }
 
               if (options.onProgress) {
                 options.onProgress(totalDocuments, -1);
               }
             } catch (error: any) {
+              if (this.shouldFetchInvoicePayments(doc, refreshInvoicePayments)) throw error;
               const isRateLimit = error?.response?.status === 429;
               if (!isRateLimit) {
                 console.error(`Failed to fetch document ${doc.id}:`, error?.message || error);
@@ -136,7 +156,7 @@ export class DocumentIndexerService {
           page++;
 
           // Rate limiting: pause between pages to avoid rate limits
-          await this.delay(500);
+          await delay(500);
         }
       }
 
@@ -148,8 +168,11 @@ export class DocumentIndexerService {
         documentCount: totalDocuments,
         itemDocumentCount: totalLineItems,
         accountName: this.accountName,
-        schemaVersion: 2,
+        schemaVersion: CACHE_SCHEMA_VERSION,
       });
+      await this.finalizePaymentRefresh(
+        'full', refreshInvoicePayments, paymentRefreshStartedAt, paymentDocumentsUpdated, lastPaymentCursor,
+      );
 
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
@@ -162,6 +185,12 @@ export class DocumentIndexerService {
         duration: `${duration}s`,
       };
     } catch (error) {
+      try {
+        await this.failPaymentRefresh(
+          'full', refreshInvoicePayments, paymentRefreshStartedAt, paymentDocumentsUpdated,
+          lastPaymentCursor, previousPaymentStatus?.lastSuccessfulSync, error,
+        );
+      } catch { /* Preserve the original sync failure. */ }
       console.error('Full sync failed:', error);
       throw error;
     }
@@ -176,6 +205,11 @@ export class DocumentIndexerService {
     let documentsUpdated = 0;
     const documentsDeleted = 0;
     let lineItemsUpdated = 0;
+    let paymentDocumentsUpdated = 0;
+    let lastPaymentCursor: string | null = null;
+    const paymentRefreshStartedAt = nowInSeconds();
+    const previousPaymentStatus = await this.cache.getPaymentSyncStatus();
+    const refreshInvoicePayments = isPaymentSyncInitialized(previousPaymentStatus);
 
     try {
       const lastSyncTime = Math.max(0, state.lastSync - this.syncLookbackSeconds);
@@ -215,22 +249,28 @@ export class DocumentIndexerService {
               let fullDoc = doc;
               
               // Only fetch individual document if line items are missing
-              if (!doc.document_items || doc.document_items.length === 0) {
+              if (this.shouldFetchDocumentDetail(doc, refreshInvoicePayments)) {
                 fullDoc = await this.client.documents.get(doc.id);
-                await this.delay(200);
+                await delay(PAYMENT_DETAIL_DELAY_MS);
               }
               
               const { docRow, itemRows } = this.processDocument(fullDoc);
 
-              const savedItems = await this.writeDocument(docRow, itemRows);
+              const { resolvedDocId, savedItems } = await this.writeDocument(docRow, itemRows);
+              const savedPayments = await this.writeInvoicePayments(fullDoc, resolvedDocId, refreshInvoicePayments);
 
               documentsUpdated++;
               lineItemsUpdated += savedItems;
+              if (savedPayments !== null) {
+                paymentDocumentsUpdated++;
+                lastPaymentCursor = resolvedDocId;
+              }
 
               if (options.onProgress) {
                 options.onProgress(documentsUpdated, -1);
               }
             } catch (error: any) {
+              if (this.shouldFetchInvoicePayments(doc, refreshInvoicePayments)) throw error;
               const isRateLimit = error?.response?.status === 429;
               if (!isRateLimit) {
                 console.error(`Failed to fetch document ${doc.id}:`, error?.message || error);
@@ -239,7 +279,7 @@ export class DocumentIndexerService {
           }
 
           page++;
-          await this.delay(500);
+          await delay(500);
         }
       }
 
@@ -252,6 +292,9 @@ export class DocumentIndexerService {
         itemDocumentCount: await this.cache.getItemDocumentCount(),
       };
       await this.cache.setCacheState(updatedState);
+      await this.finalizePaymentRefresh(
+        'delta', refreshInvoicePayments, paymentRefreshStartedAt, paymentDocumentsUpdated, lastPaymentCursor,
+      );
 
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
@@ -265,6 +308,12 @@ export class DocumentIndexerService {
         duration: `${duration}s`,
       };
     } catch (error) {
+      try {
+        await this.failPaymentRefresh(
+          'delta', refreshInvoicePayments, paymentRefreshStartedAt, paymentDocumentsUpdated,
+          lastPaymentCursor, previousPaymentStatus?.lastSuccessfulSync, error,
+        );
+      } catch { /* Preserve the original sync failure. */ }
       console.error('Delta sync failed:', error);
       throw error;
     }
@@ -311,6 +360,7 @@ export class DocumentIndexerService {
       total_cost: doc.total_cost,
       subtotal: doc.total_price,
       is_cancelled: statusName && /cancelled|canceled/i.test(statusName) ? 1 : 0,
+      archived: doc.archived == null ? null : doc.archived ? 1 : 0,
       modified: Math.floor(new Date(doc.modified).getTime() / 1000),
     };
 
@@ -334,7 +384,10 @@ export class DocumentIndexerService {
     return { docRow, itemRows };
   }
 
-  private async writeDocument(docRow: DocumentRow, itemRows: Omit<ItemDocumentRow, 'id'>[]): Promise<number> {
+  private async writeDocument(
+    docRow: DocumentRow,
+    itemRows: Omit<ItemDocumentRow, 'id'>[],
+  ): Promise<{ resolvedDocId: string; savedItems: number }> {
     const existingByApiId = docRow.api_doc_id ? await this.cache.getDocumentByApiId(docRow.api_doc_id) : undefined;
     const existingByNumber = await this.cache.getDocumentByNumber(docRow.context_id, docRow.doc_number);
     const existing = existingByApiId ?? existingByNumber;
@@ -345,7 +398,81 @@ export class DocumentIndexerService {
     await this.cache.deleteItemDocuments(resolvedDocId);
     await this.cache.insertDocument(resolvedDoc);
     await this.cache.batchInsertItemDocuments(resolvedItems);
-    return resolvedItems.length;
+    return { resolvedDocId, savedItems: resolvedItems.length };
+  }
+
+  private shouldFetchInvoicePayments(doc: Pick<Document, 'context_id'>, refreshInvoicePayments: boolean): boolean {
+    return refreshInvoicePayments && doc.context_id === DocumentContextId.Invoice;
+  }
+
+  private shouldFetchDocumentDetail(doc: Pick<Document, 'context_id' | 'document_items'>, refreshInvoicePayments: boolean): boolean {
+    if (!doc.document_items || doc.document_items.length === 0) {
+      return true;
+    }
+
+    return refreshInvoicePayments && doc.context_id === DocumentContextId.Invoice;
+  }
+
+  private async writeInvoicePayments(
+    doc: Document,
+    resolvedDocId: string,
+    refreshInvoicePayments: boolean,
+  ): Promise<number | null> {
+    if (!this.shouldFetchInvoicePayments(doc, refreshInvoicePayments)) {
+      return null;
+    }
+
+    const rows = normalizeDocumentPaymentTransactions(doc, resolvedDocId, nowInSeconds());
+    await this.cache.replacePaymentTransactions(resolvedDocId, rows);
+    return rows.length;
+  }
+
+  private async finalizePaymentRefresh(
+    mode: PaymentSyncMode,
+    refreshInvoicePayments: boolean,
+    startedAt: number,
+    processedDocuments: number,
+    cursor: string | null,
+  ): Promise<void> {
+    if (!refreshInvoicePayments) return;
+
+    const finishedAt = nowInSeconds();
+    await this.cache.setPaymentSyncStatus({
+      status: 'complete',
+      mode,
+      startedAt,
+      updatedAt: finishedAt,
+      finishedAt,
+      lastSuccessfulSync: finishedAt,
+      cursor,
+      processedDocuments,
+      totalDocuments: processedDocuments,
+    });
+  }
+
+  private async failPaymentRefresh(
+    mode: PaymentSyncMode,
+    refreshInvoicePayments: boolean,
+    startedAt: number,
+    processedDocuments: number,
+    cursor: string | null,
+    lastSuccessfulSync: number | undefined,
+    error: unknown,
+  ): Promise<void> {
+    if (!refreshInvoicePayments) return;
+    const failedAt = nowInSeconds();
+    await this.cache.setPaymentSyncStatus({
+      status: 'failed',
+      mode,
+      startedAt,
+      updatedAt: failedAt,
+      finishedAt: failedAt,
+      lastSuccessfulSync,
+      cursor,
+      processedDocuments,
+      totalDocuments: processedDocuments,
+      error: sanitizePaymentSyncError(error),
+    });
   }
 
   /**
@@ -354,12 +481,5 @@ export class DocumentIndexerService {
   private flattenDocumentArray(documents?: Document[][]): Document[] {
     if (!documents) return [];
     return Array.isArray(documents[0]) ? documents.flat() : documents as unknown as Document[];
-  }
-
-  /**
-   * Delay for rate limiting
-   */
-  private delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }

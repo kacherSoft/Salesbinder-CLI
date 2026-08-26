@@ -3,6 +3,7 @@ import { ContextId, DocumentContextId } from '../types/common.types.js';
 import type { DeletedLogEntry, DeletedLogListResponse } from '../types/deleted-log.types.js';
 import type { CacheService } from './cache.interface.js';
 import type { CacheState } from './types.js';
+import { CACHE_SCHEMA_VERSION } from './types.js';
 
 export interface DeletedLogSyncResult {
   deletedRecordsProcessed: number;
@@ -94,7 +95,7 @@ export class DeletedLogSyncService {
       documentCount: state?.documentCount ?? 0,
       itemDocumentCount: state?.itemDocumentCount ?? 0,
       accountName: state?.accountName ?? this.accountName,
-      schemaVersion: 2,
+      schemaVersion: CACHE_SCHEMA_VERSION,
       lastDeletedSync: now,
     };
   }

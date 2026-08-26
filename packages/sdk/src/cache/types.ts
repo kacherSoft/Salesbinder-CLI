@@ -33,6 +33,8 @@ export interface DocumentRow {
   external_po_number?: string | null;
   shipping_location?: string | null;
   is_cancelled?: number;
+  /** 0=active, 1=archived, null=not observable from the source. */
+  archived?: 0 | 1 | null;
   imported_at?: number | null;
 }
 
@@ -110,6 +112,8 @@ export interface ItemRow {
   price?: number | null;
   valuation?: number | null;
   published?: number | null;
+  /** 0=active, 1=archived, null=not observable from the source. */
+  archived?: 0 | 1 | null;
   created?: string | null;
   modified?: number | null;
   cache_source?: 'api' | 'csv';
@@ -146,6 +150,8 @@ export interface CacheMetaRow {
 }
 
 /** Cache sync state metadata */
+export const CACHE_SCHEMA_VERSION = 4;
+
 export interface CacheState {
   lastSync: number; // Unix timestamp
   lastFullSync: number; // Unix timestamp
@@ -258,6 +264,14 @@ export interface OrderPatternRow {
   context_id: number;
   doc_number: number;
 }
+
+export type {
+  PaymentSyncMode,
+  PaymentSyncResult,
+  PaymentSyncState,
+  PaymentSyncStatus,
+  PaymentTransactionRow,
+} from './payment-sync.types.js';
 
 // Re-export DocumentContextId from common types for convenience
 export { DocumentContextId } from '../types/common.types.js';
