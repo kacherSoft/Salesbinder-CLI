@@ -30,13 +30,13 @@ const DOCUMENT_COLUMNS = [
   'user_id', 'salesperson_name', 'customer_name', 'customer_number',
   'supplier_name', 'supplier_number', 'status_id', 'status_name',
   'total_price', 'total_cost', 'subtotal', 'associated_document_id',
-  'external_po_number', 'shipping_location', 'is_cancelled', 'imported_at',
+  'external_po_number', 'shipping_location', 'date_sent', 'shipped_percent', 'is_cancelled', 'imported_at',
 ] as const;
 
 const ITEM_DOCUMENT_COLUMNS = [
   'item_id', 'doc_id', 'quantity', 'price', 'document_item_id', 'item_name',
   'item_number', 'item_sku', 'item_location', 'line_description',
-  'quantity_received', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
+  'quantity_received', 'quantity_shipped', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
 ] as const;
 
 const ACCOUNT_COLUMNS = [
@@ -175,6 +175,8 @@ export class SQLiteCacheService implements CacheService {
         associated_document_id TEXT NULL,
         external_po_number TEXT NULL,
         shipping_location TEXT NULL,
+        date_sent TEXT NULL,
+        shipped_percent REAL NULL,
         is_cancelled INTEGER NOT NULL DEFAULT 0,
         imported_at INTEGER NULL,
         UNIQUE(context_id, doc_number)
@@ -193,6 +195,7 @@ export class SQLiteCacheService implements CacheService {
         item_location TEXT NULL,
         line_description TEXT NULL,
         quantity_received REAL NULL,
+        quantity_shipped REAL NULL,
         cost REAL NULL,
         total_amount REAL NULL,
         discounted_price REAL NULL,
@@ -289,6 +292,8 @@ export class SQLiteCacheService implements CacheService {
       ['associated_document_id', 'TEXT NULL'],
       ['external_po_number', 'TEXT NULL'],
       ['shipping_location', 'TEXT NULL'],
+      ['date_sent', 'TEXT NULL'],
+      ['shipped_percent', 'REAL NULL'],
       ['is_cancelled', 'INTEGER NOT NULL DEFAULT 0'],
       ['imported_at', 'INTEGER NULL'],
     ]);
@@ -303,6 +308,7 @@ export class SQLiteCacheService implements CacheService {
       ['item_location', 'TEXT NULL'],
       ['line_description', 'TEXT NULL'],
       ['quantity_received', 'REAL NULL'],
+      ['quantity_shipped', 'REAL NULL'],
       ['cost', 'REAL NULL'],
       ['total_amount', 'REAL NULL'],
       ['discounted_price', 'REAL NULL'],
@@ -332,6 +338,7 @@ export class SQLiteCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_documents_account_name ON documents(account_context_id, account_name);
       CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);
       CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status_id);
+      CREATE INDEX IF NOT EXISTS idx_documents_shipped_percent ON documents(shipped_percent);
       CREATE INDEX IF NOT EXISTS idx_documents_api_doc_id ON documents(api_doc_id);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item ON item_documents(item_id);
       CREATE INDEX IF NOT EXISTS idx_item_documents_doc ON item_documents(doc_id);

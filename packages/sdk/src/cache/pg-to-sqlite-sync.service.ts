@@ -144,6 +144,7 @@ async function getAllItemDocuments(pg: PostgresCacheService): Promise<Omit<ItemD
           item_location: item.item_location,
           line_description: item.line_description,
           quantity_received: item.quantity_received,
+          quantity_shipped: item.quantity_shipped,
           cost: item.cost,
           total_amount: item.total_amount,
           discounted_price: item.discounted_price,

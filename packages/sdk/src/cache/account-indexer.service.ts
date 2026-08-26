@@ -103,6 +103,8 @@ export class AccountIndexerService {
   private mergeState(state: CacheState | null, now: number): CacheState {
     return {
       ...state,
+      // The CLI owns the global lastSync watermark and advances it only after
+      // all sync phases complete successfully.
       lastSync: state?.lastSync ?? now,
       lastFullSync: state?.lastFullSync ?? now,
       documentCount: state?.documentCount ?? 0,

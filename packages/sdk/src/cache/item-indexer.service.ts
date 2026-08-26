@@ -9,7 +9,16 @@ export interface ItemSyncResult {
   stockRowsProcessed: number;
 }
 
-const DEFAULT_ITEM_DETAIL_DELAY_MS = 2000;
+export interface ItemSyncOptions {
+  full?: boolean;
+  resume?: {
+    page?: number;
+    itemIndex?: number;
+    onItemCheckpoint?: (checkpoint: { page: number; itemIndex: number }) => void;
+  };
+}
+
+const DEFAULT_ITEM_DETAIL_DELAY_MS = 0;
 
 export class ItemIndexerService {
   private readonly itemDetailDelayMs: number;
@@ -24,10 +33,12 @@ export class ItemIndexerService {
     this.itemDetailDelayMs = delayValue ? parseInt(delayValue, 10) : DEFAULT_ITEM_DETAIL_DELAY_MS;
   }
 
-  async sync(full = false): Promise<ItemSyncResult> {
+  async sync(fullOrOptions: boolean | ItemSyncOptions = false): Promise<ItemSyncResult> {
+    const options: ItemSyncOptions = typeof fullOrOptions === 'boolean' ? { full: fullOrOptions } : fullOrOptions;
+    const full = options.full ?? false;
     const state = await this.cache.getCacheState();
     const since = full ? 0 : Math.max(0, (state?.lastItemSync ?? state?.lastSync ?? 0) - this.syncLookbackSeconds);
-    let page = 1;
+    let page = Math.max(1, options.resume?.page ?? 1);
     let itemCount = 0;
     let stockCount = 0;
     let hasMore = true;
@@ -37,17 +48,31 @@ export class ItemIndexerService {
       const items = this.flattenItems(response);
       if (items.length === 0) break;
 
-      for (const item of items) {
+      const startItemIndex = options.resume?.page === page ? Math.max(0, options.resume?.itemIndex ?? 0) : 0;
+      for (let itemIndex = startItemIndex; itemIndex < items.length; itemIndex++) {
+        const item = items[itemIndex];
+        options.resume?.onItemCheckpoint?.({ page, itemIndex });
         if (!item.id) {
           throw new Error('SalesBinder item list returned an item without id');
         }
 
-        const fullItem = await this.client.items.get(item.id);
+        let fullItem: Item;
+        try {
+          fullItem = await this.client.items.get(item.id);
+        } catch (error) {
+          // One malformed/transient item response must not abort the entire
+          // incremental batch. Keep the list representation as a safe fallback;
+          // it still refreshes core item fields, while stock detail is preserved
+          // from the list shape when available.
+          console.warn(`Item detail unavailable for ${item.id}; using list payload: ${(error as Error)?.message ?? error}`);
+          fullItem = item;
+        }
         const stockRows = this.toStockRows(fullItem);
         await this.cache.insertItem(this.toItemRow(fullItem));
         await this.cache.replaceItemStockLocations(fullItem.id, stockRows);
         itemCount++;
         stockCount += stockRows.length;
+        options.resume?.onItemCheckpoint?.({ page, itemIndex: itemIndex + 1 });
 
         if (this.itemDetailDelayMs > 0) {
           await delay(this.itemDetailDelayMs);
@@ -55,6 +80,7 @@ export class ItemIndexerService {
       }
 
       hasMore = page < Number(response.pages ?? page);
+      options.resume?.onItemCheckpoint?.({ page: page + 1, itemIndex: 0 });
       page++;
     }
 

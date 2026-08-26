@@ -58,7 +58,7 @@ export function createAxiosClient(account: AccountConfig): AxiosInstance {
 
       // Check if we should retry
       const errorObj = error as any;
-      const retryableStatus = [429, 500, 502, 503, 504];
+      const retryableStatus = [429, 500, 502, 503, 504, 522];
       const isRetryable = !errorObj.response || retryableStatus.includes(errorObj.response?.status);
 
       if (!isRetryable || config._retry.attempt >= 5) {
@@ -78,7 +78,7 @@ export function createAxiosClient(account: AccountConfig): AxiosInstance {
         delay = (isNaN(retryAfterSeconds) ? 5 : retryAfterSeconds) * 1000;
       } else {
         // Calculate delay with exponential backoff
-        const INITIAL_DELAY = 1000;
+        const INITIAL_DELAY = parseInt(process.env.SALESBINDER_RETRY_INITIAL_DELAY_MS ?? '1000', 10);
         const JITTER_PERCENT = 0.5;
         const exponentialDelay = INITIAL_DELAY * Math.pow(2, attempt);
         const jitter = exponentialDelay * JITTER_PERCENT * Math.random();

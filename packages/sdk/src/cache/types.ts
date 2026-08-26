@@ -32,6 +32,8 @@ export interface DocumentRow {
   associated_document_id?: string | null;
   external_po_number?: string | null;
   shipping_location?: string | null;
+  date_sent?: string | null;
+  shipped_percent?: number | null;
   is_cancelled?: number;
   imported_at?: number | null;
 }
@@ -50,6 +52,7 @@ export interface ItemDocumentRow {
   item_location?: string | null;
   line_description?: string | null;
   quantity_received?: number | null;
+  quantity_shipped?: number | null;
   cost?: number | null;
   total_amount?: number | null;
   discounted_price?: number | null;
@@ -187,6 +190,10 @@ export interface CacheSyncStatus {
 export interface SyncOptions {
   full?: boolean; // Force full sync
   onProgress?: (current: number, total: number) => void; // Progress callback
+  resume?: {
+    documents?: { contextId?: number; page?: number; docIndex?: number };
+    onDocumentCheckpoint?: (checkpoint: { contextId: number; page: number; docIndex: number }) => void;
+  };
 }
 
 /** Sync result interface */

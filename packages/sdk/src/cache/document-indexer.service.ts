@@ -62,6 +62,7 @@ export class DocumentIndexerService {
    */
   private async fullSync(options: SyncOptions): Promise<SyncResult> {
     const startTime = Date.now();
+    const state = await this.cache.getCacheState();
     let totalDocuments = 0;
     let totalLineItems = 0;
 
@@ -73,9 +74,14 @@ export class DocumentIndexerService {
       ];
 
       for (const context of contexts) {
+        const resumeDoc = options.resume?.documents;
+        if (resumeDoc?.contextId && context.id < resumeDoc.contextId) {
+          console.error(`Skipping ${context.name}s: full-resume checkpoint already passed context ${context.id}`);
+          continue;
+        }
         console.error(`Syncing ${context.name}s...`);
 
-        let page = 1;
+        let page = resumeDoc?.contextId === context.id ? Math.max(1, resumeDoc.page ?? 1) : 1;
         let hasMore = true;
 
         while (hasMore) {
@@ -103,7 +109,12 @@ export class DocumentIndexerService {
           }
 
           // Process documents from list response (includes line items in most cases)
-          for (const doc of documents) {
+          const startDocIndex = options.resume?.documents?.contextId === context.id && options.resume?.documents?.page === page
+            ? Math.max(0, options.resume?.documents?.docIndex ?? 0)
+            : 0;
+          for (let docIndex = startDocIndex; docIndex < documents.length; docIndex++) {
+            const doc = documents[docIndex];
+            options.resume?.onDocumentCheckpoint?.({ contextId: context.id, page, docIndex });
             try {
               let fullDoc = doc;
               
@@ -122,6 +133,8 @@ export class DocumentIndexerService {
               totalDocuments++;
               totalLineItems += savedItems;
 
+              options.resume?.onDocumentCheckpoint?.({ contextId: context.id, page, docIndex: docIndex + 1 });
+
               if (options.onProgress) {
                 options.onProgress(totalDocuments, -1);
               }
@@ -133,6 +146,7 @@ export class DocumentIndexerService {
             }
           }
 
+          options.resume?.onDocumentCheckpoint?.({ contextId: context.id, page: page + 1, docIndex: 0 });
           page++;
 
           // Rate limiting: pause between pages to avoid rate limits
@@ -141,10 +155,13 @@ export class DocumentIndexerService {
       }
 
       // Update cache state
-      const now = Math.floor(Date.now() / 1000);
       await this.cache.setCacheState({
-        lastSync: now,
-        lastFullSync: now,
+        // The CLI owns both global watermarks and advances them only after the
+        // complete accounts → documents → items → deleted-log pipeline succeeds.
+        // A document-only success must not make a later failed full sync appear
+        // complete or move the incremental window forward.
+        lastSync: state?.lastSync ?? 0,
+        lastFullSync: state?.lastFullSync ?? 0,
         documentCount: totalDocuments,
         itemDocumentCount: totalLineItems,
         accountName: this.accountName,
@@ -244,10 +261,13 @@ export class DocumentIndexerService {
       }
 
       // Update cache state
-      const now = Math.floor(Date.now() / 1000);
       const updatedState: CacheState = {
         ...state,
-        lastSync: now,
+        // The CLI advances lastSync only after every sync phase succeeds.
+        // Do not move the delta watermark here: item/deleted phases may still
+        // fail after documents have been written, and the next retry must
+        // replay the complete window rather than silently skip changes.
+        lastSync: state.lastSync,
         documentCount: await this.cache.getDocumentCount(),
         itemDocumentCount: await this.cache.getItemDocumentCount(),
       };
@@ -268,6 +288,21 @@ export class DocumentIndexerService {
       console.error('Delta sync failed:', error);
       throw error;
     }
+  }
+
+  /**
+   * Remove characters PostgreSQL text columns cannot store.
+   *
+   * SalesBinder API can return literal NUL bytes inside free-text fields
+   * (seen in estimate 31723 / document 5bf132ca-4cee-4f0b-8cab-5dd9a6435d96).
+   * PostgreSQL rejects those strings with:
+   *   invalid byte sequence for encoding "UTF8": 0x00
+   * Sanitizing only cache rows keeps source data untouched while allowing sync
+   * to complete.
+   */
+  private sanitizeText(value: string | null | undefined): string | null {
+    if (value == null) return null;
+    return value.replace(/\u0000/g, '');
   }
 
   /**
@@ -294,22 +329,24 @@ export class DocumentIndexerService {
       customer_id: doc.customer_id,
       api_doc_id: doc.id,
       cache_source: 'api',
-      document_name: doc.name ?? null,
+      document_name: this.sanitizeText(doc.name),
       account_id: doc.customer_id,
       account_context_id: accountContextId,
-      account_name: accountName,
+      account_name: this.sanitizeText(accountName),
       account_number: doc.customer?.customer_number ?? null,
       user_id: doc.user_id,
-      salesperson_name: salespersonName || null,
-      customer_name: doc.context_id === DocumentContextId.PurchaseOrder ? null : accountName,
+      salesperson_name: this.sanitizeText(salespersonName || null),
+      customer_name: doc.context_id === DocumentContextId.PurchaseOrder ? null : this.sanitizeText(accountName),
       customer_number: doc.context_id === DocumentContextId.PurchaseOrder ? null : doc.customer?.customer_number ?? null,
-      supplier_name: doc.context_id === DocumentContextId.PurchaseOrder ? accountName : null,
+      supplier_name: doc.context_id === DocumentContextId.PurchaseOrder ? this.sanitizeText(accountName) : null,
       supplier_number: doc.context_id === DocumentContextId.PurchaseOrder ? doc.customer?.customer_number ?? null : null,
       status_id: doc.status_id,
-      status_name: statusName,
+      status_name: this.sanitizeText(statusName),
       total_price: doc.total_price,
       total_cost: doc.total_cost,
       subtotal: doc.total_price,
+      date_sent: doc.date_sent ?? null,
+      shipped_percent: doc.shipped_percent ?? null,
       is_cancelled: statusName && /cancelled|canceled/i.test(statusName) ? 1 : 0,
       modified: Math.floor(new Date(doc.modified).getTime() / 1000),
     };
@@ -322,9 +359,10 @@ export class DocumentIndexerService {
         document_item_id: item.id,
         quantity: item.quantity,
         price: item.price,
-        item_name: item.name ?? item.description ?? null,
-        line_description: item.description ?? null,
+        item_name: this.sanitizeText(item.name ?? item.description ?? null),
+        line_description: this.sanitizeText(item.description),
         quantity_received: item.quantity_partially_received ?? null,
+        quantity_shipped: item.quantity_partially_shipped ?? null,
         cost: item.cost ?? null,
         total_amount: item.quantity * item.price,
         discounted_price: item.discounted_price ?? null,

@@ -5,8 +5,8 @@
 import type { Command } from 'commander';
 import type { CacheService } from '@salesbinder/sdk';
 import { formatJson, formatError } from '../../output/json.formatter.js';
-import { existsSync, unlinkSync, statSync } from 'fs';
-import { join } from 'path';
+import { existsSync, unlinkSync, statSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
+import { dirname, join } from 'path';
 import { homedir } from 'os';
 
 /**
@@ -24,14 +24,18 @@ Examples:
   salesbinder cache sync
   salesbinder cache sync --full
   salesbinder cache sync --pull
+  salesbinder cache sync --full-resume
 
 When a PostgreSQL backend is configured: syncs API → PostgreSQL.
 Use --pull to also refresh the local SQLite mirror after PostgreSQL sync.
 Otherwise: syncs API → SQLite directly.
-Use --full to force complete resync.`)
+Use --full to force complete resync.
+Use --full-resume for an on-demand checkpointed rebuild attempt.`)
     .option('--full', 'Force full sync (re-download all documents)')
+    .option('--full-resume', 'Checkpointed full rebuild attempt; resumes completed phases after failures')
+    .option('--reset-checkpoint', 'Reset full-resume checkpoint before starting')
     .option('--pull', 'After PostgreSQL sync, pull PostgreSQL into local SQLite')
-    .action(async (options: { full?: boolean; pull?: boolean }) => {
+    .action(async (options: { full?: boolean; fullResume?: boolean; resetCheckpoint?: boolean; pull?: boolean }) => {
       let cacheService: import('@salesbinder/sdk').CacheService | null = null;
       let syncRunId: string | null = null;
       let syncLockKey: string | null = null;
@@ -53,6 +57,68 @@ Use --full to force complete resync.`)
 
         const accountName = program.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
+        const effectiveFull = Boolean(options.full || options.fullResume);
+
+        type FullResumeCheckpoint = {
+          runType: 'full-resume';
+          accountName: string;
+          startedAt: number;
+          updatedAt: number;
+          phase: string;
+          completedPhases: string[];
+          documents?: { contextId?: number; page?: number; docIndex?: number };
+          items?: { page?: number; itemIndex?: number };
+          lastError?: string;
+        };
+        const checkpointPath = join(homedir(), '.salesbinder', 'cache', `full-resume-${accountName}.json`);
+        const ensureCheckpointDir = () => mkdirSync(dirname(checkpointPath), { recursive: true });
+        const loadCheckpoint = (): FullResumeCheckpoint => {
+          if (options.resetCheckpoint && existsSync(checkpointPath)) {
+            rmSync(checkpointPath, { force: true });
+          }
+          if (options.fullResume && existsSync(checkpointPath)) {
+            return JSON.parse(readFileSync(checkpointPath, 'utf-8')) as FullResumeCheckpoint;
+          }
+          const now = Math.floor(Date.now() / 1000);
+          return {
+            runType: 'full-resume',
+            accountName,
+            startedAt: now,
+            updatedAt: now,
+            phase: 'init',
+            completedPhases: [],
+          };
+        };
+        const saveCheckpoint = (checkpoint: FullResumeCheckpoint) => {
+          if (!options.fullResume) return;
+          ensureCheckpointDir();
+          checkpoint.updatedAt = Math.floor(Date.now() / 1000);
+          writeFileSync(checkpointPath, JSON.stringify(checkpoint, null, 2));
+        };
+        const markPhaseStarted = (checkpoint: FullResumeCheckpoint, phase: string) => {
+          checkpoint.phase = phase;
+          delete checkpoint.lastError;
+          saveCheckpoint(checkpoint);
+        };
+        const markPhaseComplete = (checkpoint: FullResumeCheckpoint, phase: string) => {
+          if (!checkpoint.completedPhases.includes(phase)) checkpoint.completedPhases.push(phase);
+          checkpoint.phase = `${phase}:complete`;
+          if (phase === 'documents') delete checkpoint.documents;
+          if (phase === 'items') delete checkpoint.items;
+          saveCheckpoint(checkpoint);
+        };
+        const markDocumentCheckpoint = (position: { contextId: number; page: number; docIndex: number }) => {
+          checkpoint.phase = 'documents';
+          checkpoint.documents = position;
+          saveCheckpoint(checkpoint);
+        };
+        const markItemCheckpoint = (position: { page: number; itemIndex: number }) => {
+          checkpoint.phase = 'items';
+          checkpoint.items = position;
+          saveCheckpoint(checkpoint);
+        };
+        const isPhaseComplete = (checkpoint: FullResumeCheckpoint, phase: string) => checkpoint.completedPhases.includes(phase);
+        const checkpoint = loadCheckpoint();
         const dbUrl = process.env.SALESBINDER_DB_URL;
 
         // Determine sync target: PG if available, else SQLite
@@ -97,9 +163,32 @@ Use --full to force complete resync.`)
         const itemIndexer = new ItemIndexerService(client, cacheService, accountName, syncLookbackSeconds);
         const deletedLogSync = new DeletedLogSyncService(client, cacheService, accountName, syncLookbackSeconds);
 
-        const accountResult = await accountIndexer.sync(options.full);
-        const result = await indexer.sync({
-          full: options.full,
+        let accountResult = { accountsProcessed: 0, customersProcessed: 0, suppliersProcessed: 0 };
+        if (!options.fullResume || !isPhaseComplete(checkpoint, 'accounts')) {
+          markPhaseStarted(checkpoint, 'accounts');
+          accountResult = await accountIndexer.sync(effectiveFull);
+          markPhaseComplete(checkpoint, 'accounts');
+        } else {
+          console.error('Skipping accounts phase: full-resume checkpoint already complete');
+        }
+
+        let result: any = {
+          success: true,
+          type: effectiveFull ? 'full' as const : 'delta' as const,
+          documentsProcessed: 0,
+          documentsDeleted: 0,
+          lineItemsProcessed: 0,
+          duration: '0s',
+          syncLookbackSeconds,
+        };
+        if (!options.fullResume || !isPhaseComplete(checkpoint, 'documents')) {
+          markPhaseStarted(checkpoint, 'documents');
+          result = await indexer.sync({
+            full: effectiveFull,
+            resume: options.fullResume ? {
+              documents: checkpoint.documents,
+              onDocumentCheckpoint: markDocumentCheckpoint,
+            } : undefined,
           onProgress: (current, total) => {
             if (total > 0) {
               const percent = Math.round((current / total) * 100);
@@ -108,10 +197,61 @@ Use --full to force complete resync.`)
               console.error(`Processed: ${current} documents`);
             }
           },
-        });
-        const itemResult = await itemIndexer.sync(options.full);
-        const deletedResult = await deletedLogSync.sync();
+          });
+          markPhaseComplete(checkpoint, 'documents');
+        } else {
+          console.error('Skipping documents phase: full-resume checkpoint already complete');
+        }
+
+        let itemResult = { itemsProcessed: 0, stockRowsProcessed: 0 };
+        if (!options.fullResume || !isPhaseComplete(checkpoint, 'items')) {
+          markPhaseStarted(checkpoint, 'items');
+          itemResult = await itemIndexer.sync(options.fullResume ? {
+            full: effectiveFull,
+            resume: {
+              page: checkpoint.items?.page,
+              itemIndex: checkpoint.items?.itemIndex,
+              onItemCheckpoint: markItemCheckpoint,
+            },
+          } : effectiveFull);
+          markPhaseComplete(checkpoint, 'items');
+        } else {
+          console.error('Skipping items phase: full-resume checkpoint already complete');
+        }
+
+        let deletedResult = { deletedRecordsProcessed: 0 };
+        if (!options.fullResume || !isPhaseComplete(checkpoint, 'deleted-log')) {
+          markPhaseStarted(checkpoint, 'deleted-log');
+          deletedResult = await deletedLogSync.sync();
+          markPhaseComplete(checkpoint, 'deleted-log');
+        } else {
+          console.error('Skipping deleted-log phase: full-resume checkpoint already complete');
+        }
         const cloudSyncFinishedAt = Math.floor(Date.now() / 1000);
+
+        const finalState = await cacheService.getCacheState();
+        await cacheService.setCacheState({
+          ...(finalState ?? {
+            accountName,
+            schemaVersion: 2,
+            documentCount: 0,
+            itemDocumentCount: 0,
+            lastSync: cloudSyncFinishedAt,
+            lastFullSync: effectiveFull ? cloudSyncFinishedAt : 0,
+          }),
+          // Advance the global watermark after every successful sync.
+          // Incremental runs must update lastSync too; otherwise cache status
+          // remains stale and the next delta repeatedly uses an old watermark.
+          lastSync: cloudSyncFinishedAt,
+          ...(effectiveFull ? { lastFullSync: cloudSyncFinishedAt } : {}),
+          documentCount: await cacheService.getDocumentCount(),
+          itemDocumentCount: await cacheService.getItemDocumentCount(),
+          accountName,
+          schemaVersion: 2,
+          itemCount: await cacheService.getItemCount(),
+          stockLocationCount: await cacheService.getStockLocationCount(),
+        });
+
         await cacheService.setSyncStatus({
           status: 'success',
           runId: syncRunId!,
@@ -195,8 +335,21 @@ Use --full to force complete resync.`)
               duration: pullInfo.duration,
             },
           }),
+          ...(options.fullResume && {
+            full_resume: {
+              checkpoint_path: checkpointPath,
+              completed_phases: checkpoint.completedPhases,
+              granularity: 'phase+document-page+document-index+item-page+item-index',
+              document_position: checkpoint.documents,
+              item_position: checkpoint.items,
+            },
+          }),
           message: `Sync complete: ${result.documentsProcessed} documents, ${itemResult.itemsProcessed} items in ${duration}`,
         };
+
+        if (options.fullResume && existsSync(checkpointPath)) {
+          rmSync(checkpointPath, { force: true });
+        }
 
         console.log(formatJson(output));
       } catch (error) {

@@ -26,13 +26,13 @@ const DOCUMENT_COLUMNS = [
   'user_id', 'salesperson_name', 'customer_name', 'customer_number',
   'supplier_name', 'supplier_number', 'status_id', 'status_name',
   'total_price', 'total_cost', 'subtotal', 'associated_document_id',
-  'external_po_number', 'shipping_location', 'is_cancelled', 'imported_at',
+  'external_po_number', 'shipping_location', 'date_sent', 'shipped_percent', 'is_cancelled', 'imported_at',
 ] as const;
 
 const ITEM_DOCUMENT_COLUMNS = [
   'item_id', 'doc_id', 'quantity', 'price', 'document_item_id', 'item_name',
   'item_number', 'item_sku', 'item_location', 'line_description',
-  'quantity_received', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
+  'quantity_received', 'quantity_shipped', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
 ] as const;
 
 const ACCOUNT_COLUMNS = [
@@ -169,6 +169,26 @@ export class PostgresCacheService implements CacheService {
         FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE
       );
 
+      -- Category taxonomy is part of the PostgreSQL cache contract. It is
+      -- maintained by the category-cache sync, but must survive any normal
+      -- schema ensure/restore path instead of being treated as a legacy table.
+      CREATE TABLE IF NOT EXISTS categories (
+        category_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        item_count INTEGER NULL,
+        parent_id TEXT NULL,
+        parent_name TEXT NULL,
+        created TEXT NULL,
+        modified BIGINT NULL,
+        cache_source TEXT NOT NULL DEFAULT 'api',
+        imported_at BIGINT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS category_cache_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS cache_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -203,6 +223,11 @@ export class PostgresCacheService implements CacheService {
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS associated_document_id TEXT NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS external_po_number TEXT NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS shipping_location TEXT NULL;
+      ALTER TABLE documents ADD COLUMN IF NOT EXISTS date_sent TEXT NULL;
+      ALTER TABLE documents ADD COLUMN IF NOT EXISTS shipped_percent NUMERIC NULL;
+      -- Additive field owned by the live shipment-reconciliation app.
+      -- Keep it out of DOCUMENT_COLUMNS so normal SalesBinder syncs never overwrite it.
+      ALTER TABLE documents ADD COLUMN IF NOT EXISTS shipment_checked_at TIMESTAMPTZ NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_cancelled INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS imported_at BIGINT NULL;
     `);
@@ -217,6 +242,7 @@ export class PostgresCacheService implements CacheService {
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS item_location TEXT NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS line_description TEXT NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS quantity_received NUMERIC NULL;
+      ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS quantity_shipped NUMERIC NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS cost NUMERIC NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS total_amount NUMERIC NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS discounted_price NUMERIC NULL;
@@ -234,6 +260,7 @@ export class PostgresCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_documents_account_name ON documents(account_context_id, account_name);
       CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);
       CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status_id);
+      CREATE INDEX IF NOT EXISTS idx_documents_shipped_percent ON documents(shipped_percent);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_api_doc_id ON documents(api_doc_id) WHERE api_doc_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_item_documents_item ON item_documents(item_id);
       CREATE INDEX IF NOT EXISTS idx_item_documents_doc ON item_documents(doc_id);
@@ -248,6 +275,8 @@ export class PostgresCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_items_name ON items(name);
       CREATE INDEX IF NOT EXISTS idx_items_sku ON items(sku);
       CREATE INDEX IF NOT EXISTS idx_items_item_number ON items(item_number);
+      CREATE INDEX IF NOT EXISTS idx_categories_name ON categories(name);
+      CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id);
       CREATE INDEX IF NOT EXISTS idx_stock_item ON item_stock_locations(item_id);
       CREATE INDEX IF NOT EXISTS idx_stock_location ON item_stock_locations(location_id);
     `);
@@ -604,7 +633,17 @@ export class PostgresCacheService implements CacheService {
   }
 
   private valuesFor(columns: readonly string[], row: Record<string, unknown>): unknown[] {
-    return columns.map((column) => row[column] ?? null);
+    return columns.map((column) => this.sanitizeDbValue(row[column] ?? null));
+  }
+
+  /**
+   * PostgreSQL rejects literal NUL bytes in text values. SalesBinder free-text
+   * fields can contain them, so sanitize every outgoing string centrally instead
+   * of relying on each indexer to remember every text field.
+   */
+  private sanitizeDbValue(value: unknown): unknown {
+    if (typeof value !== 'string') return value;
+    return value.replace(/\u0000/g, '');
   }
 
   private async batch<T>(rows: T[], run: (row: T) => Promise<unknown>): Promise<void> {
@@ -685,6 +724,7 @@ export class PostgresCacheService implements CacheService {
       quantity: Number(row.quantity),
       price: Number(row.price),
       quantity_received: row.quantity_received == null ? null : Number(row.quantity_received),
+      quantity_shipped: row.quantity_shipped == null ? null : Number(row.quantity_shipped),
       cost: row.cost == null ? null : Number(row.cost),
       total_amount: row.total_amount == null ? null : Number(row.total_amount),
       discounted_price: row.discounted_price == null ? null : Number(row.discounted_price),
