@@ -6,8 +6,10 @@
  */
 
 import { SQLiteCacheService } from '../sqlite-cache.service.js';
-import { DocumentContextId } from '../types.js';
-import type { AccountRow, CacheState, DocumentRow, ItemRow, ItemStockLocationRow } from '../types.js';
+import { CACHE_SCHEMA_VERSION, DocumentContextId } from '../types.js';
+import type {
+  AccountRow, CacheState, DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow,
+} from '../types.js';
 import type { PaymentSyncStatus, PaymentTransactionRow } from '../payment-sync.types.js';
 import { rmSync } from 'fs';
 import { join } from 'path';
@@ -29,6 +31,8 @@ describe('PgToSqliteSyncService', () => {
         issue_date: '2026-01-15',
         customer_id: 'cust-a',
         modified: 1705300000,
+        date_sent: '2026-01-16',
+        shipped_percent: 75,
         archived: 1,
       },
       {
@@ -51,8 +55,8 @@ describe('PgToSqliteSyncService', () => {
       },
     ];
 
-    const testItems = [
-      { item_id: 'item-x', doc_id: 'doc-001', quantity: 10, price: 25.50 },
+    const testItems: Array<Omit<ItemDocumentRow, 'id'>> = [
+      { item_id: 'item-x', doc_id: 'doc-001', quantity: 10, quantity_shipped: 7.5, price: 25.50 },
       { item_id: 'item-y', doc_id: 'doc-001', quantity: 5, price: 100 },
       { item_id: 'item-x', doc_id: 'doc-002', quantity: 3, price: 30 },
     ];
@@ -111,6 +115,9 @@ describe('PgToSqliteSyncService', () => {
       expect(afterDocs.length).toBe(3);
       expect(afterDocs.map(d => d.doc_id).sort()).toEqual(['doc-001', 'doc-002', 'doc-003']);
       expect(afterDocs.map(({ archived }) => archived).sort()).toEqual([null, 0, 1].sort());
+      expect(await targetDb.getDocument('doc-001')).toMatchObject({
+        date_sent: '2026-01-16', shipped_percent: 75,
+      });
     });
 
     it('should copy tri-state lifecycle values for master items', async () => {
@@ -137,6 +144,7 @@ describe('PgToSqliteSyncService', () => {
         doc_id: i.doc_id,
         quantity: i.quantity,
         price: i.price,
+        quantity_shipped: i.quantity_shipped,
       }));
       await targetDb.batchInsertItemDocuments(allItems);
 
@@ -144,6 +152,9 @@ describe('PgToSqliteSyncService', () => {
       const targetDoc2Items = await targetDb.getItemDocuments('doc-002');
       expect(targetDoc1Items.length).toBe(2);
       expect(targetDoc2Items.length).toBe(1);
+      expect(targetDoc1Items).toEqual(expect.arrayContaining([
+        expect.objectContaining({ item_id: 'item-x', quantity_shipped: 7.5 }),
+      ]));
     });
 
     it('should copy cache state from source to target', async () => {
@@ -193,7 +204,7 @@ describe('PgToSqliteSyncService', () => {
         documentCount: 1,
         itemDocumentCount: 0,
         accountName: 'target',
-        schemaVersion: 4,
+        schemaVersion: CACHE_SCHEMA_VERSION,
       };
       const oldPaymentStatus: PaymentSyncStatus = {
         status: 'complete',
@@ -238,7 +249,7 @@ describe('PgToSqliteSyncService', () => {
           documentCount: 1,
           itemDocumentCount: 0,
           accountName: 'source',
-          schemaVersion: 4,
+          schemaVersion: CACHE_SCHEMA_VERSION,
         },
         paymentSyncStatus: null,
         pulledAt: 99999,
@@ -284,6 +295,8 @@ describe('PgToSqliteSyncService', () => {
         issue_date: '2026-07-01',
         customer_id: 'cust-new',
         modified: 300,
+        date_sent: '2026-07-02',
+        shipped_percent: 50,
         archived: 0,
       };
       const cacheState: CacheState = {
@@ -292,7 +305,7 @@ describe('PgToSqliteSyncService', () => {
         documentCount: 1,
         itemDocumentCount: 1,
         accountName: 'source',
-        schemaVersion: 4,
+        schemaVersion: CACHE_SCHEMA_VERSION,
         accountCount: 1,
         itemCount: 1,
         stockLocationCount: 1,
@@ -326,6 +339,7 @@ describe('PgToSqliteSyncService', () => {
           item_id: 'master-new',
           doc_id: 'doc-new',
           quantity: 2,
+          quantity_shipped: 1.5,
           price: 50,
           document_item_id: 'line-new',
         }],
@@ -340,7 +354,9 @@ describe('PgToSqliteSyncService', () => {
       expect(await targetDb.getAllItems()).toEqual([expect.objectContaining(item)]);
       expect(await targetDb.getAllItemStockLocations()).toEqual([expect.objectContaining(stock)]);
       expect(await targetDb.getDocument('doc-new')).toMatchObject(document);
-      expect(await targetDb.getItemDocuments('doc-new')).toEqual([expect.objectContaining({ document_item_id: 'line-new' })]);
+      expect(await targetDb.getItemDocuments('doc-new')).toEqual([
+        expect.objectContaining({ document_item_id: 'line-new', quantity_shipped: 1.5 }),
+      ]);
       expect(await targetDb.getAllPaymentTransactions()).toEqual([payment('payment-new', 'doc-new')]);
       expect(await targetDb.getCacheState()).toEqual(cacheState);
       expect(await targetDb.getPaymentSyncStatus()).toEqual(paymentStatus);

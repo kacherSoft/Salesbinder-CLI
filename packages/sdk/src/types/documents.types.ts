@@ -13,6 +13,7 @@ export interface DocumentItem {
   description?: string;
   quantity: number;
   quantity_partially_received: number;
+  quantity_partially_shipped?: number;
   tax: number;
   tax2: number;
   discount_percent: number;
@@ -67,6 +68,7 @@ export interface Document {
   total_price: number;
   /** Total amount paid across transactions; this is not the transaction row count. */
   total_transactions: number;
+  shipped_percent?: number | null;
   created: string;
   modified: string;
   status?: DocumentStatus;

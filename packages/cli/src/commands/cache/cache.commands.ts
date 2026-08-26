@@ -3,12 +3,25 @@
  */
 
 import type { Command } from 'commander';
-import type { CacheService } from '@salesbinder/sdk';
+import type { CacheService, SyncResult } from '@salesbinder/sdk';
 import { formatJson, formatError } from '../../output/json.formatter.js';
 import { existsSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { registerCachePaymentSyncCommand } from './cache-payment-sync.command.js';
+import {
+  FullResumeCheckpointStore,
+  buildFullResumeCacheIdentity,
+  buildPaymentSyncStatusFingerprint,
+  type FullResumeCheckpoint,
+  type FullResumePhase,
+  type ResumeCacheSnapshot,
+} from './full-resume-checkpoint.js';
+
+type ActiveFullResume = {
+  checkpoint: FullResumeCheckpoint;
+  store: FullResumeCheckpointStore;
+};
 
 /**
  * Register cache management commands
@@ -26,20 +39,26 @@ Examples:
   salesbinder cache sync
   salesbinder cache sync --full
   salesbinder cache sync --pull
+  salesbinder cache sync --full-resume
 
 When a PostgreSQL backend is configured: syncs API → PostgreSQL.
 Use --pull to also refresh the local SQLite mirror after PostgreSQL sync.
 Otherwise: syncs API → SQLite directly.
-Use --full to force complete resync.`)
+Use --full to force complete resync.
+Use --full-resume for an on-demand checkpointed rebuild attempt.`)
     .option('--full', 'Force full sync (re-download all documents)')
+    .option('--full-resume', 'Checkpointed full rebuild attempt; resumes completed phases after failures')
+    .option('--reset-checkpoint', 'Reset full-resume checkpoint before starting')
     .option('--pull', 'After PostgreSQL sync, pull PostgreSQL into local SQLite')
-    .action(async (options: { full?: boolean; pull?: boolean }) => {
+    .action(async (options: { full?: boolean; fullResume?: boolean; resetCheckpoint?: boolean; pull?: boolean }) => {
       let cacheService: import('@salesbinder/sdk').CacheService | null = null;
       let syncRunId: string | null = null;
       let syncLockKey: string | null = null;
       let syncStartedAt: number | null = null;
       let syncTarget: 'postgresql' | 'sqlite' | null = null;
       let lockAcquired = false;
+      let checkpointStore: FullResumeCheckpointStore | null = null;
+      let checkpoint: FullResumeCheckpoint | null = null;
 
       try {
         const {
@@ -52,10 +71,12 @@ Use --full to force complete resync.`)
           SQLiteCacheService,
           pullFromPostgres,
           loadPreferences,
+          CACHE_SCHEMA_VERSION,
         } = await import('@salesbinder/sdk');
 
         const accountName = program.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
+        const effectiveFull = Boolean(options.full || options.fullResume);
         const dbUrl = process.env.SALESBINDER_DB_URL;
 
         // Determine sync target: PG if available, else SQLite
@@ -81,15 +102,37 @@ Use --full to force complete resync.`)
           }
         }
 
-        syncStartedAt = Date.now();
-        syncRunId = `${accountName}-${syncStartedAt}`;
+        if (options.fullResume || options.resetCheckpoint) {
+          checkpointStore = new FullResumeCheckpointStore({
+            accountName,
+            syncTarget,
+            schemaVersion: CACHE_SCHEMA_VERSION,
+            cacheIdentity: buildFullResumeCacheIdentity({ accountName, syncTarget, databaseUrl: dbUrl }),
+          });
+          if (options.resetCheckpoint) checkpointStore.reset();
+          if (options.fullResume) {
+            checkpoint = checkpointStore.loadOrCreate();
+            if (checkpoint.completedPhases.length > 0) {
+              checkpointStore.validateCompletedPhases(
+                checkpoint,
+                await captureFullResumeCacheSnapshot(cacheService, accountName, CACHE_SCHEMA_VERSION),
+              );
+            }
+          }
+        }
+
+        const syncStartedAtMs = Date.now();
+        const currentSyncRunId = `${accountName}-${syncStartedAtMs}`;
+        syncStartedAt = syncStartedAtMs;
+        syncRunId = currentSyncRunId;
+        const activeCacheService = cacheService;
         await cacheService.setSyncStatus({
           status: 'running',
-          runId: syncRunId!,
+          runId: currentSyncRunId,
           accountName,
           syncTarget,
-          startedAt: Math.floor(syncStartedAt! / 1000),
-          updatedAt: Math.floor(syncStartedAt! / 1000),
+          startedAt: Math.floor(syncStartedAtMs / 1000),
+          updatedAt: Math.floor(syncStartedAtMs / 1000),
           message: 'Sync running',
         });
 
@@ -103,32 +146,116 @@ Use --full to force complete resync.`)
           cacheService,
           accountName,
           prefs?.cacheStaleSeconds,
-          syncLookbackSeconds
+          syncLookbackSeconds,
+          { deferGlobalWatermark: true },
         );
         const itemIndexer = new ItemIndexerService(client, cacheService, accountName, syncLookbackSeconds);
         const deletedLogSync = new DeletedLogSyncService(client, cacheService, accountName, syncLookbackSeconds);
+        const activeResume: ActiveFullResume | null = checkpoint && checkpointStore ? { checkpoint, store: checkpointStore } : null;
+        const captureCheckpointSnapshot = () =>
+          captureFullResumeCacheSnapshot(activeCacheService, accountName, CACHE_SCHEMA_VERSION);
+        const runFullResumePhase = async <T extends object>(
+          phase: FullResumePhase,
+          emptyResult: T,
+          runPhase: () => Promise<T>,
+        ): Promise<T> => {
+          if (!activeResume) return runPhase();
+          if (activeResume.store.isPhaseComplete(activeResume.checkpoint, phase)) {
+            console.error(`Skipping ${phase} phase: full-resume checkpoint already complete`);
+            return emptyResult;
+          }
+          activeResume.store.markPhaseStarted(activeResume.checkpoint, phase);
+          const phaseResult = await runPhase();
+          activeResume.store.markPhaseComplete(
+            activeResume.checkpoint,
+            phase,
+            phaseResult,
+            await captureCheckpointSnapshot(),
+          );
+          return phaseResult;
+        };
 
-        const accountResult = await accountIndexer.sync(options.full);
-        const result = await indexer.sync({
-          full: options.full,
-          onProgress: (current, total) => {
-            if (total > 0) {
-              const percent = Math.round((current / total) * 100);
-              console.error(`Progress: ${current}/${total} (${percent}%)`);
-            } else {
-              console.error(`Processed: ${current} documents`);
-            }
-          },
-        });
-        const itemResult = await itemIndexer.sync(options.full);
-        const deletedResult = await deletedLogSync.sync();
+        const accountResult = await runFullResumePhase(
+          'accounts',
+          { accountsProcessed: 0, customersProcessed: 0, suppliersProcessed: 0 },
+          () => accountIndexer.sync(effectiveFull),
+        );
+
+        const result = await runFullResumePhase<SyncResult>('documents', {
+          success: true,
+          type: effectiveFull ? 'full' as const : 'delta' as const,
+          documentsProcessed: 0,
+          documentsDeleted: 0,
+          lineItemsProcessed: 0,
+          duration: '0s',
+          syncLookbackSeconds,
+        }, () =>
+          indexer.sync({
+            full: effectiveFull,
+            resume: activeResume ? {
+              documents: activeResume.checkpoint.documents,
+              onDocumentCheckpoint: (position) => activeResume.store.markDocumentPosition(activeResume.checkpoint, position),
+            } : undefined,
+            onProgress: (current, total) => {
+              if (total > 0) {
+                const percent = Math.round((current / total) * 100);
+                console.error(`Progress: ${current}/${total} (${percent}%)`);
+              } else {
+                console.error(`Processed: ${current} documents`);
+              }
+            },
+          }),
+        );
+
+        const itemResult = await runFullResumePhase(
+          'items',
+          { itemsProcessed: 0, stockRowsProcessed: 0 },
+          () => itemIndexer.sync(activeResume ? {
+            full: effectiveFull,
+            resume: {
+              page: activeResume.checkpoint.items?.page,
+              itemIndex: activeResume.checkpoint.items?.itemIndex,
+              onItemCheckpoint: (position) => activeResume.store.markItemPosition(activeResume.checkpoint, position),
+            },
+          } : effectiveFull),
+        );
+
+        const deletedResult = await runFullResumePhase(
+          'deleted-log',
+          { deletedRecordsProcessed: 0 },
+          () => deletedLogSync.sync(),
+        );
         const cloudSyncFinishedAt = Math.floor(Date.now() / 1000);
+
+        const finalState = await cacheService.getCacheState();
+        await cacheService.setCacheState({
+          ...(finalState ?? {
+            accountName,
+            schemaVersion: CACHE_SCHEMA_VERSION,
+            documentCount: 0,
+            itemDocumentCount: 0,
+            lastSync: cloudSyncFinishedAt,
+            lastFullSync: effectiveFull ? cloudSyncFinishedAt : 0,
+          }),
+          // Advance the global watermark after every successful sync.
+          // Incremental runs must update lastSync too; otherwise cache status
+          // remains stale and the next delta repeatedly uses an old watermark.
+          lastSync: cloudSyncFinishedAt,
+          ...(effectiveFull ? { lastFullSync: cloudSyncFinishedAt } : {}),
+          documentCount: await cacheService.getDocumentCount(),
+          itemDocumentCount: await cacheService.getItemDocumentCount(),
+          accountName,
+          schemaVersion: CACHE_SCHEMA_VERSION,
+          itemCount: await cacheService.getItemCount(),
+          stockLocationCount: await cacheService.getStockLocationCount(),
+        });
+
         await cacheService.setSyncStatus({
           status: 'success',
-          runId: syncRunId!,
+          runId: currentSyncRunId,
           accountName,
           syncTarget,
-          startedAt: Math.floor(syncStartedAt! / 1000),
+          startedAt: Math.floor(syncStartedAtMs / 1000),
           updatedAt: cloudSyncFinishedAt,
           finishedAt: cloudSyncFinishedAt,
           message: 'Sync completed',
@@ -139,9 +266,6 @@ Use --full to force complete resync.`)
           stockRowsProcessed: itemResult.stockRowsProcessed,
           deletedRecordsProcessed: deletedResult.deletedRecordsProcessed,
         });
-
-        await cacheService.close();
-        cacheService = null;
 
         // If we synced to PG, also pull PG → SQLite
         let pullInfo: {
@@ -155,26 +279,27 @@ Use --full to force complete resync.`)
           duration?: string;
         } = { pulled: false };
         if (pgService && dbUrl && options.pull) {
+          // The pull service acquires this PostgreSQL lock on its own connection.
+          // Relinquish the outer sync lock first and prevent finally from releasing it twice.
+          if (!syncLockKey) throw new Error('Cache sync lock key is unavailable before pull.');
+          await pgService.releaseSyncLock(syncLockKey);
+          lockAcquired = false;
           console.error('Pulling PostgreSQL → SQLite...');
-          try {
-            const pullResult = await pullFromPostgres(dbUrl, accountName);
-            pullInfo = {
-              pulled: true,
-              accounts: pullResult.accountsPulled,
-              documents: pullResult.documentsPulled,
-              itemDocuments: pullResult.itemDocumentsPulled,
-              paymentTransactions: pullResult.paymentTransactionsPulled,
-              items: pullResult.itemsPulled,
-              stockRows: pullResult.stockRowsPulled,
-              duration: pullResult.duration,
-            };
-            console.error(`Pull complete: ${pullResult.documentsPulled} docs in ${pullResult.duration}`);
-          } catch (pullError: any) {
-            console.error(`Warning: PG → SQLite pull failed: ${pullError?.message}`);
-          }
+          const pullResult = await pullFromPostgres(dbUrl, accountName);
+          pullInfo = {
+            pulled: true,
+            accounts: pullResult.accountsPulled,
+            documents: pullResult.documentsPulled,
+            itemDocuments: pullResult.itemDocumentsPulled,
+            paymentTransactions: pullResult.paymentTransactionsPulled,
+            items: pullResult.itemsPulled,
+            stockRows: pullResult.stockRowsPulled,
+            duration: pullResult.duration,
+          };
+          console.error(`Pull complete: ${pullResult.documentsPulled} docs in ${pullResult.duration}`);
         }
 
-        const duration = `${((Date.now() - syncStartedAt!) / 1000).toFixed(1)}s`;
+        const duration = `${((Date.now() - syncStartedAtMs) / 1000).toFixed(1)}s`;
 
         const output = {
           success: true,
@@ -209,11 +334,29 @@ Use --full to force complete resync.`)
               duration: pullInfo.duration,
             },
           }),
+          ...(options.fullResume && {
+            full_resume: {
+              checkpoint_path: checkpointStore?.checkpointPath,
+              completed_phases: checkpoint?.completedPhases ?? [],
+              granularity: 'phase+document-page+document-index+item-page+item-index',
+              document_position: checkpoint?.documents,
+              item_position: checkpoint?.items,
+            },
+          }),
           message: `Sync complete: ${result.documentsProcessed} documents, ${itemResult.itemsProcessed} items in ${duration}`,
         };
 
+        if (options.fullResume) checkpointStore?.removeAfterSuccess();
+
         console.log(formatJson(output));
       } catch (error) {
+        if (checkpointStore && checkpoint) {
+          try {
+            checkpointStore.recordFailure(checkpoint, error);
+          } catch {
+            // Preserve the original sync error when checkpoint persistence fails.
+          }
+        }
         try {
           if (cacheService && syncRunId && syncTarget) {
             const now = Math.floor(Date.now() / 1000);
@@ -556,7 +699,7 @@ Displays:
         }
       } catch (error) {
         console.error(formatError(error as Error));
-        process.exit(1);
+        process.exitCode = 1;
       } finally {
         try {
           if (cacheService && typeof cacheService.close === 'function') {
@@ -584,7 +727,8 @@ This pull is explicit; normal cache reads and normal cache sync do not refresh S
         const dbUrl = process.env.SALESBINDER_DB_URL;
         if (!dbUrl) {
           console.error(formatError(new Error('SALESBINDER_DB_URL is not set. Pull requires a PostgreSQL backend.')));
-          process.exit(1);
+          process.exitCode = 1;
+          return;
         }
 
         const { pullFromPostgres } = await import('@salesbinder/sdk');
@@ -609,7 +753,7 @@ This pull is explicit; normal cache reads and normal cache sync do not refresh S
         );
       } catch (error) {
         console.error(formatError(error as Error));
-        process.exit(1);
+        process.exitCode = 1;
       }
     });
 }
@@ -631,6 +775,45 @@ async function releaseCacheWriterLockAndClose(
   } catch {
     // Ignore cleanup errors after the command result is set.
   }
+}
+
+async function captureFullResumeCacheSnapshot(
+  cacheService: CacheService,
+  accountName: string,
+  schemaVersion: number,
+): Promise<ResumeCacheSnapshot> {
+  const state = await cacheService.getCacheState();
+  const [
+    accountCount,
+    documentCount,
+    itemDocumentCount,
+    paymentTransactionCount,
+    paymentSyncStatus,
+    itemCount,
+    stockLocationCount,
+  ] = await Promise.all([
+    cacheService.getAccountCount(),
+    cacheService.getDocumentCount(),
+    cacheService.getItemDocumentCount(),
+    cacheService.getPaymentTransactionCount(),
+    cacheService.getPaymentSyncStatus(),
+    cacheService.getItemCount(),
+    cacheService.getStockLocationCount(),
+  ]);
+  return {
+    accountName: state?.accountName ?? accountName,
+    schemaVersion: state?.schemaVersion ?? schemaVersion,
+    accountCount,
+    documentCount,
+    itemDocumentCount,
+    paymentTransactionCount,
+    paymentSyncStatusFingerprint: buildPaymentSyncStatusFingerprint(paymentSyncStatus),
+    itemCount,
+    stockLocationCount,
+    lastAccountSync: state?.lastAccountSync ?? null,
+    lastItemSync: state?.lastItemSync ?? null,
+    lastDeletedSync: state?.lastDeletedSync ?? null,
+  };
 }
 
 async function collectCacheCounts(cacheService: CacheService) {

@@ -98,6 +98,10 @@ Delta sync uses a lookback window so late SalesBinder edits are not missed. Defa
 
 Set `preferences.syncLookbackSeconds` in `~/.salesbinder/config.json` to tune this. The same lookback is applied to account, document, item, and deleted-log delta sync.
 
+### Retry Backoff
+
+Transient HTTP retries start at `SALESBINDER_RETRY_INITIAL_DELAY_MS` milliseconds. The value must be a positive integer; invalid, zero, or negative values fall back to `1000`, and values above `60000` are capped at `60000`. The retry set includes 429, 500, 502, 503, 504, and 522.
+
 ### Cache Backend
 
 By default, the CLI uses a **local SQLite** database for reads and analytics. For shared/multi-machine setups, you can add a **shared PostgreSQL upstream** via `SALESBINDER_DB_URL`.
@@ -121,7 +125,7 @@ PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `
 
 The PostgreSQL schema is created automatically on first use.
 
-Cache schema v4 stores lifecycle state on accounts, item masters, and documents. Accounts keep their existing active/archived boolean behavior. Items and documents use `0` for active, `1` for archived, and `NULL` when the source cannot report lifecycle state. A later row with unknown state does not erase a known value. PostgreSQL → SQLite pulls preserve the same values. Existing pre-v4 item/document rows remain `NULL` until `cache sync --full` or a CSV import supplies authoritative evidence; sources that do not expose the field cannot complete that backfill. The migration is additive, so rollback uses the previous code without dropping columns or decrementing the SQLite schema version.
+Cache schema v4 keeps archive and payment safety intact. Accounts preserve their existing active/archived boolean behavior. Items and documents use `0` for active, `1` for archived, and `NULL` when the source cannot report lifecycle state; a later row with unknown state does not erase a known value. Payment tables and payment-sync metadata remain additive. Cache schema v5 adds shipping fields on documents and line items: `documents.date_sent`, `documents.shipped_percent`, and `item_documents.quantity_shipped`. The v1-v5 migration is additive, so rollback uses the previous code without dropping columns or decrementing the SQLite schema version.
 
 | Feature | SQLite (local mirror) | PostgreSQL (shared upstream) |
 |---------|------------------------|-------------------------------|
@@ -595,6 +599,10 @@ node packages/cli/dist/cli.js cache sync
 # Sync cache and also refresh local SQLite mirror
 node packages/cli/dist/cli.js cache sync --pull
 
+# Checkpointed full rebuild
+node packages/cli/dist/cli.js cache sync --full-resume
+node packages/cli/dist/cli.js cache sync --full-resume --reset-checkpoint
+
 # Force full resync (re-download all documents)
 node packages/cli/dist/cli.js cache sync --full
 
@@ -607,6 +615,10 @@ node packages/cli/dist/cli.js cache status
 # Clear cache data
 node packages/cli/dist/cli.js cache clear
 ```
+
+`cache sync --pull` is the only sync path that refreshes the local SQLite mirror. If the requested mirror refresh fails, the command exits non-zero and reports the pull error.
+
+`cache sync --full-resume` writes a private checkpoint under the per-account cache directory with restrictive permissions and resumes completed phases after failures. The checkpoint is bound to the account, sync target, and cache identity, so stale, malformed, or cross-account checkpoints fail closed and ask for `--reset-checkpoint`. `--reset-checkpoint` discards the existing checkpoint before starting.
 
 Use `cache sync-payments` once per account to populate `payment_transactions` and `cache_meta.payment_sync_status` for historical payment reporting. If the command stops partway through, rerun it; it resumes from the saved cursor. After the cache reaches `complete`, run `cache sync` once to catch invoices modified during the backfill; later normal syncs continue refreshing invoice payment rows.
 

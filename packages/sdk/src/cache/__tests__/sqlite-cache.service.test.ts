@@ -4,7 +4,7 @@
 
 import { SQLiteCacheService } from '../sqlite-cache.service.js';
 import { PostgresCacheService } from '../postgres-cache.service.js';
-import { DocumentContextId, DocumentRow, CacheState } from '../types.js';
+import { CACHE_SCHEMA_VERSION, DocumentContextId, DocumentRow, CacheState } from '../types.js';
 import type { PaymentSyncStatus, PaymentTransactionRow } from '../payment-sync.types.js';
 import Database from 'better-sqlite3';
 import { rmSync, existsSync } from 'fs';
@@ -82,16 +82,23 @@ describe('SQLiteCacheService', () => {
 
       service = new SQLiteCacheService('test-account', testDbPath);
       const migratedDb = new Database(testDbPath, { readonly: true });
-      expect(migratedDb.pragma('user_version', { simple: true })).toBe(4);
+      expect(migratedDb.pragma('user_version', { simple: true })).toBe(CACHE_SCHEMA_VERSION);
       migratedDb.close();
       expect((await service.getDocument('legacy-doc'))?.archived).toBeNull();
       expect((await service.getItem('legacy-item'))?.archived).toBeNull();
     });
 
     it.each([
-      [1, createLegacyV1Database],
-      [2, createLegacyV2Database],
-    ] as const)('migrates genuine schema v%s fixtures to v4 without losing rows', async (version, createLegacyDatabase) => {
+      [1, createLegacyV1Database, null, 0],
+      [2, createLegacyV2Database, null, 0],
+      [3, createLegacyV3Database, null, 1],
+      [4, createLegacyV4Database, 1, 1],
+    ] as const)('migrates genuine schema v%s fixtures to v5 without losing rows', async (
+      version,
+      createLegacyDatabase,
+      expectedArchived,
+      expectedPaymentCount,
+    ) => {
       await service.close();
       rmSync(testDbPath, { force: true });
       createLegacyDatabase(testDbPath);
@@ -100,21 +107,102 @@ describe('SQLiteCacheService', () => {
 
       const migratedDb = new Database(testDbPath, { readonly: true });
       try {
-        expect(migratedDb.pragma('user_version', { simple: true })).toBe(4);
+        expect(migratedDb.pragma('user_version', { simple: true })).toBe(CACHE_SCHEMA_VERSION);
+        expect((migratedDb.pragma('table_info(documents)') as Array<{ name: string }>).map(({ name }) => name))
+          .toEqual(expect.arrayContaining(['date_sent', 'shipped_percent']));
+        expect((migratedDb.pragma('table_info(item_documents)') as Array<{ name: string }>).map(({ name }) => name))
+          .toContain('quantity_shipped');
+        expect(migratedDb.pragma('index_list(documents)')).toEqual(expect.arrayContaining([
+          expect.objectContaining({ name: 'idx_documents_api_doc_id', unique: 1 }),
+        ]));
         expect((migratedDb.pragma('table_info(payment_transactions)') as Array<{ name: string }>))
           .toEqual(expect.arrayContaining([expect.objectContaining({ name: 'transaction_id' })]));
         expect(await service.getDocument(`legacy-v${version}-doc`)).toMatchObject({
           doc_id: `legacy-v${version}-doc`,
-          archived: null,
+          archived: expectedArchived,
         });
         expect(await service.getItem(`legacy-v${version}-item`)).toMatchObject({
           item_id: `legacy-v${version}-item`,
-          archived: null,
+          archived: expectedArchived,
         });
-        expect(await service.getItemDocuments(`legacy-v${version}-doc`)).toHaveLength(1);
+        expect(await service.getItemDocuments(`legacy-v${version}-doc`)).toEqual([
+          expect.objectContaining({ quantity_shipped: null }),
+        ]);
+        expect(await service.getAllPaymentTransactions()).toEqual(expectedPaymentCount === 0 ? [] : [{
+          transaction_id: `payment-v${version}`,
+          doc_id: `legacy-v${version}-doc`,
+          amount: 25,
+          transaction_date: `2026-0${version}-02`,
+          reference: null,
+          imported_at: version * 100,
+        }]);
       } finally {
         migratedDb.close();
       }
+    });
+
+    it('keeps a v4 migration atomic and reports duplicate legacy API document IDs', async () => {
+      await service.close();
+      rmSync(testDbPath, { force: true });
+      createLegacyV4DatabaseWithDuplicateApiIds(testDbPath);
+
+      expect(() => new SQLiteCacheService('test-account', testDbPath))
+        .toThrow(/Cannot migrate cache schema: documents contains 2 rows with api_doc_id "duplicate-api-id"/);
+
+      const legacyDb = new Database(testDbPath, { readonly: true });
+      try {
+        expect(legacyDb.pragma('user_version', { simple: true })).toBe(4);
+        expect((legacyDb.pragma('table_info(documents)') as Array<{ name: string }>).map(({ name }) => name))
+          .not.toContain('date_sent');
+        expect((legacyDb.prepare('SELECT COUNT(*) AS count FROM documents').get() as { count: number }).count)
+          .toBe(2);
+      } finally {
+        legacyDb.close();
+      }
+    });
+  });
+
+  describe('PostgreSQL shipping storage', () => {
+    it('adds shipping columns idempotently before creating their index', async () => {
+      const pgService = Object.create(PostgresCacheService.prototype) as PostgresCacheService;
+      const query = jest.fn(async (_sql: string) => ({ rows: [] as unknown[] }));
+      (pgService as unknown as { pool: { query: jest.Mock } }).pool = { query };
+
+      await pgService.ensureSchema();
+
+      const statements = query.mock.calls.map(([sql]) => String(sql));
+      const migrations = statements.find((sql) => sql.includes('ALTER TABLE documents')) ?? '';
+      const indexes = statements.find((sql) => sql.includes('CREATE INDEX IF NOT EXISTS idx_documents_shipped_percent')) ?? '';
+      expect(migrations).toContain('ALTER TABLE documents ADD COLUMN IF NOT EXISTS date_sent TEXT NULL');
+      expect(migrations).toContain('ALTER TABLE documents ADD COLUMN IF NOT EXISTS shipped_percent NUMERIC NULL');
+      expect(statements.find((sql) => sql.includes('ALTER TABLE item_documents')))
+        .toContain('ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS quantity_shipped NUMERIC NULL');
+      expect(statements.indexOf(migrations)).toBeLessThan(statements.indexOf(indexes));
+      expect(statements.join('\n')).not.toMatch(/category_cache_meta|CREATE TABLE IF NOT EXISTS categories|shipment_checked_at/);
+    });
+
+    it('coerces PostgreSQL shipping numerics to numbers', async () => {
+      const pgService = Object.create(PostgresCacheService.prototype) as PostgresCacheService;
+      const document = {
+        doc_id: 'pg-doc', context_id: DocumentContextId.Invoice, doc_number: 1,
+        issue_date: '2026-08-01', customer_id: 'pg-customer', modified: 1,
+        date_sent: '2026-08-02', shipped_percent: '37.5' as unknown as number,
+      };
+      const itemDocument = {
+        item_id: 'pg-item', doc_id: 'pg-doc', quantity: '2' as unknown as number,
+        price: '10' as unknown as number, quantity_shipped: '1.25' as unknown as number,
+      };
+      const query = jest.fn(async (sql: string) => ({
+        rows: sql.includes('item_documents') ? [itemDocument] : [document],
+      }));
+      (pgService as unknown as { pool: { query: jest.Mock } }).pool = { query };
+
+      expect(await pgService.getDocument('pg-doc')).toMatchObject({
+        date_sent: '2026-08-02', shipped_percent: 37.5,
+      });
+      expect(await pgService.getItemDocuments('pg-doc')).toEqual([
+        expect.objectContaining({ quantity: 2, price: 10, quantity_shipped: 1.25 }),
+      ]);
     });
   });
 
@@ -178,6 +266,19 @@ describe('SQLiteCacheService', () => {
       const retrieved = await service.getDocument('test-doc-1');
       expect(retrieved).toMatchObject(testDoc);
       expect(retrieved?.cache_source).toBe('api');
+    });
+
+    it('persists document shipping fields', async () => {
+      await service.insertDocument({
+        ...testDoc,
+        date_sent: '2026-01-30',
+        shipped_percent: 62.5,
+      });
+
+      expect(await service.getDocument(testDoc.doc_id)).toMatchObject({
+        date_sent: '2026-01-30',
+        shipped_percent: 62.5,
+      });
     });
 
     it('should update existing document', async () => {
@@ -285,7 +386,7 @@ describe('SQLiteCacheService', () => {
         const indexes = (migratedDb.pragma('index_list(payment_transactions)') as Array<{ name: string }>)
           .map(({ name }) => name);
 
-        expect(version).toBe(4);
+        expect(version).toBe(CACHE_SCHEMA_VERSION);
         expect(columns).toEqual(['transaction_id', 'doc_id', 'amount', 'transaction_date', 'reference', 'imported_at']);
         expect(indexes).toEqual(expect.arrayContaining([
           'idx_payment_transactions_doc_id', 'idx_payment_transactions_date_doc',
@@ -474,6 +575,20 @@ describe('SQLiteCacheService', () => {
       expect(items).toHaveLength(1);
       expect(items[0].item_id).toBe('item-1');
       expect(items[0].quantity).toBe(10);
+    });
+
+    it('persists shipped quantity on document items', async () => {
+      await service.insertItemDocument({
+        item_id: 'item-shipped',
+        doc_id: 'test-doc-1',
+        quantity: 10,
+        quantity_shipped: 4.25,
+        price: 29.99,
+      });
+
+      expect(await service.getItemDocuments('test-doc-1')).toEqual([
+        expect.objectContaining({ quantity_shipped: 4.25 }),
+      ]);
     });
 
     it('should cascade delete item documents when document deleted', async () => {
@@ -911,6 +1026,84 @@ function createLegacyV2Database(dbPath: string): void {
       INSERT INTO item_documents (item_id, doc_id, quantity, price, document_item_id, item_name, item_number, item_sku)
         VALUES ('legacy-v2-item', 'legacy-v2-doc', 3, 15, 'line-v2', 'Legacy v2 item', 502, 'LEG-V2');
       PRAGMA user_version = 2;
+    `);
+  } finally {
+    db.close();
+  }
+}
+
+function createLegacyV3Database(dbPath: string): void {
+  createLegacyDatabaseWithPayments(dbPath, 3, false);
+}
+
+function createLegacyV4Database(dbPath: string): void {
+  createLegacyDatabaseWithPayments(dbPath, 4, true);
+}
+
+function createLegacyV4DatabaseWithDuplicateApiIds(dbPath: string): void {
+  const db = new Database(dbPath);
+  try {
+    db.exec(`
+      ${legacyV2DocumentsTableSql().replace('api_doc_id TEXT NULL UNIQUE', 'api_doc_id TEXT NULL')}
+      ${legacyV2ItemDocumentsTableSql()}
+      ${legacyItemsTableSql()}
+      ALTER TABLE documents ADD COLUMN archived INTEGER NULL;
+      ALTER TABLE items ADD COLUMN archived INTEGER NULL;
+      CREATE TABLE payment_transactions (
+        transaction_id TEXT PRIMARY KEY,
+        doc_id TEXT NOT NULL,
+        amount REAL NOT NULL,
+        transaction_date TEXT NOT NULL,
+        reference TEXT NULL,
+        imported_at INTEGER NOT NULL,
+        FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+      );
+      INSERT INTO documents (
+        doc_id, context_id, doc_number, issue_date, customer_id, modified, api_doc_id, cache_source, is_cancelled
+      ) VALUES
+        ('duplicate-doc-1', ${DocumentContextId.Invoice}, 4401, '2026-04-01', 'customer-1', 400, 'duplicate-api-id', 'api', 0),
+        ('duplicate-doc-2', ${DocumentContextId.Invoice}, 4402, '2026-04-02', 'customer-2', 400, 'duplicate-api-id', 'api', 0);
+      PRAGMA user_version = 4;
+    `);
+  } finally {
+    db.close();
+  }
+}
+
+function createLegacyDatabaseWithPayments(dbPath: string, version: 3 | 4, archived: boolean): void {
+  const db = new Database(dbPath);
+  const archivedValue = archived ? 1 : 'NULL';
+  try {
+    db.exec(`
+      ${legacyV2DocumentsTableSql()}
+      ${legacyV2ItemDocumentsTableSql()}
+      ${legacyItemsTableSql()}
+      ${archived ? 'ALTER TABLE documents ADD COLUMN archived INTEGER NULL;' : ''}
+      ${archived ? 'ALTER TABLE items ADD COLUMN archived INTEGER NULL;' : ''}
+      CREATE TABLE payment_transactions (
+        transaction_id TEXT PRIMARY KEY,
+        doc_id TEXT NOT NULL,
+        amount REAL NOT NULL,
+        transaction_date TEXT NOT NULL,
+        reference TEXT NULL,
+        imported_at INTEGER NOT NULL,
+        FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+      );
+      INSERT INTO documents (
+        doc_id, context_id, doc_number, issue_date, customer_id, modified,
+        api_doc_id, cache_source, is_cancelled${archived ? ', archived' : ''}
+      ) VALUES (
+        'legacy-v${version}-doc', ${DocumentContextId.Invoice}, ${4000 + version}01,
+        '2026-0${version}-01', 'legacy-customer', ${version}00,
+        'api-v${version}-doc', 'api', 0${archived ? `, ${archivedValue}` : ''}
+      );
+      INSERT INTO items (item_id, item_number, name, sku, modified${archived ? ', archived' : ''})
+        VALUES ('legacy-v${version}-item', ${500 + version}, 'Legacy v${version} item', 'LEG-V${version}', ${version}00${archived ? `, ${archivedValue}` : ''});
+      INSERT INTO item_documents (item_id, doc_id, quantity, price, document_item_id)
+        VALUES ('legacy-v${version}-item', 'legacy-v${version}-doc', ${version}, 20, 'line-v${version}');
+      INSERT INTO payment_transactions (transaction_id, doc_id, amount, transaction_date, reference, imported_at)
+        VALUES ('payment-v${version}', 'legacy-v${version}-doc', 25, '2026-0${version}-02', NULL, ${version}00);
+      PRAGMA user_version = ${version};
     `);
   } finally {
     db.close();

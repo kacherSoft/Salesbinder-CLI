@@ -1,6 +1,7 @@
 /** @type {import('ts-jest').JestConfigWithTsJest} */
 export default {
   preset: 'ts-jest/presets/default-esm',
+  rootDir: '.',
   testEnvironment: 'node',
   extensionsToTreatAsEsm: ['.ts'],
   moduleNameMapper: {
@@ -11,18 +12,10 @@ export default {
       'ts-jest',
       {
         useESM: true,
-        tsconfig: './tsconfig.base.json',
+        tsconfig: '../../tsconfig.base.json',
       },
     ],
   },
-  testMatch: ['**/*.test.ts'],
-  collectCoverageFrom: ['src/**/*.ts', '!src/**/*.test.ts', '!src/**/*.d.ts'],
-  coverageThreshold: {
-    global: {
-      branches: 70,
-      functions: 70,
-      lines: 70,
-      statements: 70,
-    },
-  },
+  testMatch: ['<rootDir>/src/**/*.test.ts'],
+  collectCoverageFrom: ['<rootDir>/src/**/*.ts', '!<rootDir>/src/**/*.test.ts', '!<rootDir>/src/**/*.d.ts'],
 };

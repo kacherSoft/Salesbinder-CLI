@@ -32,13 +32,14 @@ const DOCUMENT_COLUMNS = [
   'user_id', 'salesperson_name', 'customer_name', 'customer_number',
   'supplier_name', 'supplier_number', 'status_id', 'status_name',
   'total_price', 'total_cost', 'subtotal', 'associated_document_id',
-  'external_po_number', 'shipping_location', 'is_cancelled', 'archived', 'imported_at',
+  'external_po_number', 'shipping_location', 'date_sent', 'shipped_percent',
+  'is_cancelled', 'archived', 'imported_at',
 ] as const;
 
 const ITEM_DOCUMENT_COLUMNS = [
   'item_id', 'doc_id', 'quantity', 'price', 'document_item_id', 'item_name',
   'item_number', 'item_sku', 'item_location', 'line_description',
-  'quantity_received', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
+  'quantity_received', 'quantity_shipped', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
 ] as const;
 
 const ACCOUNT_COLUMNS = [
@@ -222,6 +223,8 @@ export class PostgresCacheService implements CacheService {
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS associated_document_id TEXT NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS external_po_number TEXT NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS shipping_location TEXT NULL;
+      ALTER TABLE documents ADD COLUMN IF NOT EXISTS date_sent TEXT NULL;
+      ALTER TABLE documents ADD COLUMN IF NOT EXISTS shipped_percent NUMERIC NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_cancelled INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS archived INTEGER NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS imported_at BIGINT NULL;
@@ -243,6 +246,7 @@ export class PostgresCacheService implements CacheService {
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS item_location TEXT NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS line_description TEXT NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS quantity_received NUMERIC NULL;
+      ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS quantity_shipped NUMERIC NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS cost NUMERIC NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS total_amount NUMERIC NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS discounted_price NUMERIC NULL;
@@ -260,6 +264,7 @@ export class PostgresCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_documents_account_name ON documents(account_context_id, account_name);
       CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);
       CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status_id);
+      CREATE INDEX IF NOT EXISTS idx_documents_shipped_percent ON documents(shipped_percent);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_api_doc_id ON documents(api_doc_id) WHERE api_doc_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_documents_archived ON documents(archived);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item ON item_documents(item_id);
@@ -301,23 +306,26 @@ export class PostgresCacheService implements CacheService {
   }
 
   async getDocument(docId: string): Promise<DocumentRow | undefined> {
-    return (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE doc_id = $1`, [docId])).rows[0];
+    const row = (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE doc_id = $1`, [docId])).rows[0];
+    return row ? this.coerceDocument(row) : undefined;
   }
 
   async getDocumentByApiId(apiDocId: string): Promise<DocumentRow | undefined> {
-    return (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE api_doc_id = $1`, [apiDocId])).rows[0];
+    const row = (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE api_doc_id = $1`, [apiDocId])).rows[0];
+    return row ? this.coerceDocument(row) : undefined;
   }
 
   async getDocumentByNumber(contextId: number, docNumber: number): Promise<DocumentRow | undefined> {
-    return (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE context_id = $1 AND doc_number = $2`, [contextId, docNumber])).rows[0];
+    const row = (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE context_id = $1 AND doc_number = $2`, [contextId, docNumber])).rows[0];
+    return row ? this.coerceDocument(row) : undefined;
   }
 
   async getDocumentsByContext(contextId: number): Promise<DocumentRow[]> {
-    return (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE context_id = $1`, [contextId])).rows;
+    return (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE context_id = $1`, [contextId])).rows.map(this.coerceDocument);
   }
 
   async getDocumentsModifiedSince(timestamp: number): Promise<DocumentRow[]> {
-    return (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE modified > $1 ORDER BY modified ASC`, [timestamp])).rows;
+    return (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE modified > $1 ORDER BY modified ASC`, [timestamp])).rows.map(this.coerceDocument);
   }
 
   async getDocumentCountByContext(contextId: number): Promise<number> {
@@ -721,7 +729,17 @@ export class PostgresCacheService implements CacheService {
   }
 
   private valuesFor(columns: readonly string[], row: Record<string, unknown>): unknown[] {
-    return columns.map((column) => row[column] ?? null);
+    return columns.map((column) => this.sanitizeDbValue(row[column] ?? null));
+  }
+
+  /**
+   * PostgreSQL rejects literal NUL bytes in text values. SalesBinder free-text
+   * fields can contain them, so sanitize every outgoing string centrally instead
+   * of relying on each indexer to remember every text field.
+   */
+  private sanitizeDbValue(value: unknown): unknown {
+    if (typeof value !== 'string') return value;
+    return value.replaceAll('\u0000', '');
   }
 
   private async batch<T>(rows: T[], run: (row: T) => Promise<unknown>): Promise<void> {
@@ -804,12 +822,20 @@ export class PostgresCacheService implements CacheService {
     };
   }
 
+  private coerceDocument(row: DocumentRow): DocumentRow {
+    return {
+      ...row,
+      shipped_percent: row.shipped_percent == null ? null : Number(row.shipped_percent),
+    };
+  }
+
   private coerceItemDocument(row: ItemDocumentRow): ItemDocumentRow {
     return {
       ...row,
       quantity: Number(row.quantity),
       price: Number(row.price),
       quantity_received: row.quantity_received == null ? null : Number(row.quantity_received),
+      quantity_shipped: row.quantity_shipped == null ? null : Number(row.quantity_shipped),
       cost: row.cost == null ? null : Number(row.cost),
       total_amount: row.total_amount == null ? null : Number(row.total_amount),
       discounted_price: row.discounted_price == null ? null : Number(row.discounted_price),

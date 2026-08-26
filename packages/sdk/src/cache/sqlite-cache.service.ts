@@ -37,13 +37,14 @@ const DOCUMENT_COLUMNS = [
   'user_id', 'salesperson_name', 'customer_name', 'customer_number',
   'supplier_name', 'supplier_number', 'status_id', 'status_name',
   'total_price', 'total_cost', 'subtotal', 'associated_document_id',
-  'external_po_number', 'shipping_location', 'is_cancelled', 'archived', 'imported_at',
+  'external_po_number', 'shipping_location', 'date_sent', 'shipped_percent',
+  'is_cancelled', 'archived', 'imported_at',
 ] as const;
 
 const ITEM_DOCUMENT_COLUMNS = [
   'item_id', 'doc_id', 'quantity', 'price', 'document_item_id', 'item_name',
   'item_number', 'item_sku', 'item_location', 'line_description',
-  'quantity_received', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
+  'quantity_received', 'quantity_shipped', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
 ] as const;
 
 const ACCOUNT_COLUMNS = [
@@ -115,8 +116,11 @@ export class SQLiteCacheService implements CacheService {
       return;
     }
     if (currentVersion < CACHE_SCHEMA_VERSION) {
-      this.migrateSchema(currentVersion);
-      this.db.pragma(`user_version = ${CACHE_SCHEMA_VERSION}`);
+      const migrate = this.db.transaction(() => {
+        this.migrateSchema(currentVersion);
+        this.db.pragma(`user_version = ${CACHE_SCHEMA_VERSION}`);
+      });
+      migrate();
     }
   }
 
@@ -183,6 +187,8 @@ export class SQLiteCacheService implements CacheService {
         associated_document_id TEXT NULL,
         external_po_number TEXT NULL,
         shipping_location TEXT NULL,
+        date_sent TEXT NULL,
+        shipped_percent REAL NULL,
         is_cancelled INTEGER NOT NULL DEFAULT 0,
         archived INTEGER NULL,
         imported_at INTEGER NULL,
@@ -202,6 +208,7 @@ export class SQLiteCacheService implements CacheService {
         item_location TEXT NULL,
         line_description TEXT NULL,
         quantity_received REAL NULL,
+        quantity_shipped REAL NULL,
         cost REAL NULL,
         total_amount REAL NULL,
         discounted_price REAL NULL,
@@ -280,8 +287,8 @@ export class SQLiteCacheService implements CacheService {
     // Recreate any missing current tables before applying additive column migrations.
     this.createSchema();
     if (fromVersion < 2) {
-      this.addDocumentColumns();
-      this.addItemDocumentColumns();
+      this.addVersion2DocumentColumns();
+      this.addVersion2ItemDocumentColumns();
     }
     if (fromVersion < 3) {
       this.db.exec(`
@@ -300,11 +307,18 @@ export class SQLiteCacheService implements CacheService {
       this.addColumnsIfMissing('documents', [['archived', 'INTEGER NULL']]);
       this.addColumnsIfMissing('items', [['archived', 'INTEGER NULL']]);
     }
+    if (fromVersion < 5) {
+      this.addColumnsIfMissing('documents', [
+        ['date_sent', 'TEXT NULL'],
+        ['shipped_percent', 'REAL NULL'],
+      ]);
+      this.addColumnsIfMissing('item_documents', [['quantity_shipped', 'REAL NULL']]);
+    }
     // Current indexes may refer to columns introduced by any prior migration.
     this.createIndexes();
   }
 
-  private addDocumentColumns(): void {
+  private addVersion2DocumentColumns(): void {
     this.addColumnsIfMissing('documents', [
       ['api_doc_id', 'TEXT NULL'],
       ['cache_source', "TEXT NOT NULL DEFAULT 'api'"],
@@ -333,7 +347,7 @@ export class SQLiteCacheService implements CacheService {
     ]);
   }
 
-  private addItemDocumentColumns(): void {
+  private addVersion2ItemDocumentColumns(): void {
     this.addColumnsIfMissing('item_documents', [
       ['document_item_id', 'TEXT NULL'],
       ['item_name', 'TEXT NULL'],
@@ -361,6 +375,7 @@ export class SQLiteCacheService implements CacheService {
   }
 
   private createIndexes(): void {
+    this.ensureUniqueDocumentApiIdIndex();
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_context_doc_number
         ON documents(context_id, doc_number);
@@ -371,7 +386,7 @@ export class SQLiteCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_documents_account_name ON documents(account_context_id, account_name);
       CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);
       CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status_id);
-      CREATE INDEX IF NOT EXISTS idx_documents_api_doc_id ON documents(api_doc_id);
+      CREATE INDEX IF NOT EXISTS idx_documents_shipped_percent ON documents(shipped_percent);
       CREATE INDEX IF NOT EXISTS idx_documents_archived ON documents(archived);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item ON item_documents(item_id);
       CREATE INDEX IF NOT EXISTS idx_item_documents_doc ON item_documents(doc_id);
@@ -391,6 +406,32 @@ export class SQLiteCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_items_archived ON items(archived);
       CREATE INDEX IF NOT EXISTS idx_stock_item ON item_stock_locations(item_id);
       CREATE INDEX IF NOT EXISTS idx_stock_location ON item_stock_locations(location_id);
+    `);
+  }
+
+  private ensureUniqueDocumentApiIdIndex(): void {
+    const duplicate = this.db.prepare(`
+      SELECT api_doc_id, COUNT(*) AS count
+      FROM documents
+      WHERE api_doc_id IS NOT NULL
+      GROUP BY api_doc_id
+      HAVING COUNT(*) > 1
+      LIMIT 1
+    `).get() as { api_doc_id: string; count: number } | undefined;
+    if (duplicate) {
+      throw new Error(
+        `Cannot migrate cache schema: documents contains ${duplicate.count} rows with api_doc_id "${duplicate.api_doc_id}". `
+        + 'Resolve duplicate document identities before retrying.'
+      );
+    }
+    const indexes = this.db.pragma('index_list(documents)') as Array<{ name: string; unique: number }>;
+    const existing = indexes.find(({ name }) => name === 'idx_documents_api_doc_id');
+    if (existing && existing.unique !== 1) {
+      this.db.exec('DROP INDEX idx_documents_api_doc_id');
+    }
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_api_doc_id
+        ON documents(api_doc_id) WHERE api_doc_id IS NOT NULL;
     `);
   }
 
