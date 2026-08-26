@@ -3,6 +3,7 @@ import { ContextId } from '../types/common.types.js';
 import type { Customer, CustomerListResponse } from '../types/customers.types.js';
 import type { CacheService } from './cache.interface.js';
 import type { AccountRow, CacheState } from './types.js';
+import { CACHE_SCHEMA_VERSION } from './types.js';
 
 export interface AccountSyncResult {
   accountsProcessed: number;
@@ -103,12 +104,14 @@ export class AccountIndexerService {
   private mergeState(state: CacheState | null, now: number): CacheState {
     return {
       ...state,
-      lastSync: state?.lastSync ?? now,
-      lastFullSync: state?.lastFullSync ?? now,
+      // The CLI owns the global lastSync watermark and advances it only after
+      // all sync phases complete successfully.
+      lastSync: state?.lastSync ?? 0,
+      lastFullSync: state?.lastFullSync ?? 0,
       documentCount: state?.documentCount ?? 0,
       itemDocumentCount: state?.itemDocumentCount ?? 0,
       accountName: state?.accountName ?? this.accountName,
-      schemaVersion: 2,
+      schemaVersion: CACHE_SCHEMA_VERSION,
       lastAccountSync: now,
     };
   }

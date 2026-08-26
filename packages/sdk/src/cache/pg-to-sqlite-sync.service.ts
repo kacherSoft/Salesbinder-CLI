@@ -6,8 +6,8 @@
  * PostgreSQL is the shared source of truth (populated by `cache sync`).
  */
 
-import type { CacheService } from './cache.interface.js';
 import type { AccountRow, DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
+import type { PaymentTransactionRow } from './payment-sync.types.js';
 import { PostgresCacheService } from './postgres-cache.service.js';
 import { SQLiteCacheService } from './sqlite-cache.service.js';
 
@@ -17,6 +17,7 @@ export interface PgPullResult {
   accountsPulled: number;
   documentsPulled: number;
   itemDocumentsPulled: number;
+  paymentTransactionsPulled: number;
   itemsPulled: number;
   stockRowsPulled: number;
   duration: string;
@@ -38,47 +39,42 @@ export async function pullFromPostgres(
   const start = Date.now();
   let pg: PostgresCacheService | null = null;
   let sqlite: SQLiteCacheService | null = null;
+  let pgLockAcquired = false;
+  let sqliteLockAcquired = false;
+  const lockKey = `salesbinder-cache-sync:${sqliteAccountName}`;
 
   try {
     // Open both connections
     pg = new PostgresCacheService(pgConnectionString);
     await pg.ensureSchema();
+    pgLockAcquired = await pg.tryAcquireSyncLock(lockKey);
+    if (!pgLockAcquired) throw new Error('Another cache sync is already running for this account.');
     sqlite = new SQLiteCacheService(sqliteAccountName, sqliteCustomPath);
+    sqliteLockAcquired = await sqlite.tryAcquireSyncLock(lockKey);
+    if (!sqliteLockAcquired) throw new Error('Another local cache writer is already running for this account.');
 
     // 1. Pull all documents from PG
     const allDocs = await getAllDocuments(pg);
-    const allItems = await getAllItemDocuments(pg);
+    const allItems = await getAllItemDocuments(pg, allDocs);
+    const allPayments = await getAllPaymentTransactions(pg);
     const allAccounts = await getAllAccounts(pg);
     const allMasterItems = await getAllItems(pg);
     const allStockRows = await getAllStockRows(pg);
     const pgState = await pg.getCacheState();
+    const pgPaymentSyncStatus = await pg.getPaymentSyncStatus();
 
-    // 2. Clear SQLite tables (order matters: items first due to FK)
-    await clearSqliteTables(sqlite);
-
-    // 3. Bulk-insert into SQLite
-    if (allAccounts.length > 0) {
-      await sqlite.batchInsertAccounts(allAccounts);
-    }
-    if (allMasterItems.length > 0) {
-      await sqlite.batchInsertItems(allMasterItems);
-    }
-    if (allStockRows.length > 0) {
-      await sqlite.batchInsertItemStockLocations(allStockRows);
-    }
-    if (allDocs.length > 0) {
-      await sqlite.batchInsertDocuments(allDocs);
-    }
-    if (allItems.length > 0) {
-      await sqlite.batchInsertItemDocuments(allItems);
-    }
-
-    // 4. Copy cache metadata + record pull timestamp
-    if (pgState) {
-      await sqlite.setCacheState(pgState);
-    }
-    // Store the pull timestamp in cache_meta so we can check next time
-    await setPgPullTimestamp(sqlite, Date.now());
+    // Replace data and metadata together so readers see either the old or new mirror.
+    await sqlite.replaceMirror({
+      accounts: allAccounts,
+      items: allMasterItems,
+      itemStockLocations: allStockRows,
+      documents: allDocs,
+      itemDocuments: allItems,
+      paymentTransactions: allPayments,
+      cacheState: pgState,
+      paymentSyncStatus: pgPaymentSyncStatus,
+      pulledAt: Date.now(),
+    });
 
     const duration = ((Date.now() - start) / 1000).toFixed(1);
 
@@ -87,11 +83,14 @@ export async function pullFromPostgres(
       accountsPulled: allAccounts.length,
       documentsPulled: allDocs.length,
       itemDocumentsPulled: allItems.length,
+      paymentTransactionsPulled: allPayments.length,
       itemsPulled: allMasterItems.length,
       stockRowsPulled: allStockRows.length,
       duration: `${duration}s`,
     };
   } finally {
+    try { if (sqlite && sqliteLockAcquired) await sqlite.releaseSyncLock(lockKey); } catch { /* ignore */ }
+    try { if (pg && pgLockAcquired) await pg.releaseSyncLock(lockKey); } catch { /* ignore */ }
     try { if (pg) await pg.close(); } catch { /* ignore */ }
     try { if (sqlite) await sqlite.close(); } catch { /* ignore */ }
   }
@@ -117,11 +116,15 @@ async function getAllStockRows(pg: PostgresCacheService): Promise<ItemStockLocat
   return pg.getAllItemStockLocations();
 }
 
+async function getAllPaymentTransactions(pg: PostgresCacheService): Promise<PaymentTransactionRow[]> {
+  return pg.getAllPaymentTransactions();
+}
+
 /** Fetch all item_documents from PG */
-async function getAllItemDocuments(pg: PostgresCacheService): Promise<Omit<ItemDocumentRow, 'id'>[]> {
-  // We need a raw query — add a helper method or use existing interface
-  // Get all doc_ids first, then batch-fetch item docs
-  const docs = await pg.getDocumentsModifiedSince(0);
+async function getAllItemDocuments(
+  pg: PostgresCacheService,
+  docs: DocumentRow[],
+): Promise<Omit<ItemDocumentRow, 'id'>[]> {
   const allItems: Omit<ItemDocumentRow, 'id'>[] = [];
 
   // Batch by 100 doc_ids to avoid too many round-trips
@@ -144,6 +147,7 @@ async function getAllItemDocuments(pg: PostgresCacheService): Promise<Omit<ItemD
           item_location: item.item_location,
           line_description: item.line_description,
           quantity_received: item.quantity_received,
+          quantity_shipped: item.quantity_shipped,
           cost: item.cost,
           total_amount: item.total_amount,
           discounted_price: item.discounted_price,
@@ -154,17 +158,4 @@ async function getAllItemDocuments(pg: PostgresCacheService): Promise<Omit<ItemD
   }
 
   return allItems;
-}
-
-/** Clear SQLite data tables (preserving schema) */
-async function clearSqliteTables(sqlite: SQLiteCacheService): Promise<void> {
-  await sqlite.clearAll();
-}
-
-/** Store PG pull timestamp in SQLite cache_meta */
-async function setPgPullTimestamp(sqlite: CacheService, timestamp: number): Promise<void> {
-  const sqliteService = sqlite as SQLiteCacheService;
-  if ('setRawMeta' in sqliteService) {
-    (sqliteService as any).setRawMeta('pg_pull_timestamp', String(timestamp));
-  }
 }

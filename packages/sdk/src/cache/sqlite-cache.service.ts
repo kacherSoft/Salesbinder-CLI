@@ -3,10 +3,12 @@
  */
 
 import Database from 'better-sqlite3';
-import { mkdirSync, chmodSync, existsSync } from 'fs';
+import {
+  chmodSync, closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync,
+} from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import type { CacheService } from './cache.interface.js';
+import type { CacheService, SQLiteMirrorSnapshot } from './cache.interface.js';
 import type {
   AccountRow,
   CacheMetaRow,
@@ -20,8 +22,13 @@ import type {
   ItemStockLocationRow,
   PriceDistributionRow,
 } from './types.js';
-
-const SCHEMA_VERSION = 2;
+import { CACHE_SCHEMA_VERSION } from './types.js';
+import { PAYMENT_SYNC_STATUS_KEY, PAYMENT_TRANSACTION_COLUMNS } from './payment-cache.constants.js';
+import type { PaymentSyncStatus, PaymentTransactionRow } from './payment-sync.types.js';
+import {
+  assertPaymentRowsMatchDocument,
+  assertUniquePaymentTransactionIds,
+} from './payment-sync.helpers.js';
 
 const DOCUMENT_COLUMNS = [
   'doc_id', 'context_id', 'doc_number', 'issue_date', 'customer_id', 'modified',
@@ -30,13 +37,14 @@ const DOCUMENT_COLUMNS = [
   'user_id', 'salesperson_name', 'customer_name', 'customer_number',
   'supplier_name', 'supplier_number', 'status_id', 'status_name',
   'total_price', 'total_cost', 'subtotal', 'associated_document_id',
-  'external_po_number', 'shipping_location', 'is_cancelled', 'imported_at',
+  'external_po_number', 'shipping_location', 'date_sent', 'shipped_percent',
+  'is_cancelled', 'archived', 'imported_at',
 ] as const;
 
 const ITEM_DOCUMENT_COLUMNS = [
   'item_id', 'doc_id', 'quantity', 'price', 'document_item_id', 'item_name',
   'item_number', 'item_sku', 'item_location', 'line_description',
-  'quantity_received', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
+  'quantity_received', 'quantity_shipped', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
 ] as const;
 
 const ACCOUNT_COLUMNS = [
@@ -52,7 +60,7 @@ const ITEM_COLUMNS = [
   'item_id', 'item_number', 'name', 'description', 'sku', 'serial_number', 'barcode',
   'category_id', 'category_name', 'quantity', 'quantity_reserved', 'quantity_available',
   'quantity_incoming', 'in_transit', 'threshold', 'cost', 'price', 'valuation',
-  'published', 'created', 'modified', 'cache_source', 'imported_at',
+  'published', 'archived', 'created', 'modified', 'cache_source', 'imported_at',
 ] as const;
 
 const STOCK_COLUMNS = [
@@ -66,6 +74,7 @@ export class SQLiteCacheService implements CacheService {
   private db: Database.Database;
   private readonly accountName: string;
   private readonly dbPath: string;
+  private readonly syncLocks = new Map<string, { fd: number; path: string }>();
 
   constructor(accountName: string, customPath?: string) {
     this.accountName = this.sanitizeAccountName(accountName);
@@ -103,12 +112,15 @@ export class SQLiteCacheService implements CacheService {
     if (currentVersion === 0) {
       this.createSchema();
       this.createIndexes();
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      this.db.pragma(`user_version = ${CACHE_SCHEMA_VERSION}`);
       return;
     }
-    if (currentVersion < SCHEMA_VERSION) {
-      this.migrateSchema(currentVersion);
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    if (currentVersion < CACHE_SCHEMA_VERSION) {
+      const migrate = this.db.transaction(() => {
+        this.migrateSchema(currentVersion);
+        this.db.pragma(`user_version = ${CACHE_SCHEMA_VERSION}`);
+      });
+      migrate();
     }
   }
 
@@ -175,7 +187,10 @@ export class SQLiteCacheService implements CacheService {
         associated_document_id TEXT NULL,
         external_po_number TEXT NULL,
         shipping_location TEXT NULL,
+        date_sent TEXT NULL,
+        shipped_percent REAL NULL,
         is_cancelled INTEGER NOT NULL DEFAULT 0,
+        archived INTEGER NULL,
         imported_at INTEGER NULL,
         UNIQUE(context_id, doc_number)
       );
@@ -193,6 +208,7 @@ export class SQLiteCacheService implements CacheService {
         item_location TEXT NULL,
         line_description TEXT NULL,
         quantity_received REAL NULL,
+        quantity_shipped REAL NULL,
         cost REAL NULL,
         total_amount REAL NULL,
         discounted_price REAL NULL,
@@ -220,6 +236,7 @@ export class SQLiteCacheService implements CacheService {
         price REAL NULL,
         valuation REAL NULL,
         published INTEGER NULL,
+        archived INTEGER NULL,
         created TEXT NULL,
         modified INTEGER NULL,
         cache_source TEXT NOT NULL DEFAULT 'api',
@@ -249,6 +266,16 @@ export class SQLiteCacheService implements CacheService {
         FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS payment_transactions (
+        transaction_id TEXT PRIMARY KEY,
+        doc_id TEXT NOT NULL,
+        amount REAL NOT NULL,
+        transaction_date TEXT NOT NULL,
+        reference TEXT NULL,
+        imported_at INTEGER NOT NULL,
+        FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS cache_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -257,15 +284,41 @@ export class SQLiteCacheService implements CacheService {
   }
 
   private migrateSchema(fromVersion: number): void {
+    // Recreate any missing current tables before applying additive column migrations.
+    this.createSchema();
     if (fromVersion < 2) {
-      this.createSchema();
-      this.addDocumentColumns();
-      this.addItemDocumentColumns();
-      this.createIndexes();
+      this.addVersion2DocumentColumns();
+      this.addVersion2ItemDocumentColumns();
     }
+    if (fromVersion < 3) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS payment_transactions (
+          transaction_id TEXT PRIMARY KEY,
+          doc_id TEXT NOT NULL,
+          amount REAL NOT NULL,
+          transaction_date TEXT NOT NULL,
+          reference TEXT NULL,
+          imported_at INTEGER NOT NULL,
+          FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+        );
+      `);
+    }
+    if (fromVersion < 4) {
+      this.addColumnsIfMissing('documents', [['archived', 'INTEGER NULL']]);
+      this.addColumnsIfMissing('items', [['archived', 'INTEGER NULL']]);
+    }
+    if (fromVersion < 5) {
+      this.addColumnsIfMissing('documents', [
+        ['date_sent', 'TEXT NULL'],
+        ['shipped_percent', 'REAL NULL'],
+      ]);
+      this.addColumnsIfMissing('item_documents', [['quantity_shipped', 'REAL NULL']]);
+    }
+    // Current indexes may refer to columns introduced by any prior migration.
+    this.createIndexes();
   }
 
-  private addDocumentColumns(): void {
+  private addVersion2DocumentColumns(): void {
     this.addColumnsIfMissing('documents', [
       ['api_doc_id', 'TEXT NULL'],
       ['cache_source', "TEXT NOT NULL DEFAULT 'api'"],
@@ -294,7 +347,7 @@ export class SQLiteCacheService implements CacheService {
     ]);
   }
 
-  private addItemDocumentColumns(): void {
+  private addVersion2ItemDocumentColumns(): void {
     this.addColumnsIfMissing('item_documents', [
       ['document_item_id', 'TEXT NULL'],
       ['item_name', 'TEXT NULL'],
@@ -322,6 +375,7 @@ export class SQLiteCacheService implements CacheService {
   }
 
   private createIndexes(): void {
+    this.ensureUniqueDocumentApiIdIndex();
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_context_doc_number
         ON documents(context_id, doc_number);
@@ -332,12 +386,15 @@ export class SQLiteCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_documents_account_name ON documents(account_context_id, account_name);
       CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);
       CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status_id);
-      CREATE INDEX IF NOT EXISTS idx_documents_api_doc_id ON documents(api_doc_id);
+      CREATE INDEX IF NOT EXISTS idx_documents_shipped_percent ON documents(shipped_percent);
+      CREATE INDEX IF NOT EXISTS idx_documents_archived ON documents(archived);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item ON item_documents(item_id);
       CREATE INDEX IF NOT EXISTS idx_item_documents_doc ON item_documents(doc_id);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_name ON item_documents(item_name);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_number ON item_documents(item_number);
       CREATE INDEX IF NOT EXISTS idx_item_documents_item_sku ON item_documents(item_sku);
+      CREATE INDEX IF NOT EXISTS idx_payment_transactions_doc_id ON payment_transactions(doc_id);
+      CREATE INDEX IF NOT EXISTS idx_payment_transactions_date_doc ON payment_transactions(transaction_date, doc_id);
       CREATE INDEX IF NOT EXISTS idx_accounts_context_number ON accounts(context_id, account_number);
       CREATE INDEX IF NOT EXISTS idx_accounts_context_name ON accounts(context_id, name);
       CREATE INDEX IF NOT EXISTS idx_accounts_modified ON accounts(modified);
@@ -346,8 +403,35 @@ export class SQLiteCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_items_name ON items(name);
       CREATE INDEX IF NOT EXISTS idx_items_sku ON items(sku);
       CREATE INDEX IF NOT EXISTS idx_items_item_number ON items(item_number);
+      CREATE INDEX IF NOT EXISTS idx_items_archived ON items(archived);
       CREATE INDEX IF NOT EXISTS idx_stock_item ON item_stock_locations(item_id);
       CREATE INDEX IF NOT EXISTS idx_stock_location ON item_stock_locations(location_id);
+    `);
+  }
+
+  private ensureUniqueDocumentApiIdIndex(): void {
+    const duplicate = this.db.prepare(`
+      SELECT api_doc_id, COUNT(*) AS count
+      FROM documents
+      WHERE api_doc_id IS NOT NULL
+      GROUP BY api_doc_id
+      HAVING COUNT(*) > 1
+      LIMIT 1
+    `).get() as { api_doc_id: string; count: number } | undefined;
+    if (duplicate) {
+      throw new Error(
+        `Cannot migrate cache schema: documents contains ${duplicate.count} rows with api_doc_id "${duplicate.api_doc_id}". `
+        + 'Resolve duplicate document identities before retrying.'
+      );
+    }
+    const indexes = this.db.pragma('index_list(documents)') as Array<{ name: string; unique: number }>;
+    const existing = indexes.find(({ name }) => name === 'idx_documents_api_doc_id');
+    if (existing && existing.unique !== 1) {
+      this.db.exec('DROP INDEX idx_documents_api_doc_id');
+    }
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_api_doc_id
+        ON documents(api_doc_id) WHERE api_doc_id IS NOT NULL;
     `);
   }
 
@@ -428,6 +512,55 @@ export class SQLiteCacheService implements CacheService {
       for (const item of rows) insert.run(...this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)));
     });
     tx(items);
+    return Promise.resolve();
+  }
+
+  getPaymentTransactions(docId: string): Promise<PaymentTransactionRow[]> {
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM payment_transactions WHERE doc_id = ? ORDER BY transaction_date ASC, transaction_id ASC`)
+        .all(docId) as PaymentTransactionRow[],
+    );
+  }
+
+  getAllPaymentTransactions(): Promise<PaymentTransactionRow[]> {
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM payment_transactions ORDER BY transaction_date ASC, transaction_id ASC`)
+        .all() as PaymentTransactionRow[],
+    );
+  }
+
+  replacePaymentTransactions(docId: string, transactions: PaymentTransactionRow[]): Promise<void> {
+    assertPaymentRowsMatchDocument(docId, transactions);
+    assertUniquePaymentTransactionIds(transactions);
+    const deleteStmt = this.db.prepare(`DELETE FROM payment_transactions WHERE doc_id = ?`);
+    const insert = this.db.prepare(
+      `INSERT INTO payment_transactions (${PAYMENT_TRANSACTION_COLUMNS.join(', ')})`
+      + ` VALUES (${PAYMENT_TRANSACTION_COLUMNS.map(() => '?').join(', ')})`,
+    );
+    const tx = this.db.transaction(() => {
+      deleteStmt.run(docId);
+      for (const transaction of transactions) {
+        insert.run(...this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction)));
+      }
+    });
+    tx();
+    return Promise.resolve();
+  }
+
+  batchInsertPaymentTransactions(transactions: PaymentTransactionRow[]): Promise<void> {
+    assertUniquePaymentTransactionIds(transactions);
+    const insert = this.db.prepare(
+      `INSERT INTO payment_transactions (${PAYMENT_TRANSACTION_COLUMNS.join(', ')})`
+      + ` VALUES (${PAYMENT_TRANSACTION_COLUMNS.map(() => '?').join(', ')})`,
+    );
+    const tx = this.db.transaction((rows: PaymentTransactionRow[]) => {
+      for (const transaction of rows) {
+        insert.run(...this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction)));
+      }
+    });
+    tx(transactions);
     return Promise.resolve();
   }
 
@@ -642,12 +775,28 @@ export class SQLiteCacheService implements CacheService {
     return Promise.resolve();
   }
 
+  getPaymentSyncStatus(): Promise<PaymentSyncStatus | null> {
+    const row = this.db.prepare(`SELECT value FROM cache_meta WHERE key = ?`).get(PAYMENT_SYNC_STATUS_KEY) as CacheMetaRow | undefined;
+    return Promise.resolve(row ? JSON.parse(row.value) as PaymentSyncStatus : null);
+  }
+
+  setPaymentSyncStatus(status: PaymentSyncStatus): Promise<void> {
+    this.db
+      .prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)`)
+      .run(PAYMENT_SYNC_STATUS_KEY, JSON.stringify(status));
+    return Promise.resolve();
+  }
+
   getDocumentCount(): Promise<number> {
     return Promise.resolve(this.count('documents'));
   }
 
   getItemDocumentCount(): Promise<number> {
     return Promise.resolve(this.count('item_documents'));
+  }
+
+  getPaymentTransactionCount(): Promise<number> {
+    return Promise.resolve(this.count('payment_transactions'));
   }
 
   getAccountCount(contextId?: number): Promise<number> {
@@ -664,6 +813,7 @@ export class SQLiteCacheService implements CacheService {
 
   clearAll(): Promise<void> {
     this.db.exec(`
+      DELETE FROM payment_transactions;
       DELETE FROM item_stock_locations;
       DELETE FROM item_documents;
       DELETE FROM items;
@@ -671,6 +821,25 @@ export class SQLiteCacheService implements CacheService {
       DELETE FROM accounts;
       DELETE FROM cache_meta;
     `);
+    return Promise.resolve();
+  }
+
+  /** Replace the complete local mirror without exposing a partially-written snapshot. */
+  replaceMirror(snapshot: SQLiteMirrorSnapshot): Promise<void> {
+    assertUniquePaymentTransactionIds(snapshot.paymentTransactions);
+    const tx = this.db.transaction(() => {
+      void this.clearAll();
+      void this.batchInsertAccounts(snapshot.accounts);
+      void this.batchInsertItems(snapshot.items);
+      void this.batchInsertItemStockLocations(snapshot.itemStockLocations);
+      void this.batchInsertDocuments(snapshot.documents);
+      void this.batchInsertItemDocuments(snapshot.itemDocuments);
+      void this.batchInsertPaymentTransactions(snapshot.paymentTransactions);
+      if (snapshot.cacheState) void this.setCacheState(snapshot.cacheState);
+      if (snapshot.paymentSyncStatus) void this.setPaymentSyncStatus(snapshot.paymentSyncStatus);
+      this.setRawMeta('pg_pull_timestamp', String(snapshot.pulledAt));
+    });
+    tx();
     return Promise.resolve();
   }
 
@@ -685,7 +854,55 @@ export class SQLiteCacheService implements CacheService {
     this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)`).run(key, value);
   }
 
+  async tryAcquireSyncLock(lockKey: string): Promise<boolean> {
+    if (this.syncLocks.has(lockKey)) return false;
+    const path = `${this.dbPath}.sync.lock`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const tempPath = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+      let fd: number | null = null;
+      try {
+        fd = openSync(tempPath, 'wx', 0o600);
+        const owner = JSON.stringify({ pid: process.pid, createdAt: Date.now() });
+        if (writeSync(fd, owner) !== Buffer.byteLength(owner)) {
+          throw new Error('Could not persist the cache sync lock owner.');
+        }
+        linkSync(tempPath, path);
+        try { unlinkSync(tempPath); } catch { /* The lock link remains authoritative. */ }
+        this.syncLocks.set(lockKey, { fd, path });
+        return true;
+      } catch (error) {
+        if (fd !== null) try { closeSync(fd); } catch { /* Ignore cleanup errors. */ }
+        try { unlinkSync(tempPath); } catch { /* Ignore cleanup errors. */ }
+        if (!isExistingFileError(error)) throw error;
+        if (!this.removeStaleSyncLock(path)) return false;
+      }
+    }
+    return false;
+  }
+
+  async releaseSyncLock(lockKey: string): Promise<void> {
+    const lock = this.syncLocks.get(lockKey);
+    if (!lock) return;
+    this.syncLocks.delete(lockKey);
+    try { closeSync(lock.fd); } finally {
+      try { unlinkSync(lock.path); } catch { /* Lock already removed. */ }
+    }
+  }
+
+  private removeStaleSyncLock(path: string): boolean {
+    try {
+      const data = JSON.parse(readFileSync(path, 'utf8')) as { pid?: unknown };
+      const pid = Number(data.pid);
+      if (Number.isInteger(pid) && pid > 0 && isProcessAlive(pid)) return false;
+      unlinkSync(path);
+      return true;
+    } catch {
+      try { unlinkSync(path); return true; } catch { return false; }
+    }
+  }
+
   async close(): Promise<void> {
+    for (const lockKey of [...this.syncLocks.keys()]) await this.releaseSyncLock(lockKey);
     if (this.db) this.db.close();
   }
 
@@ -702,7 +919,9 @@ export class SQLiteCacheService implements CacheService {
   private upsertSql(table: string, columns: readonly string[], conflictColumn: string): string {
     const updates = columns
       .filter((column) => column !== conflictColumn)
-      .map((column) => `${column} = excluded.${column}`)
+      .map((column) => column === 'archived' && (table === 'documents' || table === 'items')
+        ? `${column} = COALESCE(excluded.${column}, ${table}.${column})`
+        : `${column} = excluded.${column}`)
       .join(', ');
     return `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')}) ON CONFLICT(${conflictColumn}) DO UPDATE SET ${updates}`;
   }
@@ -721,6 +940,7 @@ export class SQLiteCacheService implements CacheService {
       account_context_id: doc.account_context_id ?? null,
       account_name: doc.account_name ?? doc.customer_name ?? doc.supplier_name ?? null,
       is_cancelled: doc.is_cancelled ?? 0,
+      archived: doc.archived ?? null,
     };
   }
 
@@ -744,7 +964,7 @@ export class SQLiteCacheService implements CacheService {
   }
 
   private normalizeItem(item: ItemRow): Record<string, unknown> {
-    return { ...item, cache_source: item.cache_source ?? 'api' };
+    return { ...item, archived: item.archived ?? null, cache_source: item.cache_source ?? 'api' };
   }
 
   private normalizeStock(row: ItemStockLocationRow): Record<string, unknown> {
@@ -758,4 +978,24 @@ export class SQLiteCacheService implements CacheService {
       cache_source: row.cache_source ?? 'api',
     };
   }
+
+  private normalizePaymentTransaction(row: PaymentTransactionRow): Record<string, unknown> {
+    return {
+      ...row,
+      reference: row.reference ?? null,
+    };
+  }
 }
+
+const isExistingFileError = (error: unknown) =>
+  typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === 'EEXIST';
+
+const isProcessAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !(typeof error === 'object' && error !== null && 'code' in error
+      && (error as { code?: string }).code === 'ESRCH');
+  }
+};

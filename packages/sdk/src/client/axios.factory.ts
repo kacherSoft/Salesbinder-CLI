@@ -9,6 +9,36 @@ import type { RetryConfig } from './retry.handler.js';
 import { generateRequestId } from '../utils/request-id.generator.js';
 import type { AccountConfig } from '../config/config.schema.js';
 
+const DEFAULT_RETRY_INITIAL_DELAY_MS = 1000;
+const MAX_RETRY_DELAY_MS = 60000;
+
+function getRetryInitialDelayMs(): number {
+  const configuredDelay = Number(process.env.SALESBINDER_RETRY_INITIAL_DELAY_MS);
+  if (!Number.isSafeInteger(configuredDelay) || configuredDelay <= 0) {
+    return DEFAULT_RETRY_INITIAL_DELAY_MS;
+  }
+  return Math.min(configuredDelay, MAX_RETRY_DELAY_MS);
+}
+
+function getRetryAfterDelayMs(value: unknown): number | undefined {
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    return undefined;
+  }
+
+  const retryAfter = String(value).trim();
+  if (/^[+-]?\d+$/.test(retryAfter)) {
+    const delayMs = Number(retryAfter) * 1000;
+    return delayMs > 0 ? Math.min(delayMs, MAX_RETRY_DELAY_MS) : undefined;
+  }
+
+  const retryAt = Date.parse(retryAfter);
+  const delayMs = retryAt - Date.now();
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    return undefined;
+  }
+  return Math.min(delayMs, MAX_RETRY_DELAY_MS);
+}
+
 /**
  * Create configured axios instance for SalesBinder API
  * @param account - Account configuration
@@ -58,7 +88,7 @@ export function createAxiosClient(account: AccountConfig): AxiosInstance {
 
       // Check if we should retry
       const errorObj = error as any;
-      const retryableStatus = [429, 500, 502, 503, 504];
+      const retryableStatus = [429, 500, 502, 503, 504, 522];
       const isRetryable = !errorObj.response || retryableStatus.includes(errorObj.response?.status);
 
       if (!isRetryable || config._retry.attempt >= 5) {
@@ -67,20 +97,19 @@ export function createAxiosClient(account: AccountConfig): AxiosInstance {
 
       const { attempt, requestId } = config._retry;
 
-      // Check for retry-after header first (for 429 responses)
-      let delay: number;
+      // Prefer a valid retry-after delay, otherwise use exponential backoff.
       const retryAfterHeader = errorObj.response?.headers?.['retry-after'];
+      const retryAfterDelay = getRetryAfterDelayMs(retryAfterHeader);
       const reason = errorObj.response?.status || 'network';
+      let delay: number;
 
-      if (retryAfterHeader) {
-        // Use retry-after header value (in seconds)
-        const retryAfterSeconds = parseInt(retryAfterHeader, 10);
-        delay = (isNaN(retryAfterSeconds) ? 5 : retryAfterSeconds) * 1000;
+      if (retryAfterDelay !== undefined) {
+        delay = retryAfterDelay;
       } else {
         // Calculate delay with exponential backoff
-        const INITIAL_DELAY = 1000;
+        const initialDelay = getRetryInitialDelayMs();
         const JITTER_PERCENT = 0.5;
-        const exponentialDelay = INITIAL_DELAY * Math.pow(2, attempt);
+        const exponentialDelay = initialDelay * Math.pow(2, attempt);
         const jitter = exponentialDelay * JITTER_PERCENT * Math.random();
         delay = exponentialDelay + jitter;
       }

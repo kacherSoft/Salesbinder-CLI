@@ -14,6 +14,20 @@ import type {
   PriceDistributionRow,
   CustomerSalesData,
 } from './types.js';
+import type { PaymentSyncStatus, PaymentTransactionRow } from './payment-sync.types.js';
+
+/** Complete PostgreSQL snapshot used to replace the local SQLite read mirror. */
+export interface SQLiteMirrorSnapshot {
+  accounts: AccountRow[];
+  items: ItemRow[];
+  itemStockLocations: ItemStockLocationRow[];
+  documents: DocumentRow[];
+  itemDocuments: Omit<ItemDocumentRow, 'id'>[];
+  paymentTransactions: PaymentTransactionRow[];
+  cacheState: CacheState | null;
+  paymentSyncStatus: PaymentSyncStatus | null;
+  pulledAt: number;
+}
 
 /**
  * Unified cache service interface.
@@ -42,6 +56,13 @@ export interface CacheService {
   getItemDocuments(docId: string): Promise<ItemDocumentRow[]>;
   deleteItemDocuments(docId: string): Promise<void>;
   batchInsertItemDocuments(items: Omit<ItemDocumentRow, 'id'>[]): Promise<void>;
+
+  // ============ Payment Transaction Operations ============
+
+  getPaymentTransactions(docId: string): Promise<PaymentTransactionRow[]>;
+  getAllPaymentTransactions(): Promise<PaymentTransactionRow[]>;
+  replacePaymentTransactions(docId: string, transactions: PaymentTransactionRow[]): Promise<void>;
+  batchInsertPaymentTransactions(transactions: PaymentTransactionRow[]): Promise<void>;
 
   // ============ Account CRUD Operations ============
 
@@ -131,12 +152,20 @@ export interface CacheService {
   setCacheState(state: CacheState): Promise<void>;
   getSyncStatus(): Promise<CacheSyncStatus | null>;
   setSyncStatus(status: CacheSyncStatus): Promise<void>;
+  getPaymentSyncStatus(): Promise<PaymentSyncStatus | null>;
+  setPaymentSyncStatus(status: PaymentSyncStatus): Promise<void>;
   getDocumentCount(): Promise<number>;
   getItemDocumentCount(): Promise<number>;
+  getPaymentTransactionCount(): Promise<number>;
   getAccountCount(contextId?: number): Promise<number>;
   getItemCount(): Promise<number>;
   getStockLocationCount(): Promise<number>;
   clearAll(): Promise<void>;
+
+  // ============ Writer Coordination ============
+
+  tryAcquireSyncLock(lockKey: string): Promise<boolean>;
+  releaseSyncLock(lockKey: string): Promise<void>;
 
   // ============ Connection Management ============
 

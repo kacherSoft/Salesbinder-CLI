@@ -3,13 +3,23 @@ import type { SalesBinderClient } from '../resources/index.js';
 import type { Item, ItemListResponse, ItemVariationLocation } from '../types/items.types.js';
 import type { CacheService } from './cache.interface.js';
 import type { CacheState, ItemRow, ItemStockLocationRow } from './types.js';
+import { CACHE_SCHEMA_VERSION } from './types.js';
 
 export interface ItemSyncResult {
   itemsProcessed: number;
   stockRowsProcessed: number;
 }
 
-const DEFAULT_ITEM_DETAIL_DELAY_MS = 2000;
+export interface ItemSyncOptions {
+  full?: boolean;
+  resume?: {
+    page?: number;
+    itemIndex?: number;
+    onItemCheckpoint?: (checkpoint: { page: number; itemIndex: number }) => void;
+  };
+}
+
+const DEFAULT_ITEM_DETAIL_DELAY_MS = 0;
 
 export class ItemIndexerService {
   private readonly itemDetailDelayMs: number;
@@ -24,10 +34,12 @@ export class ItemIndexerService {
     this.itemDetailDelayMs = delayValue ? parseInt(delayValue, 10) : DEFAULT_ITEM_DETAIL_DELAY_MS;
   }
 
-  async sync(full = false): Promise<ItemSyncResult> {
+  async sync(fullOrOptions: boolean | ItemSyncOptions = false): Promise<ItemSyncResult> {
+    const options: ItemSyncOptions = typeof fullOrOptions === 'boolean' ? { full: fullOrOptions } : fullOrOptions;
+    const full = options.full ?? false;
     const state = await this.cache.getCacheState();
     const since = full ? 0 : Math.max(0, (state?.lastItemSync ?? state?.lastSync ?? 0) - this.syncLookbackSeconds);
-    let page = 1;
+    let page = Math.max(1, options.resume?.page ?? 1);
     let itemCount = 0;
     let stockCount = 0;
     let hasMore = true;
@@ -37,17 +49,24 @@ export class ItemIndexerService {
       const items = this.flattenItems(response);
       if (items.length === 0) break;
 
-      for (const item of items) {
+      const startItemIndex = options.resume?.page === page ? Math.max(0, options.resume?.itemIndex ?? 0) : 0;
+      for (let itemIndex = startItemIndex; itemIndex < items.length; itemIndex++) {
+        const item = items[itemIndex];
+        options.resume?.onItemCheckpoint?.({ page, itemIndex });
         if (!item.id) {
           throw new Error('SalesBinder item list returned an item without id');
         }
 
+        // The detail response is authoritative for per-location stock. The
+        // client owns retries; after they are exhausted, abort before writes so
+        // existing detailed stock remains intact and resume retries this item.
         const fullItem = await this.client.items.get(item.id);
         const stockRows = this.toStockRows(fullItem);
         await this.cache.insertItem(this.toItemRow(fullItem));
         await this.cache.replaceItemStockLocations(fullItem.id, stockRows);
         itemCount++;
         stockCount += stockRows.length;
+        options.resume?.onItemCheckpoint?.({ page, itemIndex: itemIndex + 1 });
 
         if (this.itemDetailDelayMs > 0) {
           await delay(this.itemDetailDelayMs);
@@ -55,6 +74,7 @@ export class ItemIndexerService {
       }
 
       hasMore = page < Number(response.pages ?? page);
+      options.resume?.onItemCheckpoint?.({ page: page + 1, itemIndex: 0 });
       page++;
     }
 
@@ -83,6 +103,7 @@ export class ItemIndexerService {
       cost: item.cost,
       price: item.price,
       published: item.published == null ? null : item.published ? 1 : 0,
+      archived: item.archived == null ? null : item.archived ? 1 : 0,
       created: item.created,
       modified: toUnix(item.modified),
       cache_source: 'api',
@@ -145,12 +166,12 @@ export class ItemIndexerService {
   private async mergeState(state: CacheState | null, now: number): Promise<CacheState> {
     return {
       ...state,
-      lastSync: state?.lastSync ?? now,
-      lastFullSync: state?.lastFullSync ?? now,
+      lastSync: state?.lastSync ?? 0,
+      lastFullSync: state?.lastFullSync ?? 0,
       documentCount: state?.documentCount ?? 0,
       itemDocumentCount: state?.itemDocumentCount ?? 0,
       accountName: state?.accountName ?? this.accountName,
-      schemaVersion: 2,
+      schemaVersion: CACHE_SCHEMA_VERSION,
       itemCount: await this.cache.getItemCount(),
       stockLocationCount: await this.cache.getStockLocationCount(),
       lastItemSync: now,

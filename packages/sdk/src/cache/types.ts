@@ -32,7 +32,11 @@ export interface DocumentRow {
   associated_document_id?: string | null;
   external_po_number?: string | null;
   shipping_location?: string | null;
+  date_sent?: string | null;
+  shipped_percent?: number | null;
   is_cancelled?: number;
+  /** 0=active, 1=archived, null=not observable from the source. */
+  archived?: 0 | 1 | null;
   imported_at?: number | null;
 }
 
@@ -50,6 +54,7 @@ export interface ItemDocumentRow {
   item_location?: string | null;
   line_description?: string | null;
   quantity_received?: number | null;
+  quantity_shipped?: number | null;
   cost?: number | null;
   total_amount?: number | null;
   discounted_price?: number | null;
@@ -110,6 +115,8 @@ export interface ItemRow {
   price?: number | null;
   valuation?: number | null;
   published?: number | null;
+  /** 0=active, 1=archived, null=not observable from the source. */
+  archived?: 0 | 1 | null;
   created?: string | null;
   modified?: number | null;
   cache_source?: 'api' | 'csv';
@@ -146,6 +153,8 @@ export interface CacheMetaRow {
 }
 
 /** Cache sync state metadata */
+export const CACHE_SCHEMA_VERSION = 5;
+
 export interface CacheState {
   lastSync: number; // Unix timestamp
   lastFullSync: number; // Unix timestamp
@@ -187,6 +196,10 @@ export interface CacheSyncStatus {
 export interface SyncOptions {
   full?: boolean; // Force full sync
   onProgress?: (current: number, total: number) => void; // Progress callback
+  resume?: {
+    documents?: { contextId?: number; page?: number; docIndex?: number };
+    onDocumentCheckpoint?: (checkpoint: { contextId: number; page: number; docIndex: number }) => void;
+  };
 }
 
 /** Sync result interface */
@@ -258,6 +271,14 @@ export interface OrderPatternRow {
   context_id: number;
   doc_number: number;
 }
+
+export type {
+  PaymentSyncMode,
+  PaymentSyncResult,
+  PaymentSyncState,
+  PaymentSyncStatus,
+  PaymentTransactionRow,
+} from './payment-sync.types.js';
 
 // Re-export DocumentContextId from common types for convenience
 export { DocumentContextId } from '../types/common.types.js';

@@ -3,7 +3,7 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import type { CacheService } from './cache.interface.js';
 import type { AccountRow, DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
-import { DocumentContextId } from './types.js';
+import { CACHE_SCHEMA_VERSION, DocumentContextId } from './types.js';
 import { ContextId } from '../types/common.types.js';
 import { parseCsvFile } from './csv-cache-import.parser.js';
 import type { CsvImportOptions, CsvImportResult, CsvImportWarnings, CsvRow } from './csv-cache-import.types.js';
@@ -177,7 +177,7 @@ export class CsvCacheImportService {
       documentCount: await this.cache.getDocumentCount(),
       itemDocumentCount: await this.cache.getItemDocumentCount(),
       accountName,
-      schemaVersion: 2,
+      schemaVersion: CACHE_SCHEMA_VERSION,
       accountCount: await this.cache.getAccountCount(),
       customerCount: await this.cache.getAccountCount(ContextId.Customer),
       supplierCount: await this.cache.getAccountCount(ContextId.Supplier),
@@ -271,6 +271,11 @@ export class CsvCacheImportService {
       const valuation = toNumber(row['Valuation']) ?? 0;
       const locationId = clean(row['Location ID']);
       const categoryName = clean(row['Category']);
+      const archived = mergeArchiveValue(
+        current?.archived,
+        toOptionalBooleanNumber(row['Archived'], `${INVENTORY_FILE} item ${itemId}`),
+        `${INVENTORY_FILE} item ${itemId}`,
+      );
       if (locationId) locationIds.add(locationId);
       if (categoryName) categoryNames.add(categoryName);
 
@@ -289,6 +294,7 @@ export class CsvCacheImportService {
         cost: toNumber(row['Cost']) ?? current?.cost ?? null,
         price: toNumber(row['Price']) ?? current?.price ?? null,
         valuation: (current?.valuation ?? 0) + valuation,
+        archived,
         cache_source: 'csv',
         imported_at: importedAt,
       });
@@ -353,6 +359,13 @@ export class CsvCacheImportService {
           : syntheticId('item-line', row['Item #'], row['Item Name']);
         if (itemNumber != null && itemIds.length !== 1) unmatchedItems.add(String(itemNumber));
 
+        const currentDocument = documents.get(docNumber);
+        const archived = mergeArchiveValue(
+          currentDocument?.archived,
+          toOptionalBooleanNumber(row['Archived'], `document ${contextId}:${docNumber}`),
+          `document ${contextId}:${docNumber}`,
+        );
+
         documents.set(docNumber, {
           doc_id: docId,
           context_id: contextId,
@@ -374,6 +387,7 @@ export class CsvCacheImportService {
           subtotal: toNumber(row['Subtotal']),
           external_po_number: nullable(row['External PO#']),
           shipping_location: nullable(row['Shipping Location']),
+          archived,
           imported_at: importedAt,
         });
 
@@ -463,6 +477,7 @@ function mergeDocument(existing: DocumentRow, imported: DocumentRow): DocumentRo
     status_id: existing.status_id ?? imported.status_id ?? null,
     status_name: existing.status_name ?? imported.status_name ?? null,
     is_cancelled: existing.is_cancelled ?? imported.is_cancelled ?? 0,
+    archived: imported.archived ?? existing.archived ?? null,
     cache_source: existing.api_doc_id ? 'api' : imported.cache_source,
   };
 }
@@ -486,6 +501,25 @@ function toNumber(value: string | undefined): number | null {
 function toBooleanNumber(value: string | undefined): number {
   const cleaned = clean(value).toLocaleLowerCase();
   return ['1', 'true', 'yes', 'y'].includes(cleaned) ? 1 : 0;
+}
+
+function toOptionalBooleanNumber(value: string | undefined, context: string): 0 | 1 | null {
+  const cleaned = clean(value).toLocaleLowerCase();
+  if (!cleaned) return null;
+  if (['1', 'true', 'yes', 'y'].includes(cleaned)) return 1;
+  if (['0', 'false', 'no', 'n'].includes(cleaned)) return 0;
+  throw new Error(`Invalid Archived value "${value}" for ${context}`);
+}
+
+function mergeArchiveValue(
+  existing: 0 | 1 | null | undefined,
+  incoming: 0 | 1 | null,
+  context: string,
+): 0 | 1 | null {
+  if (existing != null && incoming != null && existing !== incoming) {
+    throw new Error(`Conflicting Archived values for ${context}`);
+  }
+  return incoming ?? existing ?? null;
 }
 
 function normalizeDate(value: string | undefined): string | null {

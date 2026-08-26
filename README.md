@@ -7,6 +7,7 @@ Command-line interface for [SalesBinder API](https://www.salesbinder.com/api/) -
 - Full CRUD operations for Items, Customers, Documents, Locations, Categories
 - **Sales Analytics** with pluggable cache backend (SQLite local or PostgreSQL shared)
 - **Cache Management** with incremental sync, explicit PostgreSQL writes, and optional SQLite mirror pulls
+- **Resumable invoice payment backfill** with cache-level payment sync status tracking
 - Secure credential storage (0600 permissions)
 - Multiple account support
 - Pagination and search filters
@@ -97,6 +98,10 @@ Delta sync uses a lookback window so late SalesBinder edits are not missed. Defa
 
 Set `preferences.syncLookbackSeconds` in `~/.salesbinder/config.json` to tune this. The same lookback is applied to account, document, item, and deleted-log delta sync.
 
+### Retry Backoff
+
+Transient HTTP retries start at `SALESBINDER_RETRY_INITIAL_DELAY_MS` milliseconds. The value must be a positive integer; invalid, zero, or negative values fall back to `1000`, and values above `60000` are capped at `60000`. The retry set includes 429, 500, 502, 503, 504, and 522.
+
 ### Cache Backend
 
 By default, the CLI uses a **local SQLite** database for reads and analytics. For shared/multi-machine setups, you can add a **shared PostgreSQL upstream** via `SALESBINDER_DB_URL`.
@@ -119,6 +124,8 @@ When `SALESBINDER_DB_URL` is set, PostgreSQL is the shared source of truth.
 PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `cache sync` do not start a background pull.
 
 The PostgreSQL schema is created automatically on first use.
+
+Cache schema v4 keeps archive and payment safety intact. Accounts preserve their existing active/archived boolean behavior. Items and documents use `0` for active, `1` for archived, and `NULL` when the source cannot report lifecycle state; a later row with unknown state does not erase a known value. Payment tables and payment-sync metadata remain additive. Cache schema v5 adds shipping fields on documents and line items: `documents.date_sent`, `documents.shipped_percent`, and `item_documents.quantity_shipped`. The v1-v5 migration is additive, so rollback uses the previous code without dropping columns or decrementing the SQLite schema version.
 
 | Feature | SQLite (local mirror) | PostgreSQL (shared upstream) |
 |---------|------------------------|-------------------------------|
@@ -592,17 +599,30 @@ node packages/cli/dist/cli.js cache sync
 # Sync cache and also refresh local SQLite mirror
 node packages/cli/dist/cli.js cache sync --pull
 
+# Checkpointed full rebuild
+node packages/cli/dist/cli.js cache sync --full-resume
+node packages/cli/dist/cli.js cache sync --full-resume --reset-checkpoint
+
 # Force full resync (re-download all documents)
 node packages/cli/dist/cli.js cache sync --full
 
-# Check cache status (shows backend type, document counts, last sync)
+# Backfill invoice payment transactions (resumable)
+node packages/cli/dist/cli.js cache sync-payments
+
+# Check cache status (shows backend type, document counts, payment sync status, last sync)
 node packages/cli/dist/cli.js cache status
 
 # Clear cache data
 node packages/cli/dist/cli.js cache clear
 ```
 
-The CSV import expects these local export files under the import directory: customers, suppliers, 2024/2025/2026 invoice line items, 2025-2026 PO line items, and inventory variations. The importer validates headers, reports counts/warnings only, and does not print customer, supplier, item, document, or price rows.
+`cache sync --pull` is the only sync path that refreshes the local SQLite mirror. If the requested mirror refresh fails, the command exits non-zero and reports the pull error.
+
+`cache sync --full-resume` writes a private checkpoint under the per-account cache directory with restrictive permissions and resumes completed phases after failures. The checkpoint is bound to the account, sync target, and cache identity, so stale, malformed, or cross-account checkpoints fail closed and ask for `--reset-checkpoint`. `--reset-checkpoint` discards the existing checkpoint before starting.
+
+Use `cache sync-payments` once per account to populate `payment_transactions` and `cache_meta.payment_sync_status` for historical payment reporting. If the command stops partway through, rerun it; it resumes from the saved cursor. After the cache reaches `complete`, run `cache sync` once to catch invoices modified during the backfill; later normal syncs continue refreshing invoice payment rows.
+
+The CSV import expects these local export files under the import directory: customers, suppliers, 2024/2025/2026 invoice line items, 2025-2026 PO line items, and inventory variations. The importer validates headers, reports counts/warnings only, and does not print customer, supplier, item, document, or price rows. `Archived` remains required for customer/supplier exports and is optional for inventory/document exports; when omitted, item/document lifecycle state stays unknown or preserves an already-known cache value. Conflicting explicit `Archived` values for repeated rows are rejected.
 
 Expected PhuthaiTech seed counts:
 
@@ -618,6 +638,8 @@ Expected PhuthaiTech seed counts:
 | Stock location rows | 218,613 |
 
 Forward sync after the CSV seed caches modified customers/suppliers, invoices/POs/estimates, items, item stock locations from full item detail, and deleted-log removals by stable `record_id`.
+
+Archive state is metadata, not a deletion signal: missing list results and 404 responses do not remove rows. Deleted-log records remain the hard-delete authority. The current official v3 documents contract is active-only and does not expose an `archived` field, so document archive coverage must not be treated as complete. Existing analytics continue to include cached historical records regardless of archive state.
 
 **Performance:**
 - CSV import: local only, no historical API fetch

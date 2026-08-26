@@ -3,6 +3,7 @@
  */
 
 export * from './types.js';
+export * from './payment-sync.types.js';
 export type { CacheService } from './cache.interface.js';
 export { SQLiteCacheService } from './sqlite-cache.service.js';
 export { PostgresCacheService } from './postgres-cache.service.js';
@@ -10,6 +11,7 @@ export { createCacheService, createPostgresCacheService, getPostgresReadUrl } fr
 export { pullFromPostgres } from './pg-to-sqlite-sync.service.js';
 export type { PgPullResult } from './pg-to-sqlite-sync.service.js';
 export { DocumentIndexerService } from './document-indexer.service.js';
+export { PaymentSyncService } from './payment-sync.service.js';
 export { AccountIndexerService } from './account-indexer.service.js';
 export { ItemIndexerService } from './item-indexer.service.js';
 export { DeletedLogSyncService } from './deleted-log-sync.service.js';
