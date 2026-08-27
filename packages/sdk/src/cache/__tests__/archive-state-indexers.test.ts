@@ -144,6 +144,7 @@ describe('cache archive-state indexers', () => {
     const states: any[] = [];
     const stateCache = {
       getCacheState: jest.fn(async () => null),
+      getCategorySnapshot: jest.fn(async () => null),
       setCacheState: jest.fn(async (state) => { states.push(state); }),
       getItemCount: jest.fn(async () => 0),
       getStockLocationCount: jest.fn(async () => 0),

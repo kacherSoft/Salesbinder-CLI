@@ -8,6 +8,8 @@
  */
 
 import type { CacheService } from './cache.interface.js';
+import { loadConfig } from '../config/config.loader.js';
+import { createSalesBinderAccountBinding } from './types.js';
 import { SQLiteCacheService } from './sqlite-cache.service.js';
 import { PostgresCacheService } from './postgres-cache.service.js';
 
@@ -31,6 +33,8 @@ export async function createCacheService(accountName: string, customPath?: strin
   const readDbUrl = getPostgresReadUrl();
   if (readDbUrl) {
     const pg = new PostgresCacheService(readDbUrl);
+    await pg.ensureSchema();
+    await pg.verifyAccountBinding(createSalesBinderAccountBinding(loadConfig(accountName).subdomain));
     await pg.ensureSchema();
     return pg;
   }

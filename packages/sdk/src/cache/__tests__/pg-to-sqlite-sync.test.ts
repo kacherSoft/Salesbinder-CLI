@@ -231,6 +231,7 @@ describe('PgToSqliteSyncService', () => {
 
       expect(() => targetDb.replaceMirror({
         accounts: [],
+        categorySnapshot: null,
         items: [],
         itemStockLocations: [],
         documents: [{
@@ -332,6 +333,7 @@ describe('PgToSqliteSyncService', () => {
 
       await targetDb.replaceMirror({
         accounts: [account],
+        categorySnapshot: null,
         items: [item],
         itemStockLocations: [stock],
         documents: [document],

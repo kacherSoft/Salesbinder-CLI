@@ -165,8 +165,18 @@ describe('SQLiteCacheService', () => {
   describe('PostgreSQL shipping storage', () => {
     it('adds shipping columns idempotently before creating their index', async () => {
       const pgService = Object.create(PostgresCacheService.prototype) as PostgresCacheService;
-      const query = jest.fn(async (_sql: string) => ({ rows: [] as unknown[] }));
-      (pgService as unknown as { pool: { query: jest.Mock } }).pool = { query };
+      const query = jest.fn(async (sql: string) => ({
+        rows: sql.includes('SELECT account_identity') ? [{
+          account_identity: 'salesbinder:test', account_subdomain: 'test', created_at: 1,
+        }] : [] as unknown[],
+      }));
+      const client = { query, release: jest.fn() };
+      (pgService as unknown as { expectedBinding: object }).expectedBinding = {
+        accountIdentity: 'salesbinder:test', accountSubdomain: 'test', createdAt: 1,
+      };
+      (pgService as unknown as { pool: { connect: jest.Mock } }).pool = {
+        connect: jest.fn(async () => client),
+      };
 
       await pgService.ensureSchema();
 
@@ -178,7 +188,10 @@ describe('SQLiteCacheService', () => {
       expect(statements.find((sql) => sql.includes('ALTER TABLE item_documents')))
         .toContain('ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS quantity_shipped NUMERIC NULL');
       expect(statements.indexOf(migrations)).toBeLessThan(statements.indexOf(indexes));
-      expect(statements.join('\n')).not.toMatch(/category_cache_meta|CREATE TABLE IF NOT EXISTS categories|shipment_checked_at/);
+      const schemaSql = statements.join('\n');
+      expect(schemaSql).toContain('CREATE TABLE IF NOT EXISTS categories');
+      expect(schemaSql).toContain('CREATE TABLE IF NOT EXISTS category_cache_meta');
+      expect(schemaSql).not.toContain('shipment_checked_at');
     });
 
     it('coerces PostgreSQL shipping numerics to numbers', async () => {
@@ -500,10 +513,17 @@ describe('SQLiteCacheService', () => {
 
     it('uses plain PostgreSQL inserts for payment batches so existing IDs cannot be overwritten', async () => {
       const pgService = Object.create(PostgresCacheService.prototype) as PostgresCacheService;
-      const query = jest.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] as unknown[] }));
+      const query = jest.fn(async (sql: string, _params?: unknown[]) => ({
+        rows: sql.includes('SELECT account_identity') ? [{
+          account_identity: 'salesbinder:test', account_subdomain: 'test', created_at: 1,
+        }] : [] as unknown[],
+      }));
       const client = {
         query,
         release: jest.fn(),
+      };
+      (pgService as unknown as { expectedBinding: object }).expectedBinding = {
+        accountIdentity: 'salesbinder:test', accountSubdomain: 'test', createdAt: 1,
       };
       (pgService as unknown as { pool: { connect: jest.Mock; query: jest.Mock } }).pool = {
         connect: jest.fn(async () => client),
@@ -521,10 +541,17 @@ describe('SQLiteCacheService', () => {
 
     it('uses plain PostgreSQL inserts for payment replacements after deleting that invoice only', async () => {
       const pgService = Object.create(PostgresCacheService.prototype) as PostgresCacheService;
-      const query = jest.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] as unknown[] }));
+      const query = jest.fn(async (sql: string, _params?: unknown[]) => ({
+        rows: sql.includes('SELECT account_identity') ? [{
+          account_identity: 'salesbinder:test', account_subdomain: 'test', created_at: 1,
+        }] : [] as unknown[],
+      }));
       const client = {
         query,
         release: jest.fn(),
+      };
+      (pgService as unknown as { expectedBinding: object }).expectedBinding = {
+        accountIdentity: 'salesbinder:test', accountSubdomain: 'test', createdAt: 1,
       };
       (pgService as unknown as { pool: { connect: jest.Mock } }).pool = {
         connect: jest.fn(async () => client),

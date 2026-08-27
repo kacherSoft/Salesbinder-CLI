@@ -26,19 +26,23 @@ stored in cache_meta.payment_sync_status.`)
       try {
         const {
           createPostgresCacheService,
+          createSalesBinderAccountBinding,
+          loadConfig,
           PaymentSyncService,
           SalesBinderClient,
           SQLiteCacheService,
         } = await import('@salesbinder/sdk');
 
         const accountName = program.opts().account || 'default';
+        const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
         const client = new SalesBinderClient(accountName);
         const pgService = await createPostgresCacheService();
         cacheService = pgService ?? new SQLiteCacheService(accountName);
+        await cacheService.ensureAccountBinding(accountBinding);
 
         if (supportsSyncLock(cacheService)) {
           lockService = cacheService;
-          lockKey = `salesbinder-cache-sync:${accountName}`;
+          lockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
           const acquired = await lockService.tryAcquireSyncLock(lockKey);
           if (!acquired) {
             throw new Error('Another cache sync is already running for this account.');

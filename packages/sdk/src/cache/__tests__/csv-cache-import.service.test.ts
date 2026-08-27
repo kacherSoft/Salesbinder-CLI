@@ -81,6 +81,20 @@ describe('CsvCacheImportService', () => {
     expect((await cache.getDocument('api-invoice'))?.archived).toBe(1);
   });
 
+  it('does not let weak CSV category names erase API-backed category identity', async () => {
+    await cache.insertItem({
+      item_id: 'item-a', name: 'API item', category_id: 'category-api',
+      category_name: 'Canonical API Category', cache_source: 'api',
+    });
+
+    await importer.importDirectory(dir, { accountName: 'test' });
+    const item = await cache.getItem('item-a');
+
+    expect(item).toMatchObject({
+      category_id: 'category-api', category_name: 'Canonical API Category', cache_source: 'api',
+    });
+  });
+
   it('rejects conflicting archive values across repeated inventory rows', async () => {
     writeFileSync(join(dir, 'inventory_variations_list.csv'), inventoryCsv([
       'SKU-ITEM-A,5001,SKU-ITEM-A,10,1,9,0,0,var-a,,Main,Category A,12,8,80,item-a,loc-a,barcode-a,Yes',

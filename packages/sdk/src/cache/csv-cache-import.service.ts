@@ -159,10 +159,12 @@ export class CsvCacheImportService {
 
   private async write(prepared: PreparedImport, accountName: string): Promise<void> {
     const { documents, lineItems } = await this.resolveExistingDocuments(prepared);
+    const items = await this.preserveApiCategoryIdentity(prepared.items);
+    const stockRows = await this.preserveApiStockCategoryNames(prepared.stockRows);
 
     await this.cache.batchInsertAccounts(prepared.accounts);
-    await this.cache.batchInsertItems(prepared.items);
-    await this.cache.batchInsertItemStockLocations(prepared.stockRows);
+    await this.cache.batchInsertItems(items);
+    await this.cache.batchInsertItemStockLocations(stockRows);
     await this.cache.batchInsertDocuments(documents);
 
     for (const doc of documents) {
@@ -186,6 +188,32 @@ export class CsvCacheImportService {
       lastAccountSync: now,
       lastItemSync: now,
       lastFullItemSync: now,
+    });
+  }
+
+  private async preserveApiCategoryIdentity(items: ItemRow[]): Promise<ItemRow[]> {
+    return Promise.all(items.map(async (item) => {
+      const existing = await this.cache.getItem(item.item_id);
+      const hasApiCategory = existing?.category_id != null
+        || (existing?.cache_source === 'api' && existing.category_name != null);
+      if (!existing || !hasApiCategory) return item;
+      return {
+        ...item,
+        category_id: existing.category_id ?? null,
+        category_name: existing.category_name ?? null,
+        cache_source: existing.cache_source ?? item.cache_source,
+      };
+    }));
+  }
+
+  private async preserveApiStockCategoryNames(rows: ItemStockLocationRow[]): Promise<ItemStockLocationRow[]> {
+    const itemIds = [...new Set(rows.map((row) => row.item_id))];
+    const existingRows = (await Promise.all(itemIds.map((itemId) => this.cache.getItemStockLocations(itemId)))).flat();
+    const existingById = new Map(existingRows.map((row) => [row.stock_row_id, row]));
+    return rows.map((row) => {
+      const existing = existingById.get(row.stock_row_id);
+      if (existing?.cache_source !== 'api' || existing.category_name == null) return row;
+      return { ...row, category_name: existing.category_name, cache_source: 'api' };
     });
   }
 

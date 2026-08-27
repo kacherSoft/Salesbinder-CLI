@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import type { SalesBinderClient } from '../resources/index.js';
 import type { Item, ItemListResponse, ItemVariationLocation } from '../types/items.types.js';
 import type { CacheService } from './cache.interface.js';
-import type { CacheState, ItemRow, ItemStockLocationRow } from './types.js';
+import type { CacheState, CategorySnapshot, ItemRow, ItemStockLocationRow } from './types.js';
 import { CACHE_SCHEMA_VERSION } from './types.js';
 
 export interface ItemSyncResult {
@@ -38,6 +38,7 @@ export class ItemIndexerService {
     const options: ItemSyncOptions = typeof fullOrOptions === 'boolean' ? { full: fullOrOptions } : fullOrOptions;
     const full = options.full ?? false;
     const state = await this.cache.getCacheState();
+    const categoryNames = toCategoryNameIndex(await this.cache.getCategorySnapshot());
     const since = full ? 0 : Math.max(0, (state?.lastItemSync ?? state?.lastSync ?? 0) - this.syncLookbackSeconds);
     let page = Math.max(1, options.resume?.page ?? 1);
     let itemCount = 0;
@@ -61,8 +62,8 @@ export class ItemIndexerService {
         // client owns retries; after they are exhausted, abort before writes so
         // existing detailed stock remains intact and resume retries this item.
         const fullItem = await this.client.items.get(item.id);
-        const stockRows = this.toStockRows(fullItem);
-        await this.cache.insertItem(this.toItemRow(fullItem));
+        const stockRows = this.toStockRows(fullItem, categoryNames);
+        await this.cache.insertItem(this.toItemRow(fullItem, categoryNames));
         await this.cache.replaceItemStockLocations(fullItem.id, stockRows);
         itemCount++;
         stockCount += stockRows.length;
@@ -87,7 +88,7 @@ export class ItemIndexerService {
     return Array.isArray(items[0]) ? (items as unknown as Item[][]).flat() : items;
   }
 
-  private toItemRow(item: Item): ItemRow {
+  private toItemRow(item: Item, categoryNames: Map<string, string> | null = null): ItemRow {
     return {
       item_id: item.id,
       item_number: item.item_number,
@@ -97,7 +98,7 @@ export class ItemIndexerService {
       serial_number: item.serial_number ?? null,
       barcode: item.barcode ?? null,
       category_id: item.category_id ?? item.category?.id ?? null,
-      category_name: item.category?.name ?? null,
+      category_name: categoryName(item, categoryNames),
       quantity: item.quantity,
       threshold: item.threshold,
       cost: item.cost,
@@ -110,11 +111,11 @@ export class ItemIndexerService {
     };
   }
 
-  private toStockRows(item: Item): ItemStockLocationRow[] {
+  private toStockRows(item: Item, categoryNames: Map<string, string> | null = null): ItemStockLocationRow[] {
     const rows: ItemStockLocationRow[] = [];
     for (const variation of item.item_variations ?? []) {
       for (const location of variation.item_variations_locations ?? []) {
-        rows.push(this.toStockRow(item, variation.id, location));
+        rows.push(this.toStockRow(item, variation.id, location, categoryNames));
       }
     }
 
@@ -125,7 +126,7 @@ export class ItemIndexerService {
         item_number: item.item_number,
         location_id: item.location?.id ?? null,
         location_name: item.location?.name ?? null,
-        category_name: item.category?.name ?? null,
+        category_name: categoryName(item, categoryNames),
         quantity_on_hand: item.quantity ?? 0,
         quantity_reserved: 0,
         quantity_available: item.quantity ?? 0,
@@ -141,7 +142,12 @@ export class ItemIndexerService {
     return rows;
   }
 
-  private toStockRow(item: Item, variationId: string, location: ItemVariationLocation): ItemStockLocationRow {
+  private toStockRow(
+    item: Item,
+    variationId: string,
+    location: ItemVariationLocation,
+    categoryNames: Map<string, string> | null,
+  ): ItemStockLocationRow {
     const quantity = location.quantity ?? 0;
     return {
       stock_row_id: String(location.id ?? syntheticId('api-stock', item.id, variationId, location.location_id ?? 'none')),
@@ -150,7 +156,7 @@ export class ItemIndexerService {
       variation_id: variationId,
       variation_location_id: location.id == null ? null : String(location.id),
       location_id: location.location_id ?? null,
-      category_name: item.category?.name ?? null,
+      category_name: categoryName(item, categoryNames),
       quantity_on_hand: quantity,
       quantity_reserved: 0,
       quantity_available: quantity,
@@ -177,6 +183,17 @@ export class ItemIndexerService {
       lastItemSync: now,
     };
   }
+}
+
+function toCategoryNameIndex(snapshot: CategorySnapshot | null): Map<string, string> | null {
+  if (!snapshot) return null;
+  return new Map(snapshot.rows.map((row) => [row.category_id, row.name]));
+}
+
+function categoryName(item: Item, categoryNames: Map<string, string> | null): string | null {
+  if (!categoryNames) return item.category?.name ?? null;
+  const categoryId = item.category_id ?? item.category?.id;
+  return categoryId ? categoryNames.get(categoryId) ?? null : null;
 }
 
 function syntheticId(...parts: string[]): string {

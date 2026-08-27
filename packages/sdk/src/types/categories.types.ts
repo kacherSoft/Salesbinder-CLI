@@ -2,7 +2,7 @@
  * Categories types for SalesBinder API
  */
 
-import type { ListParams, ListResponse } from './common.types.js';
+import type { ListParams } from './common.types.js';
 
 /** Category object */
 export interface Category {
@@ -28,7 +28,21 @@ export interface UpdateCategoryDto extends Partial<Omit<CreateCategoryDto, 'pare
 /** List parameters for categories */
 export interface CategoryListParams extends ListParams {}
 
-/** List response for categories */
-export interface CategoryListResponse extends ListResponse {
-  categories?: Category[][];
+/** SalesBinder returns pagination metadata as integer strings or numbers. */
+export type CategoryPaginationValue = string | number;
+
+/** Raw list response before the resource normalizes nested category arrays. */
+export interface CategoryListApiResponse {
+  count?: CategoryPaginationValue;
+  page?: CategoryPaginationValue;
+  pages?: CategoryPaginationValue;
+  categories?: Category[] | Category[][];
+}
+
+/** List response with one flat category array for the requested API page. */
+export interface CategoryListResponse {
+  count?: CategoryPaginationValue;
+  page?: CategoryPaginationValue;
+  pages?: CategoryPaginationValue;
+  categories?: Category[];
 }

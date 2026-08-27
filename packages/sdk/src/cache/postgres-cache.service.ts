@@ -6,8 +6,12 @@ import pg, { type PoolClient } from 'pg';
 import type { CacheService } from './cache.interface.js';
 import type {
   AccountRow,
+  CacheAccountBinding,
   CacheState,
   CacheSyncStatus,
+  CategoryCacheMeta,
+  CategoryCacheRow,
+  CategorySnapshot,
   CustomerSalesData,
   DocumentRow,
   ItemDocumentRow,
@@ -15,6 +19,12 @@ import type {
   ItemSalesByPeriodRow,
   ItemStockLocationRow,
   PriceDistributionRow,
+} from './types.js';
+import {
+  CACHE_SCHEMA_VERSION,
+  CATEGORY_GENERATION_META_KEY,
+  CATEGORY_SNAPSHOT_META_KEY,
+  createSalesBinderAccountBinding,
 } from './types.js';
 import { PAYMENT_SYNC_STATUS_KEY, PAYMENT_TRANSACTION_COLUMNS } from './payment-cache.constants.js';
 import type { PaymentSyncStatus, PaymentTransactionRow } from './payment-sync.types.js';
@@ -24,6 +34,13 @@ import {
 } from './payment-sync.helpers.js';
 
 const { Pool } = pg;
+
+const DB_WRITE_LOCK_KEY = 'salesbinder.cache.database-write.v6';
+
+const CATEGORY_COLUMNS = [
+  'category_id', 'name', 'item_count', 'parent_id', 'parent_name',
+  'created', 'modified', 'cache_source', 'imported_at',
+] as const;
 
 const DOCUMENT_COLUMNS = [
   'doc_id', 'context_id', 'doc_number', 'issue_date', 'customer_id', 'modified',
@@ -65,11 +82,14 @@ const STOCK_COLUMNS = [
   'price', 'cost', 'valuation', 'barcode', 'cache_source', 'imported_at',
 ] as const;
 
+type QueryExecutor = Pick<PoolClient, 'query'>;
+
 export class PostgresCacheService implements CacheService {
   private pool: InstanceType<typeof Pool>;
   private opened = true;
   private readonly syncLockClients = new Map<string, PoolClient>();
   private readonly connectionString: string;
+  private expectedBinding: CacheAccountBinding | null = null;
 
   constructor(connectionString: string) {
     this.connectionString = connectionString;
@@ -77,7 +97,33 @@ export class PostgresCacheService implements CacheService {
   }
 
   async ensureSchema(): Promise<void> {
-    await this.pool.query(`
+    await this.ensureBindingSchema();
+    const binding = this.expectedBinding;
+    if (!binding) return;
+
+    await this.withDatabaseTransaction(async (client) => {
+      this.assertMatchingBinding(await this.readBinding(client, true), binding);
+      await this.ensurePayloadSchema(client);
+    });
+  }
+
+  private async ensureBindingSchema(): Promise<void> {
+    await this.withDatabaseTransaction(async (client) => {
+      await client.query(`
+      CREATE TABLE IF NOT EXISTS cache_account_binding (
+        id SMALLINT PRIMARY KEY,
+        account_identity TEXT NOT NULL UNIQUE,
+        account_subdomain TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        CONSTRAINT cache_account_binding_singleton_check CHECK (id = 1)
+      );
+      `);
+      await this.repairBindingSchema(client);
+    });
+  }
+
+  private async ensurePayloadSchema(client: PoolClient): Promise<void> {
+    await client.query(`
       CREATE TABLE IF NOT EXISTS accounts (
         account_id TEXT PRIMARY KEY,
         context_id INTEGER NOT NULL,
@@ -192,15 +238,33 @@ export class PostgresCacheService implements CacheService {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS categories (
+        category_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        item_count INTEGER NULL,
+        parent_id TEXT NULL,
+        parent_name TEXT NULL,
+        created TEXT NULL,
+        modified BIGINT NULL,
+        cache_source TEXT NOT NULL DEFAULT 'api',
+        imported_at BIGINT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS category_cache_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `);
-    await this.migrateDocumentColumns();
-    await this.migrateItemColumns();
-    await this.migrateItemDocumentColumns();
-    await this.createIndexes();
+    await this.migrateDocumentColumns(client);
+    await this.migrateItemColumns(client);
+    await this.migrateItemDocumentColumns(client);
+    await this.repairCategorySchema(client);
+    await this.createIndexes(client);
   }
 
-  private async migrateDocumentColumns(): Promise<void> {
-    await this.pool.query(`
+  private async migrateDocumentColumns(client: PoolClient): Promise<void> {
+    await client.query(`
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS api_doc_id TEXT NULL;
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS cache_source TEXT NOT NULL DEFAULT 'api';
       ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_name TEXT NULL;
@@ -231,14 +295,14 @@ export class PostgresCacheService implements CacheService {
     `);
   }
 
-  private async migrateItemColumns(): Promise<void> {
-    await this.pool.query(`
+  private async migrateItemColumns(client: PoolClient): Promise<void> {
+    await client.query(`
       ALTER TABLE items ADD COLUMN IF NOT EXISTS archived INTEGER NULL;
     `);
   }
 
-  private async migrateItemDocumentColumns(): Promise<void> {
-    await this.pool.query(`
+  private async migrateItemDocumentColumns(client: PoolClient): Promise<void> {
+    await client.query(`
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS document_item_id TEXT NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS item_name TEXT NULL;
       ALTER TABLE item_documents ADD COLUMN IF NOT EXISTS item_number INTEGER NULL;
@@ -254,8 +318,230 @@ export class PostgresCacheService implements CacheService {
     `);
   }
 
-  private async createIndexes(): Promise<void> {
-    await this.pool.query(`
+  private async repairBindingSchema(client: PoolClient): Promise<void> {
+    await client.query(`
+      ALTER TABLE cache_account_binding ADD COLUMN IF NOT EXISTS id SMALLINT;
+      ALTER TABLE cache_account_binding ADD COLUMN IF NOT EXISTS account_identity TEXT;
+      ALTER TABLE cache_account_binding ADD COLUMN IF NOT EXISTS account_subdomain TEXT;
+      ALTER TABLE cache_account_binding ADD COLUMN IF NOT EXISTS created_at BIGINT;
+      DO $migration$
+      DECLARE primary_key_name TEXT;
+      DECLARE primary_key_columns TEXT[];
+      BEGIN
+        SELECT constraint_row.conname,
+               array_agg(attribute_row.attname ORDER BY key_column.ordinality)
+          INTO primary_key_name, primary_key_columns
+        FROM pg_constraint AS constraint_row
+        CROSS JOIN LATERAL unnest(constraint_row.conkey)
+          WITH ORDINALITY AS key_column(attnum, ordinality)
+        JOIN pg_attribute AS attribute_row
+          ON attribute_row.attrelid = constraint_row.conrelid
+         AND attribute_row.attnum = key_column.attnum
+        WHERE constraint_row.conrelid = 'cache_account_binding'::regclass
+          AND constraint_row.contype = 'p'
+        GROUP BY constraint_row.conname;
+        IF primary_key_name IS NOT NULL
+          AND primary_key_columns IS DISTINCT FROM ARRAY['id']::TEXT[] THEN
+          EXECUTE format(
+            'ALTER TABLE cache_account_binding DROP CONSTRAINT %I',
+            primary_key_name
+          );
+        END IF;
+      END
+      $migration$;
+      DO $migration$
+      DECLARE extra_column TEXT;
+      BEGIN
+        FOR extra_column IN
+          SELECT column_name FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = 'cache_account_binding'
+            AND column_name NOT IN ('id', 'account_identity', 'account_subdomain', 'created_at')
+        LOOP
+          EXECUTE format('ALTER TABLE cache_account_binding DROP COLUMN %I', extra_column);
+        END LOOP;
+      END
+      $migration$;
+      ALTER TABLE cache_account_binding ALTER COLUMN id TYPE SMALLINT USING id::SMALLINT;
+      ALTER TABLE cache_account_binding ALTER COLUMN account_identity TYPE TEXT USING account_identity::TEXT;
+      ALTER TABLE cache_account_binding ALTER COLUMN account_subdomain TYPE TEXT USING account_subdomain::TEXT;
+      ALTER TABLE cache_account_binding ALTER COLUMN created_at TYPE BIGINT USING created_at::BIGINT;
+      ALTER TABLE cache_account_binding ALTER COLUMN id SET NOT NULL;
+      ALTER TABLE cache_account_binding ALTER COLUMN account_identity SET NOT NULL;
+      ALTER TABLE cache_account_binding ALTER COLUMN account_subdomain SET NOT NULL;
+      ALTER TABLE cache_account_binding ALTER COLUMN created_at SET NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_cache_account_binding_identity
+        ON cache_account_binding(account_identity);
+      DO $migration$
+      DECLARE check_constraint RECORD;
+      BEGIN
+        FOR check_constraint IN
+          SELECT conname, pg_get_constraintdef(oid) AS definition
+          FROM pg_constraint
+          WHERE conrelid = 'cache_account_binding'::regclass AND contype = 'c'
+        LOOP
+          IF check_constraint.conname <> 'cache_account_binding_singleton_check'
+            OR check_constraint.definition <> 'CHECK ((id = 1))' THEN
+            EXECUTE format(
+              'ALTER TABLE cache_account_binding DROP CONSTRAINT %I',
+              check_constraint.conname
+            );
+          END IF;
+        END LOOP;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'cache_account_binding'::regclass AND contype = 'p'
+        ) THEN
+          ALTER TABLE cache_account_binding
+            ADD CONSTRAINT cache_account_binding_pkey PRIMARY KEY (id);
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'cache_account_binding'::regclass
+            AND contype = 'c'
+            AND conname = 'cache_account_binding_singleton_check'
+            AND pg_get_constraintdef(oid) = 'CHECK ((id = 1))'
+        ) THEN
+          ALTER TABLE cache_account_binding
+            ADD CONSTRAINT cache_account_binding_singleton_check CHECK (id = 1);
+        END IF;
+      END
+      $migration$;
+    `);
+  }
+
+  private async repairCategorySchema(client: PoolClient): Promise<void> {
+    await client.query(`
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS category_id TEXT;
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS name TEXT;
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS item_count INTEGER NULL;
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id TEXT NULL;
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_name TEXT NULL;
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS created TEXT NULL;
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS modified BIGINT NULL;
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS cache_source TEXT DEFAULT 'api';
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS imported_at BIGINT;
+      DO $migration$
+      DECLARE primary_key_name TEXT;
+      DECLARE primary_key_columns TEXT[];
+      BEGIN
+        SELECT constraint_row.conname,
+               array_agg(attribute_row.attname ORDER BY key_column.ordinality)
+          INTO primary_key_name, primary_key_columns
+        FROM pg_constraint AS constraint_row
+        CROSS JOIN LATERAL unnest(constraint_row.conkey)
+          WITH ORDINALITY AS key_column(attnum, ordinality)
+        JOIN pg_attribute AS attribute_row
+          ON attribute_row.attrelid = constraint_row.conrelid
+         AND attribute_row.attnum = key_column.attnum
+        WHERE constraint_row.conrelid = 'categories'::regclass
+          AND constraint_row.contype = 'p'
+        GROUP BY constraint_row.conname;
+        IF primary_key_name IS NOT NULL
+          AND primary_key_columns IS DISTINCT FROM ARRAY['category_id']::TEXT[] THEN
+          EXECUTE format('ALTER TABLE categories DROP CONSTRAINT %I', primary_key_name);
+        END IF;
+      END
+      $migration$;
+      DO $migration$
+      DECLARE extra_column TEXT;
+      BEGIN
+        FOR extra_column IN
+          SELECT column_name FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = 'categories'
+            AND column_name NOT IN (
+              'category_id', 'name', 'item_count', 'parent_id', 'parent_name',
+              'created', 'modified', 'cache_source', 'imported_at'
+            )
+        LOOP
+          EXECUTE format('ALTER TABLE categories DROP COLUMN %I', extra_column);
+        END LOOP;
+      END
+      $migration$;
+      ALTER TABLE categories ALTER COLUMN category_id TYPE TEXT USING category_id::TEXT;
+      ALTER TABLE categories ALTER COLUMN name TYPE TEXT USING name::TEXT;
+      ALTER TABLE categories ALTER COLUMN item_count TYPE INTEGER USING item_count::INTEGER;
+      ALTER TABLE categories ALTER COLUMN parent_id TYPE TEXT USING parent_id::TEXT;
+      ALTER TABLE categories ALTER COLUMN parent_name TYPE TEXT USING parent_name::TEXT;
+      ALTER TABLE categories ALTER COLUMN created TYPE TEXT USING created::TEXT;
+      ALTER TABLE categories ALTER COLUMN modified TYPE BIGINT USING modified::BIGINT;
+      ALTER TABLE categories ALTER COLUMN cache_source TYPE TEXT USING cache_source::TEXT;
+      ALTER TABLE categories ALTER COLUMN imported_at TYPE BIGINT USING imported_at::BIGINT;
+      DELETE FROM categories
+        WHERE category_id IS NULL OR name IS NULL OR cache_source IS NULL OR imported_at IS NULL;
+      DELETE FROM categories a USING categories b
+        WHERE a.ctid > b.ctid AND a.category_id = b.category_id;
+      ALTER TABLE categories ALTER COLUMN category_id SET NOT NULL;
+      ALTER TABLE categories ALTER COLUMN name SET NOT NULL;
+      ALTER TABLE categories ALTER COLUMN cache_source SET DEFAULT 'api';
+      ALTER TABLE categories ALTER COLUMN cache_source SET NOT NULL;
+      ALTER TABLE categories ALTER COLUMN imported_at SET NOT NULL;
+
+      ALTER TABLE category_cache_meta ADD COLUMN IF NOT EXISTS key TEXT;
+      ALTER TABLE category_cache_meta ADD COLUMN IF NOT EXISTS value TEXT;
+      DO $migration$
+      DECLARE primary_key_name TEXT;
+      DECLARE primary_key_columns TEXT[];
+      BEGIN
+        SELECT constraint_row.conname,
+               array_agg(attribute_row.attname ORDER BY key_column.ordinality)
+          INTO primary_key_name, primary_key_columns
+        FROM pg_constraint AS constraint_row
+        CROSS JOIN LATERAL unnest(constraint_row.conkey)
+          WITH ORDINALITY AS key_column(attnum, ordinality)
+        JOIN pg_attribute AS attribute_row
+          ON attribute_row.attrelid = constraint_row.conrelid
+         AND attribute_row.attnum = key_column.attnum
+        WHERE constraint_row.conrelid = 'category_cache_meta'::regclass
+          AND constraint_row.contype = 'p'
+        GROUP BY constraint_row.conname;
+        IF primary_key_name IS NOT NULL
+          AND primary_key_columns IS DISTINCT FROM ARRAY['key']::TEXT[] THEN
+          EXECUTE format('ALTER TABLE category_cache_meta DROP CONSTRAINT %I', primary_key_name);
+        END IF;
+      END
+      $migration$;
+      DO $migration$
+      DECLARE extra_column TEXT;
+      BEGIN
+        FOR extra_column IN
+          SELECT column_name FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = 'category_cache_meta'
+            AND column_name NOT IN ('key', 'value')
+        LOOP
+          EXECUTE format('ALTER TABLE category_cache_meta DROP COLUMN %I', extra_column);
+        END LOOP;
+      END
+      $migration$;
+      ALTER TABLE category_cache_meta ALTER COLUMN key TYPE TEXT USING key::TEXT;
+      ALTER TABLE category_cache_meta ALTER COLUMN value TYPE TEXT USING value::TEXT;
+      DELETE FROM category_cache_meta WHERE key IS NULL OR value IS NULL;
+      DELETE FROM category_cache_meta a USING category_cache_meta b
+        WHERE a.ctid > b.ctid AND a.key = b.key;
+      ALTER TABLE category_cache_meta ALTER COLUMN key SET NOT NULL;
+      ALTER TABLE category_cache_meta ALTER COLUMN value SET NOT NULL;
+      DO $migration$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'categories'::regclass AND contype = 'p'
+        ) THEN
+          ALTER TABLE categories
+            ADD CONSTRAINT categories_pkey PRIMARY KEY (category_id);
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'category_cache_meta'::regclass AND contype = 'p'
+        ) THEN
+          ALTER TABLE category_cache_meta
+            ADD CONSTRAINT category_cache_meta_pkey PRIMARY KEY (key);
+        END IF;
+      END
+      $migration$;
+    `);
+  }
+
+  private async createIndexes(client: PoolClient): Promise<void> {
+    await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_context_doc_number ON documents(context_id, doc_number);
       CREATE INDEX IF NOT EXISTS idx_documents_context ON documents(context_id);
       CREATE INDEX IF NOT EXISTS idx_documents_modified ON documents(modified);
@@ -285,6 +571,8 @@ export class PostgresCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_items_archived ON items(archived);
       CREATE INDEX IF NOT EXISTS idx_stock_item ON item_stock_locations(item_id);
       CREATE INDEX IF NOT EXISTS idx_stock_location ON item_stock_locations(location_id);
+      CREATE INDEX IF NOT EXISTS idx_categories_name ON categories(name);
+      CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON categories(parent_id);
     `);
   }
 
@@ -298,11 +586,201 @@ export class PostgresCacheService implements CacheService {
     }
   }
 
+  async ensureAccountBinding(binding: CacheAccountBinding): Promise<void> {
+    const canonical = createSalesBinderAccountBinding(binding.accountSubdomain);
+    if (canonical.accountIdentity !== binding.accountIdentity) {
+      throw new Error('PostgreSQL cache account identity does not match its normalized SalesBinder subdomain.');
+    }
+
+    const createdAt = binding.createdAt ?? Math.floor(Date.now() / 1000);
+    await this.ensureBindingSchema();
+    let verifiedBinding: CacheAccountBinding | null = null;
+    await this.withDatabaseTransaction(async (client) => {
+      const existing = await this.readBinding(client, true);
+      if (!existing) {
+        if (await this.databaseContainsPayloadRows(client)) {
+          throw new Error(
+            'PostgreSQL cache database is populated but has no account binding. '
+            + 'Use a matching empty database or rebuild this database before binding it.'
+          );
+        }
+        await client.query(
+          `INSERT INTO cache_account_binding
+             (id, account_identity, account_subdomain, created_at)
+           VALUES (1, $1, $2, $3)
+           ON CONFLICT (id) DO NOTHING`,
+          [canonical.accountIdentity, canonical.accountSubdomain, createdAt],
+        );
+      }
+
+      const persisted = await this.readBinding(client, true);
+      this.assertMatchingBinding(persisted, canonical);
+      verifiedBinding = persisted;
+    });
+    this.expectedBinding = verifiedBinding;
+    await this.ensureSchema();
+  }
+
+  async verifyAccountBinding(binding: CacheAccountBinding): Promise<void> {
+    const canonical = createSalesBinderAccountBinding(binding.accountSubdomain);
+    if (canonical.accountIdentity !== binding.accountIdentity) {
+      throw new Error('PostgreSQL cache account identity does not match its normalized SalesBinder subdomain.');
+    }
+    const persisted = await this.readBinding(this.pool, false);
+    if (!persisted) {
+      throw new Error(
+        `PostgreSQL cache database has no account binding for ${canonical.accountIdentity}. `
+        + 'Run cache sync for this SalesBinder account first, or use the correctly bound database.'
+      );
+    }
+    this.assertMatchingBinding(persisted, canonical);
+    this.expectedBinding = persisted;
+  }
+
+  async replaceCategorySnapshot(snapshot: CategorySnapshot): Promise<void> {
+    const binding = this.requireExpectedBinding();
+    this.assertValidCategorySnapshot(snapshot, binding.accountIdentity);
+
+    await this.withVerifiedWrite(async (client) => {
+      const stateResult = await client.query<{ value: string }>(
+        `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`,
+      );
+      const currentState = this.parseCacheState(stateResult.rows[0]?.value);
+
+      await client.query(`DELETE FROM categories`);
+      for (const row of snapshot.rows) {
+        await client.query(
+          this.insertSql('categories', CATEGORY_COLUMNS),
+          this.valuesFor(CATEGORY_COLUMNS, row as unknown as Record<string, unknown>),
+        );
+      }
+
+      await client.query(`DELETE FROM category_cache_meta`);
+      await client.query(
+        `INSERT INTO category_cache_meta (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [CATEGORY_SNAPSHOT_META_KEY, JSON.stringify(snapshot.meta)],
+      );
+
+      await client.query(`
+        UPDATE items AS item
+        SET category_name = category.name
+        FROM categories AS category
+        WHERE item.category_id = category.category_id;
+        UPDATE items AS item
+        SET category_name = NULL
+        WHERE item.category_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM categories AS category
+            WHERE category.category_id = item.category_id
+          );
+        UPDATE item_stock_locations AS stock
+        SET category_name = category.name
+        FROM items AS item
+        JOIN categories AS category ON category.category_id = item.category_id
+        WHERE stock.item_id = item.item_id;
+        UPDATE item_stock_locations AS stock
+        SET category_name = NULL
+        WHERE EXISTS (
+          SELECT 1 FROM items AS item
+          WHERE item.item_id = stock.item_id AND item.category_id IS NOT NULL
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM items AS item
+            JOIN categories AS category ON category.category_id = item.category_id
+            WHERE item.item_id = stock.item_id
+          );
+      `);
+
+      const nextState: CacheState = {
+        lastSync: currentState?.lastSync ?? 0,
+        lastFullSync: currentState?.lastFullSync ?? 0,
+        documentCount: currentState?.documentCount ?? 0,
+        itemDocumentCount: currentState?.itemDocumentCount ?? 0,
+        accountName: currentState?.accountName ?? binding.accountSubdomain,
+        ...currentState,
+        schemaVersion: CACHE_SCHEMA_VERSION,
+        categoryCount: snapshot.meta.storedRowCount,
+        lastCategorySync: snapshot.meta.completedAt,
+      };
+      await client.query(
+        `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [JSON.stringify(nextState)],
+      );
+      await client.query(
+        `INSERT INTO cache_meta (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [CATEGORY_GENERATION_META_KEY, snapshot.meta.generation],
+      );
+    });
+  }
+
+  async getCategorySnapshot(): Promise<CategorySnapshot | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const meta = await this.readAuthoritativeCategoryMeta(client);
+      if (!meta) {
+        await client.query('COMMIT');
+        return null;
+      }
+      const rows = (await client.query<CategoryCacheRow>(
+        `SELECT ${CATEGORY_COLUMNS.join(', ')} FROM categories ORDER BY category_id`,
+      )).rows.map((row) => this.coerceCategory(row));
+      if (rows.length !== meta.storedRowCount) {
+        await client.query('COMMIT');
+        return null;
+      }
+      await client.query('COMMIT');
+      return { rows, meta };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getCategoryCacheMeta(): Promise<CategoryCacheMeta | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const meta = await this.readAuthoritativeCategoryMeta(client);
+      if (!meta) {
+        await client.query('COMMIT');
+        return null;
+      }
+      const countResult = await client.query<{ count: string }>(`SELECT COUNT(*) AS count FROM categories`);
+      await client.query('COMMIT');
+      return Number(countResult.rows[0]?.count) === meta.storedRowCount ? meta : null;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getCategory(categoryId: string): Promise<CategoryCacheRow | undefined> {
+    return (await this.getCategorySnapshot())?.rows.find((row) => row.category_id === categoryId);
+  }
+
+  async getAllCategories(): Promise<CategoryCacheRow[]> {
+    return (await this.getCategorySnapshot())?.rows ?? [];
+  }
+
+  async getCategoryCount(): Promise<number> {
+    return (await this.getCategoryCacheMeta())?.storedRowCount ?? 0;
+  }
+
   async insertDocument(doc: DocumentRow): Promise<void> {
-    await this.pool.query(
-      this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
-      this.valuesFor(DOCUMENT_COLUMNS, await this.normalizeDocumentForWrite(doc))
-    );
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(
+        this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
+        this.valuesFor(DOCUMENT_COLUMNS, await this.normalizeDocumentForWrite(doc, client)),
+      );
+    });
   }
 
   async getDocument(docId: string): Promise<DocumentRow | undefined> {
@@ -333,19 +811,29 @@ export class PostgresCacheService implements CacheService {
   }
 
   async deleteDocument(docId: string): Promise<void> {
-    await this.pool.query(`DELETE FROM documents WHERE doc_id = $1`, [docId]);
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(`DELETE FROM documents WHERE doc_id = $1`, [docId]);
+    });
   }
 
   async batchInsertDocuments(docs: DocumentRow[]): Promise<void> {
-    await this.batch(docs, (doc) => this.pool.query(this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'), this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(doc))));
+    await this.batch(docs, (client, doc) => client.query(
+      this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
+      this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(doc)),
+    ));
   }
 
   async batchDeleteDocuments(docIds: string[]): Promise<void> {
-    await this.batch(docIds, (id) => this.pool.query(`DELETE FROM documents WHERE doc_id = $1`, [id]));
+    await this.batch(docIds, (client, id) => client.query(`DELETE FROM documents WHERE doc_id = $1`, [id]));
   }
 
   async insertItemDocument(item: Omit<ItemDocumentRow, 'id'>): Promise<void> {
-    await this.pool.query(this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS), this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)));
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(
+        this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
+        this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)),
+      );
+    });
   }
 
   async getItemDocuments(docId: string): Promise<ItemDocumentRow[]> {
@@ -353,11 +841,16 @@ export class PostgresCacheService implements CacheService {
   }
 
   async deleteItemDocuments(docId: string): Promise<void> {
-    await this.pool.query(`DELETE FROM item_documents WHERE doc_id = $1`, [docId]);
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(`DELETE FROM item_documents WHERE doc_id = $1`, [docId]);
+    });
   }
 
   async batchInsertItemDocuments(items: Omit<ItemDocumentRow, 'id'>[]): Promise<void> {
-    await this.batch(items, (item) => this.pool.query(this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS), this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item))));
+    await this.batch(items, (client, item) => client.query(
+      this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
+      this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)),
+    ));
   }
 
   async getPaymentTransactions(docId: string): Promise<PaymentTransactionRow[]> {
@@ -376,9 +869,7 @@ export class PostgresCacheService implements CacheService {
   async replacePaymentTransactions(docId: string, transactions: PaymentTransactionRow[]): Promise<void> {
     assertPaymentRowsMatchDocument(docId, transactions);
     assertUniquePaymentTransactionIds(transactions);
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
+    await this.withVerifiedWrite(async (client) => {
       await client.query(`SELECT doc_id FROM documents WHERE doc_id = $1 FOR UPDATE`, [docId]);
       await client.query(`DELETE FROM payment_transactions WHERE doc_id = $1`, [docId]);
       for (const transaction of transactions) {
@@ -387,19 +878,13 @@ export class PostgresCacheService implements CacheService {
           this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction)),
         );
       }
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async batchInsertPaymentTransactions(transactions: PaymentTransactionRow[]): Promise<void> {
     assertUniquePaymentTransactionIds(transactions);
-    await this.batch(transactions, (transaction) =>
-      this.pool.query(
+    await this.batch(transactions, (client, transaction) =>
+      client.query(
         this.insertSql('payment_transactions', PAYMENT_TRANSACTION_COLUMNS),
         this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction)),
       ),
@@ -407,7 +892,12 @@ export class PostgresCacheService implements CacheService {
   }
 
   async insertAccount(account: AccountRow): Promise<void> {
-    await this.pool.query(this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'), this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account)));
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(
+        this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'),
+        this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account)),
+      );
+    });
   }
 
   async getAccount(accountId: string): Promise<AccountRow | undefined> {
@@ -431,15 +921,25 @@ export class PostgresCacheService implements CacheService {
   }
 
   async batchInsertAccounts(accounts: AccountRow[]): Promise<void> {
-    await this.batch(accounts, (account) => this.pool.query(this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'), this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account))));
+    await this.batch(accounts, (client, account) => client.query(
+      this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'),
+      this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account)),
+    ));
   }
 
   async deleteAccount(accountId: string): Promise<void> {
-    await this.pool.query(`DELETE FROM accounts WHERE account_id = $1`, [accountId]);
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(`DELETE FROM accounts WHERE account_id = $1`, [accountId]);
+    });
   }
 
   async insertItem(item: ItemRow): Promise<void> {
-    await this.pool.query(this.upsertSql('items', ITEM_COLUMNS, 'item_id'), this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)));
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(
+        this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
+        this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)),
+      );
+    });
   }
 
   async getItem(itemId: string): Promise<ItemRow | undefined> {
@@ -456,15 +956,25 @@ export class PostgresCacheService implements CacheService {
   }
 
   async batchInsertItems(items: ItemRow[]): Promise<void> {
-    await this.batch(items, (item) => this.pool.query(this.upsertSql('items', ITEM_COLUMNS, 'item_id'), this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item))));
+    await this.batch(items, (client, item) => client.query(
+      this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
+      this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)),
+    ));
   }
 
   async deleteItem(itemId: string): Promise<void> {
-    await this.pool.query(`DELETE FROM items WHERE item_id = $1`, [itemId]);
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(`DELETE FROM items WHERE item_id = $1`, [itemId]);
+    });
   }
 
   async insertItemStockLocation(row: ItemStockLocationRow): Promise<void> {
-    await this.pool.query(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'), this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(
+        this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
+        this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)),
+      );
+    });
   }
 
   async getItemStockLocations(itemId: string): Promise<ItemStockLocationRow[]> {
@@ -476,28 +986,25 @@ export class PostgresCacheService implements CacheService {
   }
 
   async replaceItemStockLocations(itemId: string, rows: ItemStockLocationRow[]): Promise<void> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
+    await this.withVerifiedWrite(async (client) => {
       await client.query(`DELETE FROM item_stock_locations WHERE item_id = $1`, [itemId]);
       for (const row of rows) {
         await client.query(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'), this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
       }
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async batchInsertItemStockLocations(rows: ItemStockLocationRow[]): Promise<void> {
-    await this.batch(rows, (row) => this.pool.query(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'), this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row))));
+    await this.batch(rows, (client, row) => client.query(
+      this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
+      this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)),
+    ));
   }
 
   async deleteItemStockLocations(itemId: string): Promise<void> {
-    await this.pool.query(`DELETE FROM item_stock_locations WHERE item_id = $1`, [itemId]);
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(`DELETE FROM item_stock_locations WHERE item_id = $1`, [itemId]);
+    });
   }
 
   async getItemDocumentsForPeriod(itemId: string, startDate: string, endDate: string, contextId: number): Promise<ItemDocumentRow[]> {
@@ -601,11 +1108,20 @@ export class PostgresCacheService implements CacheService {
   }
 
   async setCacheState(state: CacheState): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [JSON.stringify(state)]
-    );
+    await this.withVerifiedWrite(async (client) => {
+      const persistedResult = await client.query<{ value: string }>(
+        `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`,
+      );
+      const persisted = this.parseCacheState(persistedResult.rows[0]?.value);
+      if (state.schemaVersion === CACHE_SCHEMA_VERSION && persisted?.schemaVersion !== CACHE_SCHEMA_VERSION) {
+        await client.query(`DELETE FROM cache_meta WHERE key = $1`, [CATEGORY_GENERATION_META_KEY]);
+      }
+      await client.query(
+        `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [JSON.stringify(state)],
+      );
+    });
   }
 
   async getSyncStatus(): Promise<CacheSyncStatus | null> {
@@ -614,11 +1130,13 @@ export class PostgresCacheService implements CacheService {
   }
 
   async setSyncStatus(status: CacheSyncStatus): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO cache_meta (key, value) VALUES ('sync_status', $1)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [JSON.stringify(status)]
-    );
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(
+        `INSERT INTO cache_meta (key, value) VALUES ('sync_status', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [JSON.stringify(status)],
+      );
+    });
   }
 
   async getPaymentSyncStatus(): Promise<PaymentSyncStatus | null> {
@@ -627,14 +1145,18 @@ export class PostgresCacheService implements CacheService {
   }
 
   async setPaymentSyncStatus(status: PaymentSyncStatus): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO cache_meta (key, value) VALUES ($1, $2)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [PAYMENT_SYNC_STATUS_KEY, JSON.stringify(status)],
-    );
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(
+        `INSERT INTO cache_meta (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [PAYMENT_SYNC_STATUS_KEY, JSON.stringify(status)],
+      );
+    });
   }
 
-  async tryAcquireSyncLock(lockKey: string): Promise<boolean> {
+  async tryAcquireSyncLock(_lockKey: string): Promise<boolean> {
+    const binding = this.requireExpectedBinding();
+    const lockKey = this.syncLockKey(binding);
     if (this.syncLockClients.has(lockKey)) return false;
     const client = await this.pool.connect();
     try {
@@ -646,15 +1168,19 @@ export class PostgresCacheService implements CacheService {
         client.release();
         return false;
       }
+      this.assertMatchingBinding(await this.readBinding(client, false), binding);
       this.syncLockClients.set(lockKey, client);
       return true;
     } catch (error) {
+      await client.query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]).catch(() => undefined);
       client.release();
       throw error;
     }
   }
 
-  async releaseSyncLock(lockKey: string): Promise<void> {
+  async releaseSyncLock(_lockKey: string): Promise<void> {
+    const binding = this.requireExpectedBinding();
+    const lockKey = this.syncLockKey(binding);
     const client = this.syncLockClients.get(lockKey);
     if (!client) return;
     try {
@@ -706,7 +1232,254 @@ export class PostgresCacheService implements CacheService {
   }
 
   async truncateAll(): Promise<void> {
-    await this.pool.query(`TRUNCATE TABLE payment_transactions, item_stock_locations, item_documents, items, documents, accounts, cache_meta RESTART IDENTITY CASCADE`);
+    await this.withVerifiedWrite(async (client) => {
+      await client.query(`
+        TRUNCATE TABLE payment_transactions, item_stock_locations, item_documents,
+          items, documents, accounts, categories, category_cache_meta, cache_meta
+          RESTART IDENTITY CASCADE
+      `);
+    });
+  }
+
+  private async withDatabaseTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await this.acquireDatabaseWriteLock(client);
+      const result = await run(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async withVerifiedWrite<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+    const binding = this.requireExpectedBinding();
+    return this.withDatabaseTransaction(async (client) => {
+      this.assertMatchingBinding(await this.readBinding(client, true), binding);
+      return run(client);
+    });
+  }
+
+  private async acquireDatabaseWriteLock(client: PoolClient): Promise<void> {
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [DB_WRITE_LOCK_KEY]);
+  }
+
+  private requireExpectedBinding(): CacheAccountBinding {
+    if (!this.expectedBinding) {
+      throw new Error(
+        'PostgreSQL cache writes require an explicit SalesBinder account binding. '
+        + 'Call ensureAccountBinding with the configured subdomain before writing.'
+      );
+    }
+    return this.expectedBinding;
+  }
+
+  private syncLockKey(binding: CacheAccountBinding): string {
+    return `salesbinder-cache-sync:${binding.accountIdentity}`;
+  }
+
+  private async readBinding(
+    executor: QueryExecutor,
+    forUpdate: boolean,
+  ): Promise<CacheAccountBinding | null> {
+    const result = await executor.query<{
+      account_identity: string;
+      account_subdomain: string;
+      created_at: string | number;
+    }>(`
+      SELECT account_identity, account_subdomain, created_at
+      FROM cache_account_binding
+      WHERE id = 1${forUpdate ? ' FOR UPDATE' : ''}
+    `);
+    const row = result.rows[0];
+    return row ? {
+      accountIdentity: row.account_identity,
+      accountSubdomain: row.account_subdomain,
+      createdAt: Number(row.created_at),
+    } : null;
+  }
+
+  private async databaseContainsPayloadRows(executor: QueryExecutor): Promise<boolean> {
+    const payloadTables = [
+      'accounts', 'documents', 'item_documents', 'items', 'item_stock_locations',
+      'payment_transactions', 'categories', 'category_cache_meta', 'cache_meta',
+    ] as const;
+    for (const table of payloadTables) {
+      const relation = await executor.query<{ relation: string | null }>(
+        `SELECT to_regclass($1)::TEXT AS relation`,
+        [table],
+      );
+      if (!relation.rows[0]?.relation) continue;
+      const populated = await executor.query<{ populated: boolean }>(
+        `SELECT EXISTS (SELECT 1 FROM ${table} LIMIT 1) AS populated`,
+      );
+      if (populated.rows[0]?.populated === true) return true;
+    }
+    return false;
+  }
+
+  private assertMatchingBinding(
+    persisted: CacheAccountBinding | null,
+    expected: CacheAccountBinding,
+  ): void {
+    if (
+      !persisted
+      || persisted.accountIdentity !== expected.accountIdentity
+      || persisted.accountSubdomain !== expected.accountSubdomain
+    ) {
+      throw new Error(
+        `PostgreSQL cache database is not bound to ${expected.accountIdentity}. `
+        + 'Use the matching database or rebuild a fresh database for this SalesBinder account.'
+      );
+    }
+  }
+
+  private async readAuthoritativeCategoryMeta(
+    executor: QueryExecutor,
+  ): Promise<CategoryCacheMeta | null> {
+    const result = await executor.query<{
+      snapshot_value: string;
+      marker_value: string | null;
+      state_value: string | null;
+      account_identity: string;
+      account_subdomain: string;
+    }>(`
+      SELECT snapshot.value AS snapshot_value,
+             marker.value AS marker_value,
+             state.value AS state_value,
+             binding.account_identity,
+             binding.account_subdomain
+      FROM category_cache_meta AS snapshot
+      JOIN cache_account_binding AS binding ON binding.id = 1
+      LEFT JOIN cache_meta AS marker ON marker.key = $2
+      LEFT JOIN cache_meta AS state ON state.key = 'state'
+      WHERE snapshot.key = $1
+    `, [CATEGORY_SNAPSHOT_META_KEY, CATEGORY_GENERATION_META_KEY]);
+    const row = result.rows[0];
+    if (!row) return null;
+
+    const meta = this.parseCategoryMeta(row.snapshot_value);
+    const state = this.parseCacheState(row.state_value);
+    if (
+      !meta
+      || state?.schemaVersion !== CACHE_SCHEMA_VERSION
+      || row.marker_value !== meta.generation
+      || row.account_identity !== meta.accountIdentity
+      || (this.expectedBinding && row.account_identity !== this.expectedBinding.accountIdentity)
+    ) {
+      return null;
+    }
+    return meta;
+  }
+
+  private parseCacheState(value: string | null | undefined): CacheState | null {
+    if (!value) return null;
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (!parsed || typeof parsed !== 'object') return null;
+      const state = parsed as Partial<CacheState>;
+      return Number.isSafeInteger(state.schemaVersion) ? state as CacheState : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private parseCategoryMeta(value: string): CategoryCacheMeta | null {
+    try {
+      const parsed = JSON.parse(value) as Partial<CategoryCacheMeta>;
+      const exactKeys = [
+        'accountIdentity', 'completedAt', 'count', 'fingerprint', 'generation', 'page',
+        'pages', 'schemaVersion', 'sourceRowCount', 'startedAt', 'status',
+        'storedRowCount', 'version',
+      ];
+      const integerFields = [
+        parsed.startedAt, parsed.completedAt, parsed.count, parsed.page, parsed.pages,
+        parsed.sourceRowCount, parsed.storedRowCount,
+      ];
+      if (
+        !parsed || typeof parsed !== 'object'
+        || !this.hasExactKeys(parsed, exactKeys)
+        || parsed.version !== 1
+        || parsed.status !== 'complete'
+        || parsed.schemaVersion !== CACHE_SCHEMA_VERSION
+        || typeof parsed.accountIdentity !== 'string'
+        || typeof parsed.generation !== 'string' || parsed.generation.length === 0
+        || typeof parsed.fingerprint !== 'string' || parsed.fingerprint.length === 0
+        || integerFields.some((number) => !Number.isSafeInteger(number) || (number as number) < 0)
+        || (parsed.completedAt as number) < (parsed.startedAt as number)
+      ) {
+        return null;
+      }
+      return parsed as CategoryCacheMeta;
+    } catch {
+      return null;
+    }
+  }
+
+  private assertValidCategorySnapshot(snapshot: CategorySnapshot, accountIdentity: string): void {
+    const meta = this.parseCategoryMeta(JSON.stringify(snapshot.meta));
+    if (
+      !meta
+      || meta.accountIdentity !== accountIdentity
+      || meta.sourceRowCount !== snapshot.rows.length
+      || meta.storedRowCount !== snapshot.rows.length
+      || meta.count !== snapshot.rows.length
+    ) {
+      throw new Error('Category snapshot metadata does not match the bound account or validated rows.');
+    }
+    const expectedRowKeys = [
+      'cache_source', 'category_id', 'created', 'imported_at', 'item_count',
+      'modified', 'name', 'parent_id', 'parent_name',
+    ];
+    const ids = new Set<string>();
+    const names = new Map<string, string>();
+    for (const row of snapshot.rows) {
+      if (
+        !row || typeof row !== 'object'
+        || !this.hasExactKeys(row, expectedRowKeys)
+        || typeof row.category_id !== 'string'
+        || typeof row.name !== 'string'
+        || !row.category_id.trim()
+        || !row.name.trim()
+        || row.category_id.includes('\0')
+        || row.name.includes('\0')
+        || ids.has(row.category_id)
+        || row.cache_source !== 'api'
+        || !Number.isSafeInteger(row.imported_at) || row.imported_at < 0
+        || (row.item_count !== null
+          && (!Number.isSafeInteger(row.item_count) || row.item_count < 0))
+        || (row.parent_id !== null
+          && (typeof row.parent_id !== 'string' || row.parent_id.trim().length === 0
+            || row.parent_id.includes('\0')))
+        || (row.parent_name !== null
+          && (typeof row.parent_name !== 'string' || row.parent_name.trim().length === 0
+            || row.parent_name.includes('\0')))
+        || (row.created !== null
+          && (typeof row.created !== 'string' || row.created.includes('\0')))
+        || (row.modified !== null
+          && (!Number.isSafeInteger(row.modified) || row.modified < 0))
+      ) {
+        throw new Error('Category snapshot contains an invalid or duplicate category row.');
+      }
+      ids.add(row.category_id);
+      names.set(row.category_id, row.name);
+    }
+    for (const row of snapshot.rows) {
+      const expectedParentName = row.parent_id ? names.get(row.parent_id) ?? null : null;
+      if (row.parent_name !== expectedParentName) {
+        throw new Error('Category snapshot parent names must be derived from the same validated snapshot.');
+      }
+    }
+  }
+
+  private hasExactKeys(value: object, keys: string[]): boolean {
+    const actual = Object.keys(value).sort();
+    return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
   }
 
   private async count(sql: string, params: unknown[] = []): Promise<number> {
@@ -742,22 +1515,14 @@ export class PostgresCacheService implements CacheService {
     return value.replaceAll('\u0000', '');
   }
 
-  private async batch<T>(rows: T[], run: (row: T) => Promise<unknown>): Promise<void> {
+  private async batch<T>(
+    rows: T[],
+    run: (client: PoolClient, row: T) => Promise<unknown>,
+  ): Promise<void> {
     if (rows.length === 0) return;
-    const client = await this.pool.connect();
-    const oldPool = this.pool;
-    try {
-      await client.query('BEGIN');
-      this.pool = client as any;
-      for (const row of rows) await run(row);
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      this.pool = oldPool;
-      client.release();
-    }
+    await this.withVerifiedWrite(async (client) => {
+      for (const row of rows) await run(client, row);
+    });
   }
 
   private normalizeDocument(doc: DocumentRow): Record<string, unknown> {
@@ -774,16 +1539,19 @@ export class PostgresCacheService implements CacheService {
     };
   }
 
-  private async normalizeDocumentForWrite(doc: DocumentRow): Promise<Record<string, unknown>> {
+  private async normalizeDocumentForWrite(
+    doc: DocumentRow,
+    executor: QueryExecutor,
+  ): Promise<Record<string, unknown>> {
     let existing: { doc_id: string } | undefined;
     if (doc.api_doc_id) {
-      existing = (await this.pool.query<{ doc_id: string }>(
+      existing = (await executor.query<{ doc_id: string }>(
         `SELECT doc_id FROM documents WHERE api_doc_id = $1`,
         [doc.api_doc_id]
       )).rows[0];
     }
     if (!existing) {
-      existing = (await this.pool.query<{ doc_id: string }>(
+      existing = (await executor.query<{ doc_id: string }>(
         `SELECT doc_id FROM documents WHERE context_id = $1 AND doc_number = $2`,
         [doc.context_id, doc.doc_number]
       )).rows[0];
@@ -869,6 +1637,15 @@ export class PostgresCacheService implements CacheService {
       price: row.price == null ? null : Number(row.price),
       cost: row.cost == null ? null : Number(row.cost),
       valuation: row.valuation == null ? null : Number(row.valuation),
+    };
+  }
+
+  private coerceCategory(row: CategoryCacheRow): CategoryCacheRow {
+    return {
+      ...row,
+      item_count: row.item_count == null ? null : Number(row.item_count),
+      modified: row.modified == null ? null : Number(row.modified),
+      imported_at: Number(row.imported_at),
     };
   }
 

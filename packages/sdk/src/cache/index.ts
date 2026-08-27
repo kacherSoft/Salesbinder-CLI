@@ -14,6 +14,8 @@ export { DocumentIndexerService } from './document-indexer.service.js';
 export { PaymentSyncService } from './payment-sync.service.js';
 export { AccountIndexerService } from './account-indexer.service.js';
 export { ItemIndexerService } from './item-indexer.service.js';
+export { CategoryIndexerService } from './category-indexer.service.js';
+export type { CategorySyncResult } from './category-indexer.service.js';
 export { DeletedLogSyncService } from './deleted-log-sync.service.js';
 export { CacheAnalyticsService } from './cache-analytics.service.js';
 export { CsvCacheImportService } from './csv-cache-import.service.js';

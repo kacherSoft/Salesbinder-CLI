@@ -21,6 +21,12 @@ function snapshot(overrides: Partial<ResumeCacheSnapshot> = {}): ResumeCacheSnap
     accountName: ACCOUNT,
     schemaVersion: SCHEMA_VERSION,
     accountCount: 10,
+    categoryCount: 5,
+    categoryStatus: 'complete',
+    categoryCompletedAt: 150,
+    categorySchemaVersion: 6,
+    categoryGeneration: 'generation-a',
+    categoryFingerprint: 'sha256:category-a',
     documentCount: 20,
     itemDocumentCount: 30,
     paymentTransactionCount: 35,
@@ -129,7 +135,7 @@ describe('FullResumeCheckpointStore', () => {
   });
 
   it.each([
-    ['version', 'version', 1],
+    ['version', 'version', 2],
     ['account', 'accountName', 'another-account'],
     ['schema', 'schemaVersion', 99],
     ['cache identity', 'cacheIdentity', 'sqlite:another-cache'],
@@ -170,16 +176,30 @@ describe('FullResumeCheckpointStore', () => {
     const checkpoint = store.loadOrCreate();
     const completedSnapshot = snapshot({ paymentTransactionCount: 5 });
     completePhase(store, checkpoint, 'accounts', completedSnapshot);
+    completePhase(store, checkpoint, 'categories', completedSnapshot);
     completePhase(store, checkpoint, 'documents', completedSnapshot);
 
     expect(() => store.validateCompletedPhases(checkpoint, snapshot({ paymentTransactionCount: 6 })))
       .toThrow(/documents.*reset-checkpoint/i);
   });
 
+  it('rejects category resume when same-count category content changes', () => {
+    const store = createStore();
+    const checkpoint = store.loadOrCreate();
+    completePhase(store, checkpoint, 'accounts');
+    completePhase(store, checkpoint, 'categories');
+
+    expect(() => store.validateCompletedPhases(checkpoint, snapshot({
+      categoryGeneration: 'generation-b',
+      categoryFingerprint: 'sha256:category-b',
+    }))).toThrow(/categories.*reset-checkpoint/i);
+  });
+
   it('rejects document resume after payment sync metadata changes with the same count', () => {
     const store = createStore();
     const checkpoint = store.loadOrCreate();
     completePhase(store, checkpoint, 'accounts');
+    completePhase(store, checkpoint, 'categories');
     completePhase(store, checkpoint, 'documents');
 
     expect(() => store.validateCompletedPhases(checkpoint, snapshot({
@@ -192,6 +212,7 @@ describe('FullResumeCheckpointStore', () => {
     const store = createStore();
     const checkpoint = store.loadOrCreate();
     completePhase(store, checkpoint, 'accounts');
+    completePhase(store, checkpoint, 'categories');
     completePhase(store, checkpoint, 'documents');
     completePhase(store, checkpoint, 'items');
     store.markPhaseStarted(checkpoint, 'deleted-log');
@@ -208,10 +229,29 @@ describe('FullResumeCheckpointStore', () => {
     }))).not.toThrow();
   });
 
+  it('rejects deleted-log resume when category authority changed', () => {
+    const store = createStore();
+    const checkpoint = store.loadOrCreate();
+    completePhase(store, checkpoint, 'accounts');
+    completePhase(store, checkpoint, 'categories');
+    completePhase(store, checkpoint, 'documents');
+    completePhase(store, checkpoint, 'items');
+    store.markPhaseStarted(checkpoint, 'deleted-log');
+
+    expect(() => store.validateCompletedPhases(checkpoint, snapshot({
+      categoryStatus: 'uninitialized',
+      categoryCompletedAt: null,
+      categorySchemaVersion: null,
+      categoryGeneration: null,
+      categoryFingerprint: null,
+    }))).toThrow(/categories.*reset-checkpoint/i);
+  });
+
   it('validates deleted-log completion against the final cache snapshot', () => {
     const store = createStore();
     const checkpoint = store.loadOrCreate();
     completePhase(store, checkpoint, 'accounts');
+    completePhase(store, checkpoint, 'categories');
     completePhase(store, checkpoint, 'documents');
     completePhase(store, checkpoint, 'items');
     const deletedLogSnapshot = snapshot({

@@ -4,6 +4,10 @@
 
 import type {
   AccountRow,
+  CacheAccountBinding,
+  CategoryCacheMeta,
+  CategoryCacheRow,
+  CategorySnapshot,
   DocumentRow,
   ItemDocumentRow,
   ItemRow,
@@ -19,6 +23,8 @@ import type { PaymentSyncStatus, PaymentTransactionRow } from './payment-sync.ty
 /** Complete PostgreSQL snapshot used to replace the local SQLite read mirror. */
 export interface SQLiteMirrorSnapshot {
   accounts: AccountRow[];
+  /** Null means the source category cache is not authoritative. */
+  categorySnapshot: CategorySnapshot | null;
   items: ItemRow[];
   itemStockLocations: ItemStockLocationRow[];
   documents: DocumentRow[];
@@ -74,6 +80,18 @@ export interface CacheService {
   getAccountsModifiedSince(timestamp: number): Promise<AccountRow[]>;
   batchInsertAccounts(accounts: AccountRow[]): Promise<void>;
   deleteAccount(accountId: string): Promise<void>;
+
+  // ============ Category Snapshot Operations ============
+
+  /** Atomically replace categories, complete metadata, marker, and derived names. */
+  replaceCategorySnapshot(snapshot: CategorySnapshot): Promise<void>;
+  /** Return only an authoritative snapshot; fail closed with null on any authority mismatch. */
+  getCategorySnapshot(): Promise<CategorySnapshot | null>;
+  /** Return only authoritative typed metadata. */
+  getCategoryCacheMeta(): Promise<CategoryCacheMeta | null>;
+  getCategory(categoryId: string): Promise<CategoryCacheRow | undefined>;
+  getAllCategories(): Promise<CategoryCacheRow[]>;
+  getCategoryCount(): Promise<number>;
 
   // ============ Item CRUD Operations ============
 
@@ -166,6 +184,10 @@ export interface CacheService {
 
   tryAcquireSyncLock(lockKey: string): Promise<boolean>;
   releaseSyncLock(lockKey: string): Promise<void>;
+  /** Bind or verify a cache database against one stable SalesBinder account identity. */
+  ensureAccountBinding(binding: CacheAccountBinding): Promise<void>;
+  /** Verify an existing binding without claiming an unbound database. */
+  verifyAccountBinding(binding: CacheAccountBinding): Promise<void>;
 
   // ============ Connection Management ============
 

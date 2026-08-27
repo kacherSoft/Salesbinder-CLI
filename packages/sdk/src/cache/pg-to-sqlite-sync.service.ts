@@ -6,15 +6,25 @@
  * PostgreSQL is the shared source of truth (populated by `cache sync`).
  */
 
-import type { AccountRow, DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
+import type {
+  AccountRow,
+  CacheAccountBinding,
+  DocumentRow,
+  ItemDocumentRow,
+  ItemRow,
+  ItemStockLocationRow,
+} from './types.js';
 import type { PaymentTransactionRow } from './payment-sync.types.js';
 import { PostgresCacheService } from './postgres-cache.service.js';
 import { SQLiteCacheService } from './sqlite-cache.service.js';
+import { loadConfig } from '../config/config.loader.js';
+import { createSalesBinderAccountBinding } from './types.js';
 
 /** Result of a PG → SQLite pull */
 export interface PgPullResult {
   success: boolean;
   accountsPulled: number;
+  categoriesPulled: number;
   documentsPulled: number;
   itemDocumentsPulled: number;
   paymentTransactionsPulled: number;
@@ -35,21 +45,27 @@ export async function pullFromPostgres(
   pgConnectionString: string,
   sqliteAccountName: string,
   sqliteCustomPath?: string,
+  accountBinding?: CacheAccountBinding,
 ): Promise<PgPullResult> {
   const start = Date.now();
+  const resolvedBinding = accountBinding
+    ?? createSalesBinderAccountBinding(loadConfig(sqliteAccountName).subdomain);
   let pg: PostgresCacheService | null = null;
   let sqlite: SQLiteCacheService | null = null;
   let pgLockAcquired = false;
   let sqliteLockAcquired = false;
-  const lockKey = `salesbinder-cache-sync:${sqliteAccountName}`;
+  const lockKey = `salesbinder-cache-sync:${resolvedBinding.accountIdentity}`;
 
   try {
     // Open both connections
     pg = new PostgresCacheService(pgConnectionString);
     await pg.ensureSchema();
+    await pg.verifyAccountBinding(resolvedBinding);
+    await pg.ensureSchema();
     pgLockAcquired = await pg.tryAcquireSyncLock(lockKey);
     if (!pgLockAcquired) throw new Error('Another cache sync is already running for this account.');
     sqlite = new SQLiteCacheService(sqliteAccountName, sqliteCustomPath);
+    await sqlite.verifyAccountBinding(resolvedBinding);
     sqliteLockAcquired = await sqlite.tryAcquireSyncLock(lockKey);
     if (!sqliteLockAcquired) throw new Error('Another local cache writer is already running for this account.');
 
@@ -58,6 +74,7 @@ export async function pullFromPostgres(
     const allItems = await getAllItemDocuments(pg, allDocs);
     const allPayments = await getAllPaymentTransactions(pg);
     const allAccounts = await getAllAccounts(pg);
+    const categorySnapshot = await pg.getCategorySnapshot();
     const allMasterItems = await getAllItems(pg);
     const allStockRows = await getAllStockRows(pg);
     const pgState = await pg.getCacheState();
@@ -66,6 +83,7 @@ export async function pullFromPostgres(
     // Replace data and metadata together so readers see either the old or new mirror.
     await sqlite.replaceMirror({
       accounts: allAccounts,
+      categorySnapshot,
       items: allMasterItems,
       itemStockLocations: allStockRows,
       documents: allDocs,
@@ -81,6 +99,7 @@ export async function pullFromPostgres(
     return {
       success: true,
       accountsPulled: allAccounts.length,
+      categoriesPulled: categorySnapshot?.rows.length ?? 0,
       documentsPulled: allDocs.length,
       itemDocumentsPulled: allItems.length,
       paymentTransactionsPulled: allPayments.length,

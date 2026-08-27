@@ -12,12 +12,18 @@ import { homedir } from 'os';
 import { dirname, join } from 'path';
 
 export type FullResumeSyncTarget = 'sqlite' | 'postgresql';
-export type FullResumePhase = 'accounts' | 'documents' | 'items' | 'deleted-log';
+export type FullResumePhase = 'accounts' | 'categories' | 'documents' | 'items' | 'deleted-log';
 
 export interface ResumeCacheSnapshot {
   accountName: string;
   schemaVersion: number;
   accountCount: number;
+  categoryCount: number;
+  categoryStatus: 'complete' | 'uninitialized';
+  categoryCompletedAt: number | null;
+  categorySchemaVersion: number | null;
+  categoryGeneration: string | null;
+  categoryFingerprint: string | null;
   documentCount: number;
   itemDocumentCount: number;
   paymentTransactionCount: number;
@@ -30,7 +36,7 @@ export interface ResumeCacheSnapshot {
 }
 
 export interface FullResumeCheckpoint {
-  version: 2;
+  version: 3;
   runType: 'full-resume';
   accountName: string;
   syncTarget: FullResumeSyncTarget;
@@ -74,10 +80,11 @@ interface CacheIdentityOptions {
   databaseUrl?: string;
 }
 
-const CHECKPOINT_VERSION = 2;
-const PHASES: FullResumePhase[] = ['accounts', 'documents', 'items', 'deleted-log'];
+const CHECKPOINT_VERSION = 3;
+const PHASES: FullResumePhase[] = ['accounts', 'categories', 'documents', 'items', 'deleted-log'];
 const SNAPSHOT_COUNT_FIELDS: Array<keyof ResumeCacheSnapshot> = [
   'accountCount',
+  'categoryCount',
   'documentCount',
   'itemDocumentCount',
   'paymentTransactionCount',
@@ -86,9 +93,22 @@ const SNAPSHOT_COUNT_FIELDS: Array<keyof ResumeCacheSnapshot> = [
 ];
 const SNAPSHOT_WATERMARK_FIELDS: Array<keyof ResumeCacheSnapshot> = ['lastAccountSync', 'lastItemSync', 'lastDeletedSync'];
 const SNAPSHOT_PAYMENT_FIELDS: Array<keyof ResumeCacheSnapshot> = ['paymentSyncStatusFingerprint'];
-const SNAPSHOT_FIELDS = [...SNAPSHOT_COUNT_FIELDS, ...SNAPSHOT_WATERMARK_FIELDS, ...SNAPSHOT_PAYMENT_FIELDS];
+const SNAPSHOT_CATEGORY_FIELDS: Array<keyof ResumeCacheSnapshot> = [
+  'categoryStatus',
+  'categoryCompletedAt',
+  'categorySchemaVersion',
+  'categoryGeneration',
+  'categoryFingerprint',
+];
+const SNAPSHOT_FIELDS = [
+  ...SNAPSHOT_COUNT_FIELDS,
+  ...SNAPSHOT_WATERMARK_FIELDS,
+  ...SNAPSHOT_PAYMENT_FIELDS,
+  ...SNAPSHOT_CATEGORY_FIELDS,
+];
 const PHASE_FIELDS: Record<FullResumePhase, Array<keyof ResumeCacheSnapshot>> = {
   accounts: ['accountCount', 'lastAccountSync'],
+  categories: ['categoryCount', ...SNAPSHOT_CATEGORY_FIELDS],
   documents: ['documentCount', 'itemDocumentCount', 'paymentTransactionCount', 'paymentSyncStatusFingerprint'],
   items: ['itemCount', 'stockLocationCount', 'lastItemSync'],
   'deleted-log': ['lastDeletedSync'],
@@ -224,7 +244,17 @@ export class FullResumeCheckpointStore {
       this.validatePhaseSnapshot(checkpoint, current, 'deleted-log', SNAPSHOT_FIELDS);
       return;
     }
-    if (checkpoint.phase === 'deleted-log') return;
+    if (checkpoint.phase === 'deleted-log') {
+      if (this.isPhaseComplete(checkpoint, 'categories')) {
+        this.validatePhaseSnapshot(
+          checkpoint,
+          current,
+          'categories',
+          ['categoryCount', ...SNAPSHOT_CATEGORY_FIELDS],
+        );
+      }
+      return;
+    }
     for (const phase of checkpoint.completedPhases) {
       this.validatePhaseSnapshot(checkpoint, current, phase, PHASE_FIELDS[phase]);
     }
@@ -345,6 +375,11 @@ function validSnapshot(value: unknown): value is ResumeCacheSnapshot {
   if (!isRecord(value) || typeof value.accountName !== 'string' || !validNonNegativeInteger(value.schemaVersion)) return false;
   return SNAPSHOT_COUNT_FIELDS.every((field) => validNonNegativeInteger(value[field])) &&
     SNAPSHOT_WATERMARK_FIELDS.every((field) => value[field] === null || validNonNegativeInteger(value[field])) &&
+    (value.categoryStatus === 'complete' || value.categoryStatus === 'uninitialized') &&
+    (value.categoryCompletedAt === null || validNonNegativeInteger(value.categoryCompletedAt)) &&
+    (value.categorySchemaVersion === null || validNonNegativeInteger(value.categorySchemaVersion)) &&
+    (value.categoryGeneration === null || typeof value.categoryGeneration === 'string') &&
+    (value.categoryFingerprint === null || typeof value.categoryFingerprint === 'string') &&
     (value.paymentSyncStatusFingerprint === null ||
       (typeof value.paymentSyncStatusFingerprint === 'string' && /^[a-f0-9]{64}$/.test(value.paymentSyncStatusFingerprint)));
 }

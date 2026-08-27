@@ -124,6 +124,7 @@ describe('full sync resume indexers', () => {
     const checkpoints: Array<{ page: number; itemIndex: number }> = [];
     const cache = {
       getCacheState: jest.fn(async () => null),
+      getCategorySnapshot: jest.fn(async () => null),
       insertItem: jest.fn(async (row) => { inserted.push(row.item_id); }),
       replaceItemStockLocations: jest.fn(async (id: string) => { replaced.push(id); }),
       getItemCount: jest.fn(async () => 3),

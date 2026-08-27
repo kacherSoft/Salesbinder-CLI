@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 
 let outerPgLockHeld = false;
+let phaseOrder: string[] = [];
 
 const outerPgService = {
   tryAcquireSyncLock: jest.fn(async () => {
@@ -11,6 +12,7 @@ const outerPgService = {
     outerPgLockHeld = false;
   }),
   close: jest.fn(async () => undefined),
+  ensureAccountBinding: jest.fn(async () => undefined),
   setSyncStatus: jest.fn(async () => undefined),
   getSyncStatus: jest.fn(async () => null),
   getPaymentSyncStatus: jest.fn(async () => null),
@@ -20,12 +22,15 @@ const outerPgService = {
   getDocumentCount: jest.fn(async () => 0),
   getItemDocumentCount: jest.fn(async () => 0),
   getItemCount: jest.fn(async () => 0),
+  getCategoryCount: jest.fn(async () => 0),
+  getCategoryCacheMeta: jest.fn(async () => null),
   getStockLocationCount: jest.fn(async () => 0),
 };
 
 const pullFromPostgres = jest.fn<Promise<{
   success: boolean;
   accountsPulled: number;
+  categoriesPulled: number;
   documentsPulled: number;
   itemDocumentsPulled: number;
   paymentTransactionsPulled: number;
@@ -36,12 +41,14 @@ const pullFromPostgres = jest.fn<Promise<{
 
 class SuccessfulAccountIndexer {
   async sync() {
+    phaseOrder.push('accounts');
     return { accountsProcessed: 0, customersProcessed: 0, suppliersProcessed: 0 };
   }
 }
 
 class SuccessfulDocumentIndexer {
   async sync() {
+    phaseOrder.push('documents');
     return {
       success: true,
       type: 'delta' as const,
@@ -54,14 +61,23 @@ class SuccessfulDocumentIndexer {
   }
 }
 
+class SuccessfulCategoryIndexer {
+  async sync() {
+    phaseOrder.push('categories');
+    return { categoriesProcessed: 0, snapshot: null };
+  }
+}
+
 class SuccessfulItemIndexer {
   async sync() {
+    phaseOrder.push('items');
     return { itemsProcessed: 0, stockRowsProcessed: 0 };
   }
 }
 
 class SuccessfulDeletedLogSync {
   async sync() {
+    phaseOrder.push('deleted-log');
     return { deletedRecordsProcessed: 0 };
   }
 }
@@ -71,6 +87,7 @@ let registerCacheCommands: typeof import('./cache.commands.js').registerCacheCom
 jest.mock('@salesbinder/sdk', () => ({
   SalesBinderClient: class {},
   AccountIndexerService: SuccessfulAccountIndexer,
+  CategoryIndexerService: SuccessfulCategoryIndexer,
   DocumentIndexerService: SuccessfulDocumentIndexer,
   ItemIndexerService: SuccessfulItemIndexer,
   DeletedLogSyncService: SuccessfulDeletedLogSync,
@@ -78,6 +95,11 @@ jest.mock('@salesbinder/sdk', () => ({
   createPostgresCacheService: jest.fn(async () => outerPgService),
   pullFromPostgres,
   loadPreferences: jest.fn(() => ({})),
+  loadConfig: jest.fn(() => ({ subdomain: 'example' })),
+  createSalesBinderAccountBinding: jest.fn(() => ({
+    accountIdentity: 'salesbinder:example',
+    accountSubdomain: 'example',
+  })),
   CACHE_SCHEMA_VERSION: 7,
 }), { virtual: true });
 
@@ -85,6 +107,7 @@ function successfulPullResult() {
   return {
     success: true,
     accountsPulled: 0,
+    categoriesPulled: 0,
     documentsPulled: 0,
     itemDocumentsPulled: 0,
     paymentTransactionsPulled: 0,
@@ -113,6 +136,7 @@ describe('cache sync --pull lock ordering', () => {
     process.env.SALESBINDER_DB_URL = 'postgres://example.test/salesbinder';
     process.exitCode = undefined;
     outerPgLockHeld = false;
+    phaseOrder = [];
     jest.clearAllMocks();
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -137,6 +161,7 @@ describe('cache sync --pull lock ordering', () => {
     await runExplicitPull();
 
     expect(pullFromPostgres).toHaveBeenCalledTimes(1);
+    expect(phaseOrder).toEqual(['accounts', 'categories', 'documents', 'items', 'deleted-log']);
     expect(outerPgService.releaseSyncLock).toHaveBeenCalledTimes(1);
     expect(outerPgService.close).toHaveBeenCalledTimes(1);
     expect(process.exitCode).toBeUndefined();

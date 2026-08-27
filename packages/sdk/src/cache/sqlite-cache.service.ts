@@ -11,9 +11,13 @@ import { homedir } from 'os';
 import type { CacheService, SQLiteMirrorSnapshot } from './cache.interface.js';
 import type {
   AccountRow,
+  CacheAccountBinding,
   CacheMetaRow,
   CacheState,
   CacheSyncStatus,
+  CategoryCacheMeta,
+  CategoryCacheRow,
+  CategorySnapshot,
   CustomerSalesData,
   DocumentRow,
   ItemDocumentRow,
@@ -22,7 +26,11 @@ import type {
   ItemStockLocationRow,
   PriceDistributionRow,
 } from './types.js';
-import { CACHE_SCHEMA_VERSION } from './types.js';
+import {
+  CACHE_SCHEMA_VERSION,
+  CATEGORY_GENERATION_META_KEY,
+  CATEGORY_SNAPSHOT_META_KEY,
+} from './types.js';
 import { PAYMENT_SYNC_STATUS_KEY, PAYMENT_TRANSACTION_COLUMNS } from './payment-cache.constants.js';
 import type { PaymentSyncStatus, PaymentTransactionRow } from './payment-sync.types.js';
 import {
@@ -54,6 +62,11 @@ const ACCOUNT_COLUMNS = [
   'shipping_address_2', 'shipping_city', 'shipping_region', 'shipping_postal_code',
   'shipping_country', 'vat_number', 'account_manager', 'label_name', 'archived',
   'last_invoiced', 'created', 'modified', 'cache_source', 'imported_at',
+] as const;
+
+const CATEGORY_COLUMNS = [
+  'category_id', 'name', 'item_count', 'parent_id', 'parent_name',
+  'created', 'modified', 'cache_source', 'imported_at',
 ] as const;
 
 const ITEM_COLUMNS = [
@@ -276,6 +289,23 @@ export class SQLiteCacheService implements CacheService {
         FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS categories (
+        category_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        item_count INTEGER NULL,
+        parent_id TEXT NULL,
+        parent_name TEXT NULL,
+        created TEXT NULL,
+        modified INTEGER NULL,
+        cache_source TEXT NOT NULL DEFAULT 'api',
+        imported_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS category_cache_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS cache_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -406,6 +436,8 @@ export class SQLiteCacheService implements CacheService {
       CREATE INDEX IF NOT EXISTS idx_items_archived ON items(archived);
       CREATE INDEX IF NOT EXISTS idx_stock_item ON item_stock_locations(item_id);
       CREATE INDEX IF NOT EXISTS idx_stock_location ON item_stock_locations(location_id);
+      CREATE INDEX IF NOT EXISTS idx_categories_name ON categories(name);
+      CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON categories(parent_id);
     `);
   }
 
@@ -603,6 +635,45 @@ export class SQLiteCacheService implements CacheService {
     return Promise.resolve();
   }
 
+  replaceCategorySnapshot(snapshot: CategorySnapshot): Promise<void> {
+    this.assertCategorySnapshot(snapshot);
+    const tx = this.db.transaction(() => this.replaceCategorySnapshotInTransaction(snapshot));
+    tx.immediate();
+    return Promise.resolve();
+  }
+
+  getCategorySnapshot(): Promise<CategorySnapshot | null> {
+    const read = this.db.transaction(() => {
+      const meta = this.readAuthoritativeCategoryMeta();
+      if (!meta) return null;
+      const rows = this.getAllCategoryRows();
+      return rows.length === meta.storedRowCount ? { rows, meta } : null;
+    });
+    return Promise.resolve(read.deferred());
+  }
+
+  getCategoryCacheMeta(): Promise<CategoryCacheMeta | null> {
+    const read = this.db.transaction(() => this.readAuthoritativeCategoryMeta());
+    return Promise.resolve(read.deferred());
+  }
+
+  getCategory(categoryId: string): Promise<CategoryCacheRow | undefined> {
+    const read = this.db.transaction(() => this.readAuthoritativeCategoryMeta()
+      ? this.db.prepare('SELECT * FROM categories WHERE category_id = ?').get(categoryId) as CategoryCacheRow | undefined
+      : undefined);
+    return Promise.resolve(read.deferred());
+  }
+
+  getAllCategories(): Promise<CategoryCacheRow[]> {
+    const read = this.db.transaction(() => this.readAuthoritativeCategoryMeta() ? this.getAllCategoryRows() : []);
+    return Promise.resolve(read.deferred());
+  }
+
+  getCategoryCount(): Promise<number> {
+    const read = this.db.transaction(() => this.readAuthoritativeCategoryMeta() ? this.count('categories') : 0);
+    return Promise.resolve(read.deferred());
+  }
+
   insertItem(item: ItemRow): Promise<void> {
     this.db.prepare(this.upsertSql('items', ITEM_COLUMNS, 'item_id')).run(...this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)));
     return Promise.resolve();
@@ -756,12 +827,12 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getCacheState(): Promise<CacheState | null> {
-    const row = this.db.prepare(`SELECT value FROM cache_meta WHERE key = 'state'`).get() as CacheMetaRow | undefined;
-    return Promise.resolve(row ? JSON.parse(row.value) as CacheState : null);
+    return Promise.resolve(this.readCacheState());
   }
 
   setCacheState(state: CacheState): Promise<void> {
-    this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`).run(JSON.stringify(state));
+    const tx = this.db.transaction(() => this.setCacheStateInTransaction(state));
+    tx.immediate();
     return Promise.resolve();
   }
 
@@ -812,34 +883,29 @@ export class SQLiteCacheService implements CacheService {
   }
 
   clearAll(): Promise<void> {
-    this.db.exec(`
-      DELETE FROM payment_transactions;
-      DELETE FROM item_stock_locations;
-      DELETE FROM item_documents;
-      DELETE FROM items;
-      DELETE FROM documents;
-      DELETE FROM accounts;
-      DELETE FROM cache_meta;
-    `);
+    const tx = this.db.transaction(() => this.clearAllInTransaction());
+    tx.immediate();
     return Promise.resolve();
   }
 
   /** Replace the complete local mirror without exposing a partially-written snapshot. */
   replaceMirror(snapshot: SQLiteMirrorSnapshot): Promise<void> {
     assertUniquePaymentTransactionIds(snapshot.paymentTransactions);
+    if (snapshot.categorySnapshot) this.assertCategorySnapshot(snapshot.categorySnapshot);
     const tx = this.db.transaction(() => {
-      void this.clearAll();
+      this.clearAllInTransaction();
       void this.batchInsertAccounts(snapshot.accounts);
       void this.batchInsertItems(snapshot.items);
       void this.batchInsertItemStockLocations(snapshot.itemStockLocations);
       void this.batchInsertDocuments(snapshot.documents);
       void this.batchInsertItemDocuments(snapshot.itemDocuments);
       void this.batchInsertPaymentTransactions(snapshot.paymentTransactions);
-      if (snapshot.cacheState) void this.setCacheState(snapshot.cacheState);
+      if (snapshot.cacheState) this.setCacheStateInTransaction(snapshot.cacheState);
+      if (snapshot.categorySnapshot) this.replaceCategorySnapshotInTransaction(snapshot.categorySnapshot);
       if (snapshot.paymentSyncStatus) void this.setPaymentSyncStatus(snapshot.paymentSyncStatus);
       this.setRawMeta('pg_pull_timestamp', String(snapshot.pulledAt));
     });
-    tx();
+    tx.immediate();
     return Promise.resolve();
   }
 
@@ -889,6 +955,16 @@ export class SQLiteCacheService implements CacheService {
     }
   }
 
+  ensureAccountBinding(_binding: CacheAccountBinding): Promise<void> {
+    // SQLite files are already isolated by the configured local account name.
+    // Durable database-global binding is required only for shared PostgreSQL caches.
+    return Promise.resolve();
+  }
+
+  verifyAccountBinding(_binding: CacheAccountBinding): Promise<void> {
+    return Promise.resolve();
+  }
+
   private removeStaleSyncLock(path: string): boolean {
     try {
       const data = JSON.parse(readFileSync(path, 'utf8')) as { pid?: unknown };
@@ -908,6 +984,135 @@ export class SQLiteCacheService implements CacheService {
 
   isOpen(): boolean {
     return this.db && this.db.open;
+  }
+
+  private replaceCategorySnapshotInTransaction(snapshot: CategorySnapshot): void {
+    const insert = this.db.prepare(
+      `INSERT INTO categories (${CATEGORY_COLUMNS.join(', ')}) VALUES (${CATEGORY_COLUMNS.map(() => '?').join(', ')})`,
+    );
+    this.db.prepare('DELETE FROM categories').run();
+    for (const row of snapshot.rows) insert.run(...this.valuesFor(CATEGORY_COLUMNS, row as unknown as Record<string, unknown>));
+
+    this.db.prepare('DELETE FROM category_cache_meta').run();
+    this.db.prepare('INSERT INTO category_cache_meta (key, value) VALUES (?, ?)')
+      .run(CATEGORY_SNAPSHOT_META_KEY, JSON.stringify(snapshot.meta));
+
+    const currentState = this.readCacheState();
+    const state: CacheState = {
+      ...(currentState ?? {
+        lastSync: 0,
+        lastFullSync: 0,
+        documentCount: this.count('documents'),
+        itemDocumentCount: this.count('item_documents'),
+        accountName: this.accountName,
+      }),
+      schemaVersion: CACHE_SCHEMA_VERSION,
+      categoryCount: snapshot.rows.length,
+      lastCategorySync: snapshot.meta.completedAt,
+    };
+    this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`).run(JSON.stringify(state));
+    this.db.prepare('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)')
+      .run(CATEGORY_GENERATION_META_KEY, snapshot.meta.generation);
+
+    this.db.exec(`
+      UPDATE items
+      SET category_name = (
+        SELECT categories.name FROM categories WHERE categories.category_id = items.category_id
+      )
+      WHERE category_id IS NOT NULL;
+
+      UPDATE item_stock_locations
+      SET category_name = (
+        SELECT categories.name
+        FROM items
+        LEFT JOIN categories ON categories.category_id = items.category_id
+        WHERE items.item_id = item_stock_locations.item_id
+      )
+      WHERE EXISTS (
+        SELECT 1 FROM items
+        WHERE items.item_id = item_stock_locations.item_id
+          AND items.category_id IS NOT NULL
+      );
+    `);
+  }
+
+  private readAuthoritativeCategoryMeta(): CategoryCacheMeta | null {
+    const state = this.readCacheState();
+    if (state?.schemaVersion !== CACHE_SCHEMA_VERSION) return null;
+    const marker = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+      .get(CATEGORY_GENERATION_META_KEY) as CacheMetaRow | undefined;
+    const row = this.db.prepare('SELECT value FROM category_cache_meta WHERE key = ?')
+      .get(CATEGORY_SNAPSHOT_META_KEY) as CacheMetaRow | undefined;
+    if (!marker || !row) return null;
+    try {
+      const meta = JSON.parse(row.value) as unknown;
+      if (!isCategoryCacheMeta(meta) || meta.generation !== marker.value) return null;
+      if (meta.storedRowCount !== this.count('categories')) return null;
+      return meta;
+    } catch {
+      return null;
+    }
+  }
+
+  private getAllCategoryRows(): CategoryCacheRow[] {
+    return this.db.prepare('SELECT * FROM categories ORDER BY category_id ASC').all() as CategoryCacheRow[];
+  }
+
+  private assertCategorySnapshot(snapshot: CategorySnapshot): void {
+    if (!snapshot || !Array.isArray(snapshot.rows) || !isCategoryCacheMeta(snapshot.meta)) {
+      throw new Error('Category snapshot is incomplete or invalid.');
+    }
+    if (
+      snapshot.meta.count !== snapshot.rows.length
+      || snapshot.meta.sourceRowCount !== snapshot.rows.length
+      || snapshot.meta.storedRowCount !== snapshot.rows.length
+    ) {
+      throw new Error('Category snapshot metadata counts do not match its rows.');
+    }
+    const names = new Map<string, string>();
+    for (const row of snapshot.rows) {
+      if (!isCategoryCacheRow(row)) throw new Error('Category snapshot contains an invalid row.');
+      if (names.has(row.category_id)) throw new Error(`Category snapshot contains duplicate ID ${row.category_id}.`);
+      names.set(row.category_id, row.name);
+    }
+    for (const row of snapshot.rows) {
+      const expectedParentName = row.parent_id ? names.get(row.parent_id) ?? null : null;
+      if (row.parent_name !== expectedParentName) {
+        throw new Error(`Category snapshot has an inconsistent parent name for ${row.category_id}.`);
+      }
+    }
+  }
+
+  private readCacheState(): CacheState | null {
+    const row = this.db.prepare(`SELECT value FROM cache_meta WHERE key = 'state'`).get() as CacheMetaRow | undefined;
+    if (!row) return null;
+    try {
+      return JSON.parse(row.value) as CacheState;
+    } catch {
+      return null;
+    }
+  }
+
+  private setCacheStateInTransaction(state: CacheState): void {
+    const persistedState = this.readCacheState();
+    if (state.schemaVersion === CACHE_SCHEMA_VERSION && persistedState?.schemaVersion !== CACHE_SCHEMA_VERSION) {
+      this.db.prepare('DELETE FROM cache_meta WHERE key = ?').run(CATEGORY_GENERATION_META_KEY);
+    }
+    this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`).run(JSON.stringify(state));
+  }
+
+  private clearAllInTransaction(): void {
+    this.db.exec(`
+      DELETE FROM payment_transactions;
+      DELETE FROM item_stock_locations;
+      DELETE FROM item_documents;
+      DELETE FROM items;
+      DELETE FROM documents;
+      DELETE FROM accounts;
+      DELETE FROM categories;
+      DELETE FROM category_cache_meta;
+      DELETE FROM cache_meta;
+    `);
   }
 
   private count(table: string, where?: string, params: unknown[] = []): number {
@@ -989,6 +1194,64 @@ export class SQLiteCacheService implements CacheService {
 
 const isExistingFileError = (error: unknown) =>
   typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === 'EEXIST';
+
+const isCategoryCacheMeta = (value: unknown): value is CategoryCacheMeta => {
+  if (!isRecord(value)) return false;
+  const exactKeys = [
+    'accountIdentity', 'completedAt', 'count', 'fingerprint', 'generation', 'page',
+    'pages', 'schemaVersion', 'sourceRowCount', 'startedAt', 'status',
+    'storedRowCount', 'version',
+  ];
+  return hasExactKeys(value, exactKeys)
+    && value.version === 1
+    && value.status === 'complete'
+    && isNonEmptyString(value.accountIdentity)
+    && isNonNegativeInteger(value.startedAt)
+    && isNonNegativeInteger(value.completedAt)
+    && value.completedAt >= value.startedAt
+    && isNonNegativeInteger(value.count)
+    && isNonNegativeInteger(value.page)
+    && isNonNegativeInteger(value.pages)
+    && isNonNegativeInteger(value.sourceRowCount)
+    && isNonNegativeInteger(value.storedRowCount)
+    && value.schemaVersion === CACHE_SCHEMA_VERSION
+    && isNonEmptyString(value.generation)
+    && isNonEmptyString(value.fingerprint)
+    && (value.count === 0
+      ? value.page === 1 && (value.pages === 0 || value.pages === 1)
+      : value.pages >= 1 && value.page === value.pages);
+};
+
+const isCategoryCacheRow = (value: unknown): value is CategoryCacheRow => {
+  if (!isRecord(value)) return false;
+  return isNonEmptyString(value.category_id)
+    && isNonEmptyString(value.name)
+    && (value.item_count === null || isNonNegativeInteger(value.item_count))
+    && (value.parent_id === null || isNonEmptyString(value.parent_id))
+    && (value.parent_name === null || isNonEmptyString(value.parent_name))
+    && (value.created === null || isTextWithoutNullByte(value.created))
+    && (value.modified === null || isNonNegativeInteger(value.modified))
+    && value.cache_source === 'api'
+    && isNonNegativeInteger(value.imported_at);
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean => {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+};
+
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === 'string' && value.trim().length > 0 && !value.includes('\0');
+
+const isTextWithoutNullByte = (value: unknown): value is string =>
+  typeof value === 'string' && !value.includes('\0');
+
+const isNonNegativeInteger = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && (value as number) >= 0;
 
 const isProcessAlive = (pid: number) => {
   try {

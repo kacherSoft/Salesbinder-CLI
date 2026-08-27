@@ -152,8 +152,71 @@ export interface CacheMetaRow {
   value: string;
 }
 
+/** Category cache v6 metadata keys shared by both cache backends. */
+export const CATEGORY_SNAPSHOT_META_KEY = 'category_cache.v6.snapshot';
+export const CATEGORY_GENERATION_META_KEY = 'category_cache.v6.generation';
+
+/** Conservative API bounds used before category pagination allocates or loops. */
+export const MAX_CATEGORY_PAGES = 10_000;
+export const MAX_CATEGORY_COUNT = 1_000_000;
+
+/** Database schema row for cached category master data. */
+export interface CategoryCacheRow {
+  category_id: string;
+  name: string;
+  item_count: number | null;
+  parent_id: string | null;
+  parent_name: string | null;
+  created: string | null;
+  modified: number | null;
+  cache_source: 'api';
+  imported_at: number;
+}
+
+/** Sole typed value stored at CATEGORY_SNAPSHOT_META_KEY. */
+export interface CategoryCacheMeta {
+  version: 1;
+  status: 'complete';
+  accountIdentity: string;
+  startedAt: number;
+  completedAt: number;
+  count: number;
+  page: number;
+  pages: number;
+  sourceRowCount: number;
+  storedRowCount: number;
+  schemaVersion: 6;
+  generation: string;
+  fingerprint: string;
+}
+
+/** Validated category rows and their complete snapshot metadata. */
+export interface CategorySnapshot {
+  rows: CategoryCacheRow[];
+  meta: CategoryCacheMeta;
+}
+
+/** Immutable identity assigned to a one-account PostgreSQL cache database. */
+export interface CacheAccountBinding {
+  accountIdentity: string;
+  accountSubdomain: string;
+  createdAt?: number;
+}
+
+/** Normalize the configured SalesBinder subdomain into a stable cache owner identity. */
+export function createSalesBinderAccountBinding(subdomain: string): CacheAccountBinding {
+  const normalized = subdomain.trim().toLowerCase().replace(/\.salesbinder\.com\.?$/, '');
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(normalized)) {
+    throw new Error('SalesBinder subdomain is invalid and cannot identify a cache database safely.');
+  }
+  return {
+    accountIdentity: `salesbinder:${normalized}`,
+    accountSubdomain: normalized,
+  };
+}
+
 /** Cache sync state metadata */
-export const CACHE_SCHEMA_VERSION = 5;
+export const CACHE_SCHEMA_VERSION = 6;
 
 export interface CacheState {
   lastSync: number; // Unix timestamp
@@ -166,8 +229,10 @@ export interface CacheState {
   customerCount?: number;
   supplierCount?: number;
   itemCount?: number;
+  categoryCount?: number;
   stockLocationCount?: number;
   lastAccountSync?: number;
+  lastCategorySync?: number;
   lastItemSync?: number;
   lastFullItemSync?: number;
   lastDeletedSync?: number;
@@ -187,6 +252,7 @@ export interface CacheSyncStatus {
   documentsProcessed?: number;
   lineItemsProcessed?: number;
   itemsProcessed?: number;
+  categoriesProcessed?: number;
   stockRowsProcessed?: number;
   deletedRecordsProcessed?: number;
   error?: string;
@@ -214,6 +280,7 @@ export interface SyncResult {
   customersProcessed?: number;
   suppliersProcessed?: number;
   itemsProcessed?: number;
+  categoriesProcessed?: number;
   stockRowsProcessed?: number;
   deletedRecordsProcessed?: number;
   syncLookbackSeconds?: number;

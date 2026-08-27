@@ -3,7 +3,7 @@
  */
 
 import type { Command } from 'commander';
-import type { CacheService, SyncResult } from '@salesbinder/sdk';
+import type { CacheService, CategorySnapshot, SyncResult } from '@salesbinder/sdk';
 import { formatJson, formatError } from '../../output/json.formatter.js';
 import { existsSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
@@ -64,6 +64,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
         const {
           SalesBinderClient,
           AccountIndexerService,
+          CategoryIndexerService,
           DocumentIndexerService,
           ItemIndexerService,
           DeletedLogSyncService,
@@ -71,10 +72,13 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           SQLiteCacheService,
           pullFromPostgres,
           loadPreferences,
+          loadConfig,
+          createSalesBinderAccountBinding,
           CACHE_SCHEMA_VERSION,
         } = await import('@salesbinder/sdk');
 
         const accountName = program.opts().account || 'default';
+        const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
         const client = new SalesBinderClient(accountName);
         const effectiveFull = Boolean(options.full || options.fullResume);
         const dbUrl = process.env.SALESBINDER_DB_URL;
@@ -84,8 +88,9 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
         if (pgService) {
           syncTarget = 'postgresql';
           cacheService = pgService;
+          await pgService.ensureAccountBinding(accountBinding);
           console.error('Syncing API → PostgreSQL...');
-          syncLockKey = `salesbinder-cache-sync:${accountName}`;
+          syncLockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
           lockAcquired = await pgService.tryAcquireSyncLock(syncLockKey);
           if (!lockAcquired) {
             throw new Error('Another cache sync is already running for this account.');
@@ -94,8 +99,9 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           syncTarget = 'sqlite';
           const sqliteService = new SQLiteCacheService(accountName);
           cacheService = sqliteService;
+          await sqliteService.ensureAccountBinding(accountBinding);
           console.error('Syncing API → SQLite...');
-          syncLockKey = `salesbinder-cache-sync:${accountName}`;
+          syncLockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
           lockAcquired = await sqliteService.tryAcquireSyncLock(syncLockKey);
           if (!lockAcquired) {
             throw new Error('Another cache sync is already running for this account.');
@@ -141,6 +147,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
         const lookbackEnv = process.env[['SALESBINDER', 'SYNC', 'LOOKBACK', 'SECONDS'].join('_')];
         const syncLookbackSeconds = lookbackEnv ? parseInt(lookbackEnv, 10) : (prefs?.syncLookbackSeconds ?? 604800);
         const accountIndexer = new AccountIndexerService(client, cacheService, accountName, syncLookbackSeconds);
+        const categoryIndexer = new CategoryIndexerService(client, cacheService, accountBinding.accountIdentity);
         const indexer = new DocumentIndexerService(
           client,
           cacheService,
@@ -179,6 +186,12 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           'accounts',
           { accountsProcessed: 0, customersProcessed: 0, suppliersProcessed: 0 },
           () => accountIndexer.sync(effectiveFull),
+        );
+
+        const categoryResult = await runFullResumePhase<{ categoriesProcessed: number; snapshot: CategorySnapshot | null }>(
+          'categories',
+          { categoriesProcessed: 0, snapshot: null },
+          () => categoryIndexer.sync(),
         );
 
         const result = await runFullResumePhase<SyncResult>('documents', {
@@ -228,6 +241,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
         const cloudSyncFinishedAt = Math.floor(Date.now() / 1000);
 
         const finalState = await cacheService.getCacheState();
+        const categoryMeta = await cacheService.getCategoryCacheMeta();
         await cacheService.setCacheState({
           ...(finalState ?? {
             accountName,
@@ -247,6 +261,8 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           accountName,
           schemaVersion: CACHE_SCHEMA_VERSION,
           itemCount: await cacheService.getItemCount(),
+          categoryCount: await cacheService.getCategoryCount(),
+          lastCategorySync: categoryMeta?.completedAt ?? finalState?.lastCategorySync,
           stockLocationCount: await cacheService.getStockLocationCount(),
         });
 
@@ -263,6 +279,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           documentsProcessed: result.documentsProcessed,
           lineItemsProcessed: result.lineItemsProcessed,
           itemsProcessed: itemResult.itemsProcessed,
+          categoriesProcessed: categoryResult.categoriesProcessed,
           stockRowsProcessed: itemResult.stockRowsProcessed,
           deletedRecordsProcessed: deletedResult.deletedRecordsProcessed,
         });
@@ -271,6 +288,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
         let pullInfo: {
           pulled: boolean;
           accounts?: number;
+          categories?: number;
           documents?: number;
           itemDocuments?: number;
           paymentTransactions?: number;
@@ -285,10 +303,11 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           await pgService.releaseSyncLock(syncLockKey);
           lockAcquired = false;
           console.error('Pulling PostgreSQL → SQLite...');
-          const pullResult = await pullFromPostgres(dbUrl, accountName);
+          const pullResult = await pullFromPostgres(dbUrl, accountName, undefined, accountBinding);
           pullInfo = {
             pulled: true,
             accounts: pullResult.accountsPulled,
+            categories: pullResult.categoriesPulled,
             documents: pullResult.documentsPulled,
             itemDocuments: pullResult.itemDocumentsPulled,
             paymentTransactions: pullResult.paymentTransactionsPulled,
@@ -313,6 +332,8 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           documents_deleted: result.documentsDeleted || 0,
           line_items_processed: result.lineItemsProcessed,
           items_processed: itemResult.itemsProcessed,
+          categories_processed: categoryResult.categoriesProcessed,
+          categories: categoryMeta ?? 'not_initialized',
           stock_rows_processed: itemResult.stockRowsProcessed,
           deleted_records_processed: deletedResult.deletedRecordsProcessed,
           duration,
@@ -326,6 +347,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           ...(pullInfo.pulled && {
             pg_to_sqlite_pull: {
               accounts: pullInfo.accounts,
+              categories: pullInfo.categories,
               documents: pullInfo.documents,
               item_documents: pullInfo.itemDocuments,
               payment_transactions: pullInfo.paymentTransactions,
@@ -343,7 +365,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
               item_position: checkpoint?.items,
             },
           }),
-          message: `Sync complete: ${result.documentsProcessed} documents, ${itemResult.itemsProcessed} items in ${duration}`,
+          message: `Sync complete: ${result.documentsProcessed} documents, ${categoryResult.categoriesProcessed} categories, ${itemResult.itemsProcessed} items in ${duration}`,
         };
 
         if (options.fullResume) checkpointStore?.removeAfterSuccess();
@@ -401,18 +423,21 @@ Next sync will perform a full resync.`)
       try {
         const dbUrl = process.env.SALESBINDER_DB_URL;
         const accountName = program.opts().account || 'default';
+        const { createSalesBinderAccountBinding, loadConfig } = await import('@salesbinder/sdk');
+        const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
 
         if (dbUrl) {
           // PostgreSQL: truncate tables
           const { PostgresCacheService } = await import('@salesbinder/sdk');
           const pgCache = new PostgresCacheService(dbUrl);
           cacheService = pgCache;
-          lockKey = `salesbinder-cache-sync:${accountName}`;
+          await pgCache.ensureSchema();
+          await pgCache.ensureAccountBinding(accountBinding);
+          lockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
           lockAcquired = await pgCache.tryAcquireSyncLock(lockKey);
           if (!lockAcquired) {
             throw new Error('Another cache sync is already running for this account.');
           }
-          await pgCache.ensureSchema();
           await pgCache.truncateAll();
 
           console.log(
@@ -447,7 +472,7 @@ Next sync will perform a full resync.`)
           const { SQLiteCacheService } = await import('@salesbinder/sdk');
           const sqliteCache = new SQLiteCacheService(accountName);
           cacheService = sqliteCache;
-          lockKey = `salesbinder-cache-sync:${accountName}`;
+          lockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
           lockAcquired = await sqliteCache.tryAcquireSyncLock(lockKey);
           if (!lockAcquired) {
             throw new Error('Another cache sync is already running for this account.');
@@ -500,8 +525,15 @@ No historical SalesBinder API requests are made.`)
       let lockAcquired = false;
 
       try {
-        const { CsvCacheImportService, SQLiteCacheService, PostgresCacheService } = await import('@salesbinder/sdk');
+        const {
+          CsvCacheImportService,
+          SQLiteCacheService,
+          PostgresCacheService,
+          createSalesBinderAccountBinding,
+          loadConfig,
+        } = await import('@salesbinder/sdk');
         const accountName = program.opts().account || 'default';
+        const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
         const databaseUrlEnv = ['SALESBINDER', 'DB', 'URL'].join('_');
         const dbUrl = process.env[databaseUrlEnv];
         const target = (options.target || (dbUrl ? 'postgresql' : 'sqlite')).toLowerCase();
@@ -520,14 +552,14 @@ No historical SalesBinder API requests are made.`)
         }
 
         if (!options.dryRun) {
-          lockKey = `salesbinder-cache-sync:${accountName}`;
+          if (ensurePostgresSchema) await ensurePostgresSchema();
+          await cacheService.ensureAccountBinding(accountBinding);
+          lockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
           lockAcquired = await cacheService.tryAcquireSyncLock(lockKey);
           if (!lockAcquired) {
             throw new Error('Another cache sync is already running for this account.');
           }
         }
-        if (ensurePostgresSchema) await ensurePostgresSchema();
-
         console.error(`${options.dryRun ? 'Validating' : 'Importing'} CSV exports -> ${target}...`);
         const importer = new CsvCacheImportService(cacheService);
         const result = await importer.importDirectory(directory, {
@@ -563,12 +595,21 @@ Displays:
       let cacheService: import('@salesbinder/sdk').CacheService | null = null;
 
       try {
-        const { createCacheService, createPostgresCacheService, DocumentIndexerService, SalesBinderClient, loadPreferences } = await import(
+        const {
+          createCacheService,
+          createPostgresCacheService,
+          createSalesBinderAccountBinding,
+          DocumentIndexerService,
+          SalesBinderClient,
+          loadConfig,
+          loadPreferences,
+        } = await import(
           '@salesbinder/sdk'
         );
 
         const dbUrl = process.env.SALESBINDER_DB_URL;
         const accountName = program.opts().account || 'default';
+        const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
 
         if (dbUrl) {
           // PostgreSQL backend
@@ -577,6 +618,8 @@ Displays:
             throw new Error('PostgreSQL backend is configured but could not be opened.');
           }
           cacheService = pgCache;
+          await pgCache.verifyAccountBinding(accountBinding);
+          await pgCache.ensureSchema();
           const client = new SalesBinderClient(accountName);
           const prefs = loadPreferences();
           const indexer = new DocumentIndexerService(
@@ -591,6 +634,7 @@ Displays:
           const paymentSyncStatus = await cacheService.getPaymentSyncStatus();
           const stale = await indexer.isCacheStale();
           const counts = await collectCacheCounts(cacheService);
+          const categoryMeta = await cacheService.getCategoryCacheMeta();
 
           await cacheService.close();
           cacheService = null;
@@ -620,6 +664,7 @@ Displays:
                   stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
                   sync_status: syncStatus,
                   payment_sync_status: paymentSyncStatus ?? 'not_initialized',
+                  categories: categoryMeta ?? 'not_initialized',
                 }
               : {
                   message: 'Cache exists but no metadata found. May need full sync.',
@@ -652,6 +697,7 @@ Displays:
           const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
 
           cacheService = await createCacheService(accountName);
+          await cacheService.verifyAccountBinding(accountBinding);
           const client = new SalesBinderClient(accountName);
 
           // Load stale threshold from config
@@ -668,6 +714,7 @@ Displays:
           const paymentSyncStatus = await cacheService.getPaymentSyncStatus();
           const stale = await indexer.isCacheStale();
           const counts = await collectCacheCounts(cacheService);
+          const categoryMeta = await cacheService.getCategoryCacheMeta();
 
           await cacheService.close();
           cacheService = null;
@@ -689,6 +736,7 @@ Displays:
                   stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
                   sync_status: syncStatus,
                   payment_sync_status: paymentSyncStatus ?? 'not_initialized',
+                  categories: categoryMeta ?? 'not_initialized',
                 }
               : {
                   message: 'Cache exists but no metadata found. May need full sync.',
@@ -731,17 +779,19 @@ This pull is explicit; normal cache reads and normal cache sync do not refresh S
           return;
         }
 
-        const { pullFromPostgres } = await import('@salesbinder/sdk');
+        const { createSalesBinderAccountBinding, loadConfig, pullFromPostgres } = await import('@salesbinder/sdk');
 
         const accountName = program.opts().account || 'default';
+        const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
         console.error('Pulling PostgreSQL → SQLite...');
 
-        const result = await pullFromPostgres(dbUrl, accountName);
+        const result = await pullFromPostgres(dbUrl, accountName, undefined, accountBinding);
 
         console.log(
           formatJson({
             success: true,
             accounts_pulled: result.accountsPulled,
+            categories_pulled: result.categoriesPulled,
             documents_pulled: result.documentsPulled,
             item_documents_pulled: result.itemDocumentsPulled,
             payment_transactions_pulled: result.paymentTransactionsPulled,
@@ -783,8 +833,10 @@ async function captureFullResumeCacheSnapshot(
   schemaVersion: number,
 ): Promise<ResumeCacheSnapshot> {
   const state = await cacheService.getCacheState();
+  const categoryMeta = await cacheService.getCategoryCacheMeta();
   const [
     accountCount,
+    categoryCount,
     documentCount,
     itemDocumentCount,
     paymentTransactionCount,
@@ -793,6 +845,7 @@ async function captureFullResumeCacheSnapshot(
     stockLocationCount,
   ] = await Promise.all([
     cacheService.getAccountCount(),
+    cacheService.getCategoryCount(),
     cacheService.getDocumentCount(),
     cacheService.getItemDocumentCount(),
     cacheService.getPaymentTransactionCount(),
@@ -804,6 +857,12 @@ async function captureFullResumeCacheSnapshot(
     accountName: state?.accountName ?? accountName,
     schemaVersion: state?.schemaVersion ?? schemaVersion,
     accountCount,
+    categoryCount,
+    categoryStatus: categoryMeta ? 'complete' : 'uninitialized',
+    categoryCompletedAt: categoryMeta?.completedAt ?? null,
+    categorySchemaVersion: categoryMeta?.schemaVersion ?? null,
+    categoryGeneration: categoryMeta?.generation ?? null,
+    categoryFingerprint: categoryMeta?.fingerprint ?? null,
     documentCount,
     itemDocumentCount,
     paymentTransactionCount,
@@ -828,6 +887,7 @@ async function collectCacheCounts(cacheService: CacheService) {
     customerCount,
     supplierCount,
     itemCount,
+    categoryCount,
     stockLocationCount,
   ] = await Promise.all([
     cacheService.getDocumentCount(),
@@ -840,6 +900,7 @@ async function collectCacheCounts(cacheService: CacheService) {
     cacheService.getAccountCount(2),
     cacheService.getAccountCount(10),
     cacheService.getItemCount(),
+    cacheService.getCategoryCount(),
     cacheService.getStockLocationCount(),
   ]);
 
@@ -854,6 +915,7 @@ async function collectCacheCounts(cacheService: CacheService) {
     customer_count: customerCount,
     supplier_count: supplierCount,
     item_count: itemCount,
+    category_count: categoryCount,
     stock_location_count: stockLocationCount,
   };
 }

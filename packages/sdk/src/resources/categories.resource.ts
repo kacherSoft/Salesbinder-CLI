@@ -8,6 +8,7 @@ import type {
   CreateCategoryDto,
   UpdateCategoryDto,
   CategoryListParams,
+  CategoryListApiResponse,
   CategoryListResponse,
 } from '../types/categories.types.js';
 
@@ -21,8 +22,20 @@ export class CategoriesResource {
    * List categories with optional filtering
    */
   async list(params?: CategoryListParams): Promise<CategoryListResponse> {
-    const response = await this.client.get<CategoryListResponse>('/categories.json', { params });
-    return response.data;
+    const response = await this.client.get<CategoryListApiResponse>('/categories.json', { params });
+    const categories = response.data.categories;
+    if (categories === undefined) return { ...response.data, categories: undefined };
+    if (!Array.isArray(categories)) {
+      throw new Error('Invalid API response for categories: expected an array');
+    }
+    const nested = categories.map(Array.isArray);
+    if (categories.length === 0 || nested.every((value) => !value)) {
+      return { ...response.data, categories: categories as Category[] };
+    }
+    if (!nested.every(Boolean)) {
+      throw new Error('Invalid API response for categories: mixed nested array shape');
+    }
+    return { ...response.data, categories: (categories as Category[][]).flat() };
   }
 
   /**
