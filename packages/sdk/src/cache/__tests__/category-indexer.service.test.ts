@@ -44,6 +44,74 @@ describe('CategoryIndexerService', () => {
     expect(replace).toHaveBeenCalledTimes(1);
   });
 
+  it('preserves v3 category fields and records their source version', async () => {
+    const list = jest.fn(async () => ({
+      count: 1,
+      page: 1,
+      pages: 1,
+      categories: [{
+        ...category('parts', 'Parts'),
+        item_count: 1,
+        inventory_type: 'unique' as const,
+        custom_fields: [{
+          id: 'field-1',
+          name: 'Bin',
+          display_order: 0,
+          display_on_inventory_list: true,
+          publish_on_documents: false,
+        }],
+      }],
+    }));
+    const replace = jest.fn(async () => undefined);
+    const cache = {
+      getCacheState: jest.fn(async () => ({ schemaVersion: 7 })),
+      replaceCategorySnapshot: replace,
+    } as unknown as CacheService;
+
+    const result = await new CategoryIndexerService(
+      { categories: { list } },
+      cache,
+      'acme',
+      '3',
+    ).sync();
+
+    expect(result.snapshot.rows[0]).toMatchObject({
+      category_id: 'parts',
+      inventory_type: 'unique',
+      source_api_version: '3',
+      custom_fields_json: JSON.stringify([{
+        id: 'field-1',
+        name: 'Bin',
+        display_order: 0,
+        display_on_inventory_list: true,
+        publish_on_documents: false,
+      }]),
+    });
+    expect(result.snapshot.meta.sourceApiVersion).toBe('3');
+    expect(replace).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not publish a v3 snapshot when equal-count membership changes between stability passes', async () => {
+    const list = jest.fn()
+      .mockResolvedValueOnce({ count: 1, page: 1, pages: 1, categories: [category('first')] })
+      .mockResolvedValueOnce({ count: 1, page: 1, pages: 1, categories: [category('second')] });
+    const replace = jest.fn(async () => undefined);
+    const cache = {
+      getCacheState: jest.fn(async () => ({ schemaVersion: 7 })),
+      replaceCategorySnapshot: replace,
+    } as unknown as CacheService;
+    const service = new CategoryIndexerService(
+      { categories: { list } },
+      cache,
+      'acme',
+      '3',
+    );
+
+    await expect(service.sync()).rejects.toThrow(/stability verification/i);
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(replace).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['missing count', { count: undefined }],
     ['fractional count', { count: '1.5' }],
@@ -87,7 +155,7 @@ describe('CategoryIndexerService', () => {
     expect(replace).not.toHaveBeenCalled();
   });
 
-  it('rejects a non-v6 cache state before fetching or writing', async () => {
+  it('rejects a non-v7 cache state before fetching or writing', async () => {
     const list = jest.fn();
     const replace = jest.fn();
     const client = { categories: { list } } as unknown as SalesBinderClient;
@@ -97,7 +165,7 @@ describe('CategoryIndexerService', () => {
     } as unknown as CacheService;
 
     await expect(new CategoryIndexerService(client, cache, 'acme').sync())
-      .rejects.toThrow('requires cache state schema version 6');
+      .rejects.toThrow('requires cache state schema version 7');
     expect(list).not.toHaveBeenCalled();
     expect(replace).not.toHaveBeenCalled();
   });
@@ -115,13 +183,13 @@ describe('CategoryIndexerService', () => {
   it('creates a deterministic, order-independent fingerprint covering rows and metadata', () => {
     const rows = [cacheRow('b', 'B'), cacheRow('a', 'A')];
     const meta = fingerprintMeta();
-    const fingerprint = createCategoryFingerprint(meta, rows, 6);
+    const fingerprint = createCategoryFingerprint(meta, rows, 7);
 
-    expect(createCategoryFingerprint(meta, [...rows].reverse(), 6)).toBe(fingerprint);
-    expect(createCategoryFingerprint(meta, [cacheRow('b', 'Renamed'), cacheRow('a', 'A')], 6)).not.toBe(fingerprint);
-    expect(createCategoryFingerprint({ ...meta, generation: 'next' }, rows, 6)).not.toBe(fingerprint);
-    expect(createCategoryFingerprint({ ...meta, pages: 2 }, rows, 6)).not.toBe(fingerprint);
-    expect(createCategoryFingerprint({ ...meta, accountIdentity: 'other' }, rows, 6)).not.toBe(fingerprint);
+    expect(createCategoryFingerprint(meta, [...rows].reverse(), 7)).toBe(fingerprint);
+    expect(createCategoryFingerprint(meta, [cacheRow('b', 'Renamed'), cacheRow('a', 'A')], 7)).not.toBe(fingerprint);
+    expect(createCategoryFingerprint({ ...meta, generation: 'next' }, rows, 7)).not.toBe(fingerprint);
+    expect(createCategoryFingerprint({ ...meta, pages: 2 }, rows, 7)).not.toBe(fingerprint);
+    expect(createCategoryFingerprint({ ...meta, accountIdentity: 'other' }, rows, 7)).not.toBe(fingerprint);
     expect(createCategoryFingerprint(meta, rows, 5)).not.toBe(fingerprint);
   });
 });
@@ -155,7 +223,7 @@ function setup(responses: unknown[]) {
 function createService(list: jest.Mock, replace: jest.Mock): CategoryIndexerService {
   const client = { categories: { list } } as unknown as SalesBinderClient;
   const cache = {
-    getCacheState: jest.fn(async () => ({ schemaVersion: 6 })),
+    getCacheState: jest.fn(async () => ({ schemaVersion: 7 })),
     replaceCategorySnapshot: replace,
   } as unknown as CacheService;
   return new CategoryIndexerService(client, cache, 'acme');
@@ -164,7 +232,8 @@ function createService(list: jest.Mock, replace: jest.Mock): CategoryIndexerServ
 function cacheRow(id: string, name: string): CategoryCacheRow {
   return {
     category_id: id, name, item_count: 1, parent_id: null, parent_name: null,
-    created: '2026-01-01', modified: 1, cache_source: 'api', imported_at: 1,
+    inventory_type: null, custom_fields_json: null, created: '2026-01-01', modified: 1,
+    cache_source: 'api', source_api_version: '2.0', imported_at: 1,
   };
 }
 
@@ -172,7 +241,8 @@ function fingerprintMeta() {
   return {
     version: 1 as const, status: 'complete' as const, accountIdentity: 'acme',
     startedAt: 1, completedAt: 2, count: 2, page: 1, pages: 1,
-    sourceRowCount: 2, storedRowCount: 2, schemaVersion: 6 as const, generation: 'fixed',
+    sourceRowCount: 2, storedRowCount: 2, schemaVersion: 7 as const,
+    sourceApiVersion: '2.0' as const, generation: 'fixed',
   };
 }
 

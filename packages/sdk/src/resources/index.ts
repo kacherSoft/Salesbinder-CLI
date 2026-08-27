@@ -10,6 +10,9 @@ import { DocumentsResource } from './documents.resource.js';
 import { LocationsResource } from './locations.resource.js';
 import { CategoriesResource } from './categories.resource.js';
 import { DeletedLogResource } from './deleted-log.resource.js';
+import { createV3AxiosClient } from '../client/v3-axios.factory.js';
+import { V3ItemsResource } from './v3-items.resource.js';
+import { V3CategoriesResource } from './v3-categories.resource.js';
 
 /**
  * SalesBinder SDK client
@@ -39,6 +42,22 @@ export class SalesBinderClient {
     this.locations = new LocationsResource(client);
     this.categories = new CategoriesResource(client);
     this.deletedLog = new DeletedLogResource(client);
+  }
+}
+
+/** Read-only API v3 client used for inventory and category snapshots. */
+export class SalesBinderV3Client {
+  readonly items: V3ItemsResource;
+  readonly categories: V3CategoriesResource;
+
+  constructor(accountName?: string) {
+    const account = loadConfig(accountName);
+    if (!account.v3ApiKey) {
+      throw new Error('SalesBinder API v3 key is not configured for this account');
+    }
+    const client = createV3AxiosClient(account);
+    this.items = new V3ItemsResource(client);
+    this.categories = new V3CategoriesResource(client);
   }
 }
 

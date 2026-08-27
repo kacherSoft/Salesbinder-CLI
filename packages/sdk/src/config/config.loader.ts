@@ -67,6 +67,13 @@ export function loadConfig(accountName?: string): AccountConfig {
   if (!account.apiKey) {
     throw new Error(`Account "${targetAccount}" missing apiKey`);
   }
+  if (account.v3ApiKey !== undefined && (
+    typeof account.v3ApiKey !== 'string'
+    || !account.v3ApiKey.trim()
+    || account.v3ApiKey.includes('\0')
+  )) {
+    throw new Error(`Account "${targetAccount}" has an invalid v3ApiKey`);
+  }
 
   return account;
 }

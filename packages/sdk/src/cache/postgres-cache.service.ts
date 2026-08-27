@@ -14,6 +14,8 @@ import type {
   CategorySnapshot,
   CustomerSalesData,
   DocumentRow,
+  InventoryCacheMeta,
+  InventorySnapshot,
   ItemDocumentRow,
   ItemRow,
   ItemSalesByPeriodRow,
@@ -24,6 +26,7 @@ import {
   CACHE_SCHEMA_VERSION,
   CATEGORY_GENERATION_META_KEY,
   CATEGORY_SNAPSHOT_META_KEY,
+  INVENTORY_SNAPSHOT_META_KEY,
   createSalesBinderAccountBinding,
 } from './types.js';
 import { PAYMENT_SYNC_STATUS_KEY, PAYMENT_TRANSACTION_COLUMNS } from './payment-cache.constants.js';
@@ -35,11 +38,14 @@ import {
 
 const { Pool } = pg;
 
+// Keep the lock identity stable across rolling schema upgrades.
 const DB_WRITE_LOCK_KEY = 'salesbinder.cache.database-write.v6';
+const INVENTORY_NULLABILITY_MIGRATION_META_KEY = 'schema.v7.inventory-nullability-migrated';
 
 const CATEGORY_COLUMNS = [
   'category_id', 'name', 'item_count', 'parent_id', 'parent_name',
-  'created', 'modified', 'cache_source', 'imported_at',
+  'inventory_type', 'custom_fields_json', 'created', 'modified', 'cache_source',
+  'source_api_version', 'imported_at',
 ] as const;
 
 const DOCUMENT_COLUMNS = [
@@ -73,6 +79,7 @@ const ITEM_COLUMNS = [
   'category_id', 'category_name', 'quantity', 'quantity_reserved', 'quantity_available',
   'quantity_incoming', 'in_transit', 'threshold', 'cost', 'price', 'valuation',
   'published', 'archived', 'created', 'modified', 'cache_source', 'imported_at',
+  'source_api_version',
 ] as const;
 
 const STOCK_COLUMNS = [
@@ -80,6 +87,7 @@ const STOCK_COLUMNS = [
   'location_id', 'location_name', 'category_name', 'quantity_on_hand',
   'quantity_reserved', 'quantity_available', 'quantity_incoming', 'in_transit',
   'price', 'cost', 'valuation', 'barcode', 'cache_source', 'imported_at',
+  'source_api_version',
 ] as const;
 
 type QueryExecutor = Pick<PoolClient, 'query'>;
@@ -153,7 +161,8 @@ export class PostgresCacheService implements CacheService {
         created TEXT NULL,
         modified BIGINT NULL,
         cache_source TEXT NOT NULL DEFAULT 'api',
-        imported_at BIGINT NULL
+        imported_at BIGINT NULL,
+        source_api_version TEXT NULL
       );
 
       CREATE TABLE IF NOT EXISTS documents (
@@ -211,16 +220,17 @@ export class PostgresCacheService implements CacheService {
         location_name TEXT NULL,
         category_name TEXT NULL,
         quantity_on_hand NUMERIC NOT NULL DEFAULT 0,
-        quantity_reserved NUMERIC NOT NULL DEFAULT 0,
-        quantity_available NUMERIC NOT NULL DEFAULT 0,
-        quantity_incoming NUMERIC NOT NULL DEFAULT 0,
-        in_transit NUMERIC NOT NULL DEFAULT 0,
+        quantity_reserved NUMERIC NULL,
+        quantity_available NUMERIC NULL,
+        quantity_incoming NUMERIC NULL,
+        in_transit NUMERIC NULL,
         price NUMERIC NULL,
         cost NUMERIC NULL,
         valuation NUMERIC NULL,
         barcode TEXT NULL,
         cache_source TEXT NOT NULL DEFAULT 'api',
         imported_at BIGINT NULL,
+        source_api_version TEXT NULL,
         FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE
       );
 
@@ -245,9 +255,12 @@ export class PostgresCacheService implements CacheService {
         item_count INTEGER NULL,
         parent_id TEXT NULL,
         parent_name TEXT NULL,
+        inventory_type TEXT NULL,
+        custom_fields_json TEXT NULL,
         created TEXT NULL,
         modified BIGINT NULL,
         cache_source TEXT NOT NULL DEFAULT 'api',
+        source_api_version TEXT NULL,
         imported_at BIGINT NOT NULL
       );
 
@@ -258,6 +271,7 @@ export class PostgresCacheService implements CacheService {
     `);
     await this.migrateDocumentColumns(client);
     await this.migrateItemColumns(client);
+    await this.migrateStockColumns(client);
     await this.migrateItemDocumentColumns(client);
     await this.repairCategorySchema(client);
     await this.createIndexes(client);
@@ -298,6 +312,52 @@ export class PostgresCacheService implements CacheService {
   private async migrateItemColumns(client: PoolClient): Promise<void> {
     await client.query(`
       ALTER TABLE items ADD COLUMN IF NOT EXISTS archived INTEGER NULL;
+      ALTER TABLE items ADD COLUMN IF NOT EXISTS source_api_version TEXT NULL;
+    `);
+  }
+
+  private async migrateStockColumns(client: PoolClient): Promise<void> {
+    await client.query(`
+      ALTER TABLE item_stock_locations ADD COLUMN IF NOT EXISTS source_api_version TEXT NULL;
+      ALTER TABLE items ALTER COLUMN quantity_reserved DROP DEFAULT;
+      ALTER TABLE items ALTER COLUMN quantity_reserved DROP NOT NULL;
+      ALTER TABLE items ALTER COLUMN quantity_available DROP DEFAULT;
+      ALTER TABLE items ALTER COLUMN quantity_available DROP NOT NULL;
+      ALTER TABLE items ALTER COLUMN quantity_incoming DROP DEFAULT;
+      ALTER TABLE items ALTER COLUMN quantity_incoming DROP NOT NULL;
+      ALTER TABLE items ALTER COLUMN in_transit DROP DEFAULT;
+      ALTER TABLE items ALTER COLUMN in_transit DROP NOT NULL;
+      ALTER TABLE item_stock_locations ALTER COLUMN quantity_reserved DROP DEFAULT;
+      ALTER TABLE item_stock_locations ALTER COLUMN quantity_reserved DROP NOT NULL;
+      ALTER TABLE item_stock_locations ALTER COLUMN quantity_available DROP DEFAULT;
+      ALTER TABLE item_stock_locations ALTER COLUMN quantity_available DROP NOT NULL;
+      ALTER TABLE item_stock_locations ALTER COLUMN quantity_incoming DROP DEFAULT;
+      ALTER TABLE item_stock_locations ALTER COLUMN quantity_incoming DROP NOT NULL;
+      ALTER TABLE item_stock_locations ALTER COLUMN in_transit DROP DEFAULT;
+      ALTER TABLE item_stock_locations ALTER COLUMN in_transit DROP NOT NULL;
+      DO $migration$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM cache_meta WHERE key = '${INVENTORY_NULLABILITY_MIGRATION_META_KEY}'
+        ) THEN
+          UPDATE items
+          SET quantity_reserved = NULL,
+              quantity_available = NULL,
+              quantity_incoming = NULL,
+              in_transit = NULL
+          WHERE cache_source = 'api';
+          UPDATE item_stock_locations
+          SET quantity_reserved = NULL,
+              quantity_available = NULL,
+              quantity_incoming = NULL,
+              in_transit = NULL
+          WHERE cache_source = 'api';
+          INSERT INTO cache_meta (key, value)
+          VALUES ('${INVENTORY_NULLABILITY_MIGRATION_META_KEY}', 'complete')
+          ON CONFLICT (key) DO NOTHING;
+        END IF;
+      END
+      $migration$;
     `);
   }
 
@@ -416,9 +476,12 @@ export class PostgresCacheService implements CacheService {
       ALTER TABLE categories ADD COLUMN IF NOT EXISTS item_count INTEGER NULL;
       ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id TEXT NULL;
       ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_name TEXT NULL;
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS inventory_type TEXT NULL;
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS custom_fields_json TEXT NULL;
       ALTER TABLE categories ADD COLUMN IF NOT EXISTS created TEXT NULL;
       ALTER TABLE categories ADD COLUMN IF NOT EXISTS modified BIGINT NULL;
       ALTER TABLE categories ADD COLUMN IF NOT EXISTS cache_source TEXT DEFAULT 'api';
+      ALTER TABLE categories ADD COLUMN IF NOT EXISTS source_api_version TEXT NULL;
       ALTER TABLE categories ADD COLUMN IF NOT EXISTS imported_at BIGINT;
       DO $migration$
       DECLARE primary_key_name TEXT;
@@ -450,7 +513,8 @@ export class PostgresCacheService implements CacheService {
           WHERE table_schema = current_schema() AND table_name = 'categories'
             AND column_name NOT IN (
               'category_id', 'name', 'item_count', 'parent_id', 'parent_name',
-              'created', 'modified', 'cache_source', 'imported_at'
+              'inventory_type', 'custom_fields_json', 'created', 'modified',
+              'cache_source', 'source_api_version', 'imported_at'
             )
         LOOP
           EXECUTE format('ALTER TABLE categories DROP COLUMN %I', extra_column);
@@ -462,9 +526,12 @@ export class PostgresCacheService implements CacheService {
       ALTER TABLE categories ALTER COLUMN item_count TYPE INTEGER USING item_count::INTEGER;
       ALTER TABLE categories ALTER COLUMN parent_id TYPE TEXT USING parent_id::TEXT;
       ALTER TABLE categories ALTER COLUMN parent_name TYPE TEXT USING parent_name::TEXT;
+      ALTER TABLE categories ALTER COLUMN inventory_type TYPE TEXT USING inventory_type::TEXT;
+      ALTER TABLE categories ALTER COLUMN custom_fields_json TYPE TEXT USING custom_fields_json::TEXT;
       ALTER TABLE categories ALTER COLUMN created TYPE TEXT USING created::TEXT;
       ALTER TABLE categories ALTER COLUMN modified TYPE BIGINT USING modified::BIGINT;
       ALTER TABLE categories ALTER COLUMN cache_source TYPE TEXT USING cache_source::TEXT;
+      ALTER TABLE categories ALTER COLUMN source_api_version TYPE TEXT USING source_api_version::TEXT;
       ALTER TABLE categories ALTER COLUMN imported_at TYPE BIGINT USING imported_at::BIGINT;
       DELETE FROM categories
         WHERE category_id IS NULL OR name IS NULL OR cache_source IS NULL OR imported_at IS NULL;
@@ -642,11 +709,6 @@ export class PostgresCacheService implements CacheService {
     this.assertValidCategorySnapshot(snapshot, binding.accountIdentity);
 
     await this.withVerifiedWrite(async (client) => {
-      const stateResult = await client.query<{ value: string }>(
-        `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`,
-      );
-      const currentState = this.parseCacheState(stateResult.rows[0]?.value);
-
       await client.query(`DELETE FROM categories`);
       for (const row of snapshot.rows) {
         await client.query(
@@ -691,6 +753,8 @@ export class PostgresCacheService implements CacheService {
             WHERE item.item_id = stock.item_id
           );
       `);
+
+      const currentState = await this.invalidateInventoryAuthority(client, false);
 
       const nextState: CacheState = {
         lastSync: currentState?.lastSync ?? 0,
@@ -939,6 +1003,7 @@ export class PostgresCacheService implements CacheService {
         this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
         this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)),
       );
+      await this.invalidateInventoryAuthority(client);
     });
   }
 
@@ -956,15 +1021,22 @@ export class PostgresCacheService implements CacheService {
   }
 
   async batchInsertItems(items: ItemRow[]): Promise<void> {
-    await this.batch(items, (client, item) => client.query(
-      this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
-      this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)),
-    ));
+    if (items.length === 0) return;
+    await this.withVerifiedWrite(async (client) => {
+      for (const item of items) {
+        await client.query(
+          this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
+          this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)),
+        );
+      }
+      await this.invalidateInventoryAuthority(client);
+    });
   }
 
   async deleteItem(itemId: string): Promise<void> {
     await this.withVerifiedWrite(async (client) => {
       await client.query(`DELETE FROM items WHERE item_id = $1`, [itemId]);
+      await this.invalidateInventoryAuthority(client);
     });
   }
 
@@ -974,6 +1046,7 @@ export class PostgresCacheService implements CacheService {
         this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
         this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)),
       );
+      await this.invalidateInventoryAuthority(client);
     });
   }
 
@@ -991,20 +1064,108 @@ export class PostgresCacheService implements CacheService {
       for (const row of rows) {
         await client.query(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'), this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
       }
+      await this.invalidateInventoryAuthority(client);
     });
   }
 
   async batchInsertItemStockLocations(rows: ItemStockLocationRow[]): Promise<void> {
-    await this.batch(rows, (client, row) => client.query(
-      this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
-      this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)),
-    ));
+    if (rows.length === 0) return;
+    await this.withVerifiedWrite(async (client) => {
+      for (const row of rows) {
+        await client.query(
+          this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
+          this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)),
+        );
+      }
+      await this.invalidateInventoryAuthority(client);
+    });
   }
 
   async deleteItemStockLocations(itemId: string): Promise<void> {
     await this.withVerifiedWrite(async (client) => {
       await client.query(`DELETE FROM item_stock_locations WHERE item_id = $1`, [itemId]);
+      await this.invalidateInventoryAuthority(client);
     });
+  }
+
+  async replaceInventorySnapshot(snapshot: InventorySnapshot): Promise<void> {
+    const binding = this.requireExpectedBinding();
+    this.assertValidInventorySnapshot(snapshot, binding.accountIdentity);
+
+    await this.withVerifiedWrite(async (client) => {
+      const stateResult = await client.query<{ value: string }>(
+        `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`,
+      );
+      const currentState = this.parseCacheState(stateResult.rows[0]?.value);
+
+      await client.query(`DELETE FROM item_stock_locations WHERE cache_source = 'api'`);
+      await client.query(`
+        UPDATE items AS item
+        SET cache_source = 'csv', source_api_version = NULL
+        WHERE item.cache_source = 'api'
+          AND EXISTS (
+            SELECT 1 FROM item_stock_locations AS stock
+            WHERE stock.item_id = item.item_id AND stock.cache_source = 'csv'
+          )
+      `);
+      await client.query(`DELETE FROM items WHERE cache_source = 'api'`);
+      for (const item of snapshot.items) {
+        await client.query(
+          this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
+          this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)),
+        );
+      }
+      for (const row of snapshot.stockRows) {
+        await client.query(
+          this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
+          this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)),
+        );
+      }
+
+      await client.query(
+        `INSERT INTO cache_meta (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [INVENTORY_SNAPSHOT_META_KEY, JSON.stringify(snapshot.meta)],
+      );
+      const counts = await client.query<{ item_count: string; stock_row_count: string }>(`
+        SELECT (SELECT COUNT(*) FROM items) AS item_count,
+               (SELECT COUNT(*) FROM item_stock_locations) AS stock_row_count
+      `);
+      const nextState: CacheState = {
+        lastSync: currentState?.lastSync ?? 0,
+        lastFullSync: currentState?.lastFullSync ?? 0,
+        documentCount: currentState?.documentCount ?? 0,
+        itemDocumentCount: currentState?.itemDocumentCount ?? 0,
+        accountName: currentState?.accountName ?? binding.accountSubdomain,
+        ...currentState,
+        schemaVersion: CACHE_SCHEMA_VERSION,
+        itemCount: Number(counts.rows[0]?.item_count ?? snapshot.meta.itemCount),
+        stockLocationCount: Number(counts.rows[0]?.stock_row_count ?? snapshot.meta.stockRowCount),
+        lastItemSync: snapshot.meta.completedAt,
+        lastFullItemSync: snapshot.meta.completedAt,
+        inventorySourceApiVersion: snapshot.meta.sourceApiVersion,
+      };
+      await client.query(
+        `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [JSON.stringify(nextState)],
+      );
+    });
+  }
+
+  async getInventoryCacheMeta(): Promise<InventoryCacheMeta | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const meta = await this.readAuthoritativeInventoryMeta(client);
+      await client.query('COMMIT');
+      return meta;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async getItemDocumentsForPeriod(itemId: string, startDate: string, endDate: string, contextId: number): Promise<ItemDocumentRow[]> {
@@ -1115,6 +1276,7 @@ export class PostgresCacheService implements CacheService {
       const persisted = this.parseCacheState(persistedResult.rows[0]?.value);
       if (state.schemaVersion === CACHE_SCHEMA_VERSION && persisted?.schemaVersion !== CACHE_SCHEMA_VERSION) {
         await client.query(`DELETE FROM cache_meta WHERE key = $1`, [CATEGORY_GENERATION_META_KEY]);
+        await client.query(`DELETE FROM cache_meta WHERE key = $1`, [INVENTORY_SNAPSHOT_META_KEY]);
       }
       await client.query(
         `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
@@ -1265,6 +1427,29 @@ export class PostgresCacheService implements CacheService {
     });
   }
 
+  private async invalidateInventoryAuthority(
+    client: PoolClient,
+    persistState = true,
+  ): Promise<CacheState | null> {
+    const stateResult = await client.query<{ value: string }>(
+      `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`,
+    );
+    const currentState = this.parseCacheState(stateResult.rows[0]?.value);
+    await client.query(`DELETE FROM cache_meta WHERE key = $1`, [INVENTORY_SNAPSHOT_META_KEY]);
+    if (!currentState) return null;
+    if (currentState.inventorySourceApiVersion !== '3') return currentState;
+    const nextState = { ...currentState };
+    delete nextState.inventorySourceApiVersion;
+    if (persistState && currentState.inventorySourceApiVersion !== undefined) {
+      await client.query(
+        `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [JSON.stringify(nextState)],
+      );
+    }
+    return nextState;
+  }
+
   private async acquireDatabaseWriteLock(client: PoolClient): Promise<void> {
     await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [DB_WRITE_LOCK_KEY]);
   }
@@ -1377,6 +1562,47 @@ export class PostgresCacheService implements CacheService {
     return meta;
   }
 
+  private async readAuthoritativeInventoryMeta(
+    executor: QueryExecutor,
+  ): Promise<InventoryCacheMeta | null> {
+    const result = await executor.query<{
+      snapshot_value: string;
+      state_value: string | null;
+      account_identity: string;
+      item_count: string;
+      stock_row_count: string;
+    }>(`
+      SELECT snapshot.value AS snapshot_value,
+             state.value AS state_value,
+             binding.account_identity,
+             (SELECT COUNT(*) FROM items
+               WHERE cache_source = 'api' AND source_api_version = '3') AS item_count,
+             (SELECT COUNT(*) FROM item_stock_locations
+               WHERE cache_source = 'api' AND source_api_version = '3') AS stock_row_count
+      FROM cache_meta AS snapshot
+      JOIN cache_account_binding AS binding ON binding.id = 1
+      LEFT JOIN cache_meta AS state ON state.key = 'state'
+      WHERE snapshot.key = $1
+    `, [INVENTORY_SNAPSHOT_META_KEY]);
+    const row = result.rows[0];
+    if (!row) return null;
+
+    const meta = this.parseInventoryMeta(row.snapshot_value);
+    const state = this.parseCacheState(row.state_value);
+    if (
+      !meta
+      || state?.schemaVersion !== CACHE_SCHEMA_VERSION
+      || state.inventorySourceApiVersion !== '3'
+      || row.account_identity !== meta.accountIdentity
+      || (this.expectedBinding && row.account_identity !== this.expectedBinding.accountIdentity)
+      || Number(row.item_count) !== meta.itemCount
+      || Number(row.stock_row_count) !== meta.stockRowCount
+    ) {
+      return null;
+    }
+    return meta;
+  }
+
   private parseCacheState(value: string | null | undefined): CacheState | null {
     if (!value) return null;
     try {
@@ -1394,7 +1620,7 @@ export class PostgresCacheService implements CacheService {
       const parsed = JSON.parse(value) as Partial<CategoryCacheMeta>;
       const exactKeys = [
         'accountIdentity', 'completedAt', 'count', 'fingerprint', 'generation', 'page',
-        'pages', 'schemaVersion', 'sourceRowCount', 'startedAt', 'status',
+        'pages', 'schemaVersion', 'sourceApiVersion', 'sourceRowCount', 'startedAt', 'status',
         'storedRowCount', 'version',
       ];
       const integerFields = [
@@ -1407,6 +1633,7 @@ export class PostgresCacheService implements CacheService {
         || parsed.version !== 1
         || parsed.status !== 'complete'
         || parsed.schemaVersion !== CACHE_SCHEMA_VERSION
+        || (parsed.sourceApiVersion !== '2.0' && parsed.sourceApiVersion !== '3')
         || typeof parsed.accountIdentity !== 'string'
         || typeof parsed.generation !== 'string' || parsed.generation.length === 0
         || typeof parsed.fingerprint !== 'string' || parsed.fingerprint.length === 0
@@ -1416,6 +1643,37 @@ export class PostgresCacheService implements CacheService {
         return null;
       }
       return parsed as CategoryCacheMeta;
+    } catch {
+      return null;
+    }
+  }
+
+  private parseInventoryMeta(value: string): InventoryCacheMeta | null {
+    try {
+      const parsed = JSON.parse(value) as Partial<InventoryCacheMeta>;
+      const exactKeys = [
+        'accountIdentity', 'completedAt', 'fingerprint', 'generation', 'itemCount',
+        'schemaVersion', 'sourceApiVersion', 'startedAt', 'status', 'stockRowCount', 'version',
+      ];
+      if (
+        !parsed || typeof parsed !== 'object'
+        || !this.hasExactKeys(parsed, exactKeys)
+        || parsed.version !== 1
+        || parsed.status !== 'complete'
+        || parsed.schemaVersion !== CACHE_SCHEMA_VERSION
+        || parsed.sourceApiVersion !== '3'
+        || typeof parsed.accountIdentity !== 'string' || parsed.accountIdentity.length === 0
+        || typeof parsed.generation !== 'string' || parsed.generation.length === 0
+        || typeof parsed.fingerprint !== 'string' || parsed.fingerprint.length === 0
+        || !Number.isSafeInteger(parsed.startedAt) || (parsed.startedAt as number) < 0
+        || !Number.isSafeInteger(parsed.completedAt) || (parsed.completedAt as number) < 0
+        || !Number.isSafeInteger(parsed.itemCount) || (parsed.itemCount as number) < 0
+        || !Number.isSafeInteger(parsed.stockRowCount) || (parsed.stockRowCount as number) < 0
+        || (parsed.completedAt as number) < (parsed.startedAt as number)
+      ) {
+        return null;
+      }
+      return parsed as InventoryCacheMeta;
     } catch {
       return null;
     }
@@ -1433,8 +1691,9 @@ export class PostgresCacheService implements CacheService {
       throw new Error('Category snapshot metadata does not match the bound account or validated rows.');
     }
     const expectedRowKeys = [
-      'cache_source', 'category_id', 'created', 'imported_at', 'item_count',
-      'modified', 'name', 'parent_id', 'parent_name',
+      'cache_source', 'category_id', 'created', 'custom_fields_json', 'imported_at',
+      'inventory_type', 'item_count', 'modified', 'name', 'parent_id',
+      'parent_name', 'source_api_version',
     ];
     const ids = new Set<string>();
     const names = new Map<string, string>();
@@ -1450,6 +1709,12 @@ export class PostgresCacheService implements CacheService {
         || row.name.includes('\0')
         || ids.has(row.category_id)
         || row.cache_source !== 'api'
+        || (row.source_api_version !== '2.0' && row.source_api_version !== '3')
+        || (row.inventory_type !== null
+          && row.inventory_type !== 'quantity' && row.inventory_type !== 'unique')
+        || (row.custom_fields_json !== null
+          && (typeof row.custom_fields_json !== 'string'
+            || row.custom_fields_json.includes('\0')))
         || !Number.isSafeInteger(row.imported_at) || row.imported_at < 0
         || (row.item_count !== null
           && (!Number.isSafeInteger(row.item_count) || row.item_count < 0))
@@ -1475,6 +1740,62 @@ export class PostgresCacheService implements CacheService {
         throw new Error('Category snapshot parent names must be derived from the same validated snapshot.');
       }
     }
+  }
+
+  private assertValidInventorySnapshot(snapshot: InventorySnapshot, accountIdentity: string): void {
+    const meta = this.parseInventoryMeta(JSON.stringify(snapshot.meta));
+    if (
+      !meta
+      || meta.accountIdentity !== accountIdentity
+      || meta.itemCount !== snapshot.items.length
+      || meta.stockRowCount !== snapshot.stockRows.length
+    ) {
+      throw new Error('Inventory snapshot metadata does not match the bound account or validated rows.');
+    }
+
+    const itemIds = new Set<string>();
+    for (const item of snapshot.items) {
+      if (
+        !item || typeof item !== 'object'
+        || typeof item.item_id !== 'string' || item.item_id.length === 0 || item.item_id.includes('\0')
+        || typeof item.name !== 'string' || item.name.length === 0 || item.name.includes('\0')
+        || itemIds.has(item.item_id)
+        || item.cache_source !== 'api'
+        || item.source_api_version !== '3'
+        || !this.isFiniteNumber(item.quantity)
+      ) {
+        throw new Error('Inventory snapshot contains an invalid or duplicate item row.');
+      }
+      itemIds.add(item.item_id);
+    }
+
+    const stockIds = new Set<string>();
+    for (const row of snapshot.stockRows) {
+      if (
+        !row || typeof row !== 'object'
+        || typeof row.stock_row_id !== 'string' || row.stock_row_id.length === 0
+        || row.stock_row_id.includes('\0') || stockIds.has(row.stock_row_id)
+        || typeof row.item_id !== 'string' || !itemIds.has(row.item_id)
+        || row.cache_source !== 'api'
+        || row.source_api_version !== '3'
+        || !this.isFiniteNumber(row.quantity_on_hand)
+        || !this.isNullableFiniteNumber(row.quantity_reserved)
+        || !this.isNullableFiniteNumber(row.quantity_available)
+        || !this.isNullableFiniteNumber(row.quantity_incoming)
+        || !this.isNullableFiniteNumber(row.in_transit)
+      ) {
+        throw new Error('Inventory snapshot contains an invalid or duplicate stock row.');
+      }
+      stockIds.add(row.stock_row_id);
+    }
+  }
+
+  private isFiniteNumber(value: unknown): value is number {
+    return typeof value === 'number' && Number.isFinite(value);
+  }
+
+  private isNullableFiniteNumber(value: unknown): value is number | null {
+    return value === null || this.isFiniteNumber(value);
   }
 
   private hasExactKeys(value: object, keys: string[]): boolean {
@@ -1575,10 +1896,10 @@ export class PostgresCacheService implements CacheService {
     return {
       ...row,
       quantity_on_hand: row.quantity_on_hand ?? 0,
-      quantity_reserved: row.quantity_reserved ?? 0,
-      quantity_available: row.quantity_available ?? 0,
-      quantity_incoming: row.quantity_incoming ?? 0,
-      in_transit: row.in_transit ?? 0,
+      quantity_reserved: row.quantity_reserved ?? null,
+      quantity_available: row.quantity_available ?? null,
+      quantity_incoming: row.quantity_incoming ?? null,
+      in_transit: row.in_transit ?? null,
       cache_source: row.cache_source ?? 'api',
     };
   }
@@ -1630,10 +1951,10 @@ export class PostgresCacheService implements CacheService {
     return {
       ...row,
       quantity_on_hand: Number(row.quantity_on_hand),
-      quantity_reserved: Number(row.quantity_reserved),
-      quantity_available: Number(row.quantity_available),
-      quantity_incoming: Number(row.quantity_incoming),
-      in_transit: Number(row.in_transit),
+      quantity_reserved: row.quantity_reserved == null ? null : Number(row.quantity_reserved),
+      quantity_available: row.quantity_available == null ? null : Number(row.quantity_available),
+      quantity_incoming: row.quantity_incoming == null ? null : Number(row.quantity_incoming),
+      in_transit: row.in_transit == null ? null : Number(row.in_transit),
       price: row.price == null ? null : Number(row.price),
       cost: row.cost == null ? null : Number(row.cost),
       valuation: row.valuation == null ? null : Number(row.valuation),

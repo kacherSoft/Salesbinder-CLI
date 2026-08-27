@@ -4,7 +4,19 @@
 
 import { SQLiteCacheService } from '../sqlite-cache.service.js';
 import { PostgresCacheService } from '../postgres-cache.service.js';
-import { CACHE_SCHEMA_VERSION, DocumentContextId, DocumentRow, CacheState } from '../types.js';
+import {
+  CACHE_SCHEMA_VERSION,
+  DocumentContextId,
+  INVENTORY_ACCOUNT_META_KEY,
+  INVENTORY_SNAPSHOT_META_KEY,
+} from '../types.js';
+import type {
+  CacheState,
+  DocumentRow,
+  InventorySnapshot,
+  ItemRow,
+  ItemStockLocationRow,
+} from '../types.js';
 import type { PaymentSyncStatus, PaymentTransactionRow } from '../payment-sync.types.js';
 import Database from 'better-sqlite3';
 import { rmSync, existsSync } from 'fs';
@@ -62,6 +74,88 @@ describe('SQLiteCacheService', () => {
       }
     });
 
+    it('creates the v7 inventory and category columns with nullable source-correct stock fields', () => {
+      const db = new Database(testDbPath, { readonly: true });
+      try {
+        const stockColumns = db.pragma('table_info(item_stock_locations)') as Array<{
+          name: string; notnull: number; dflt_value: string | null;
+        }>;
+        for (const name of ['quantity_reserved', 'quantity_available', 'quantity_incoming', 'in_transit']) {
+          expect(stockColumns).toContainEqual(expect.objectContaining({ name, notnull: 0, dflt_value: null }));
+        }
+        expect(stockColumns).toContainEqual(expect.objectContaining({ name: 'source_api_version', notnull: 0 }));
+        expect(db.pragma('table_info(items)')).toEqual(expect.arrayContaining([
+          expect.objectContaining({ name: 'source_api_version', notnull: 0 }),
+        ]));
+        expect(db.pragma('table_info(categories)')).toEqual(expect.arrayContaining([
+          expect.objectContaining({ name: 'inventory_type', notnull: 0 }),
+          expect.objectContaining({ name: 'custom_fields_json', notnull: 0 }),
+          expect.objectContaining({ name: 'source_api_version', notnull: 0 }),
+        ]));
+      } finally {
+        db.close();
+      }
+    });
+
+    it('migrates a genuine v6 stock table to v7 while nulling only API-fabricated fields', async () => {
+      await service.close();
+      rmSync(testDbPath, { force: true });
+      createLegacyV6InventoryDatabase(testDbPath);
+
+      service = new SQLiteCacheService('test-account', testDbPath);
+
+      const db = new Database(testDbPath, { readonly: true });
+      try {
+        expect(db.pragma('user_version', { simple: true })).toBe(7);
+        const columns = db.pragma('table_info(item_stock_locations)') as Array<{
+          name: string; notnull: number; dflt_value: string | null;
+        }>;
+        for (const name of ['quantity_reserved', 'quantity_available', 'quantity_incoming', 'in_transit']) {
+          expect(columns).toContainEqual(expect.objectContaining({ name, notnull: 0, dflt_value: null }));
+        }
+        expect(db.pragma('foreign_key_check')).toEqual([]);
+        expect(db.pragma('foreign_key_list(item_stock_locations)')).toEqual(expect.arrayContaining([
+          expect.objectContaining({ table: 'items', from: 'item_id', to: 'item_id', on_delete: 'CASCADE' }),
+        ]));
+        expect((db.pragma('index_list(item_stock_locations)') as Array<{ name: string }>).map(({ name }) => name))
+          .toEqual(expect.arrayContaining(['idx_stock_item', 'idx_stock_location']));
+
+        expect(await service.getItem('legacy-api-item')).toEqual(expect.objectContaining({
+          quantity_reserved: null,
+          quantity_available: null,
+          quantity_incoming: null,
+          in_transit: null,
+        }));
+        expect(await service.getItem('legacy-csv-item')).toEqual(expect.objectContaining({
+          quantity_reserved: 5,
+          quantity_available: 17,
+          quantity_incoming: 6,
+          in_transit: 7,
+        }));
+
+        expect(await service.getItemStockLocations('legacy-api-item')).toEqual([{
+          stock_row_id: 'legacy-api-stock', item_id: 'legacy-api-item', item_number: 701,
+          variation_id: 'variation-api', variation_location_id: 'variation-location-api',
+          location_id: 'location-api', location_name: 'API Warehouse', category_name: 'API Category',
+          quantity_on_hand: 11, quantity_reserved: null, quantity_available: null,
+          quantity_incoming: null, in_transit: null, price: 19.5, cost: 8.25,
+          valuation: 90.75, barcode: 'API-BARCODE', cache_source: 'api',
+          source_api_version: null, imported_at: 610,
+        }]);
+        expect(await service.getItemStockLocations('legacy-csv-item')).toEqual([{
+          stock_row_id: 'legacy-csv-stock', item_id: 'legacy-csv-item', item_number: 702,
+          variation_id: 'variation-csv', variation_location_id: 'variation-location-csv',
+          location_id: 'location-csv', location_name: 'CSV Warehouse', category_name: 'CSV Category',
+          quantity_on_hand: 22, quantity_reserved: 5, quantity_available: 17,
+          quantity_incoming: 6, in_transit: 7, price: 29.5, cost: 18.25,
+          valuation: 401.5, barcode: 'CSV-BARCODE', cache_source: 'csv',
+          source_api_version: null, imported_at: 620,
+        }]);
+      } finally {
+        db.close();
+      }
+    });
+
     it('migrates schema v3 lifecycle state as unknown without losing records', async () => {
       await service.insertDocument({
         doc_id: 'legacy-doc', context_id: DocumentContextId.Invoice, doc_number: 7001,
@@ -93,7 +187,7 @@ describe('SQLiteCacheService', () => {
       [2, createLegacyV2Database, null, 0],
       [3, createLegacyV3Database, null, 1],
       [4, createLegacyV4Database, 1, 1],
-    ] as const)('migrates genuine schema v%s fixtures to v5 without losing rows', async (
+    ] as const)('migrates genuine schema v%s fixtures to the current schema without losing rows', async (
       version,
       createLegacyDatabase,
       expectedArchived,
@@ -227,6 +321,257 @@ describe('SQLiteCacheService', () => {
 
       await service.insertItem({ item_id: 'item-1', name: 'Active item', archived: 0 });
       expect((await service.getItem('item-1'))?.archived).toBe(0);
+    });
+  });
+
+  describe('Inventory schema v7 snapshots', () => {
+    it('round-trips nullable stock values through insert, batch, and replacement writes', async () => {
+      await service.insertItem({ item_id: 'nullable-item', name: 'Nullable item', source_api_version: null });
+      const nullable = stockRow('nullable-stock', 'nullable-item', {
+        quantity_reserved: null,
+        quantity_available: null,
+        quantity_incoming: null,
+        in_transit: null,
+        source_api_version: null,
+      });
+      await service.insertItemStockLocation(nullable);
+      expect(await service.getItemStockLocations('nullable-item')).toEqual([expect.objectContaining(nullable)]);
+
+      await service.batchInsertItemStockLocations([stockRow('batch-nullable', 'nullable-item', {
+        quantity_reserved: null,
+        quantity_available: 0,
+        quantity_incoming: null,
+        in_transit: 2,
+      })]);
+      await service.replaceItemStockLocations('nullable-item', [stockRow('replacement-nullable', 'nullable-item', {
+        quantity_reserved: null,
+        quantity_available: null,
+        quantity_incoming: null,
+        in_transit: null,
+      })]);
+      expect(await service.getItemStockLocations('nullable-item')).toEqual([
+        expect.objectContaining({
+          stock_row_id: 'replacement-nullable', quantity_reserved: null, quantity_available: null,
+          quantity_incoming: null, in_transit: null,
+        }),
+      ]);
+    });
+
+    it('atomically replaces API inventory while preserving CSV-only rows and publishing metadata', async () => {
+      const csvItem: ItemRow = { item_id: 'csv-item', name: 'CSV item', cache_source: 'csv' };
+      const csvStock = stockRow('csv-stock', 'csv-item', {
+        cache_source: 'csv', quantity_reserved: 4, quantity_available: 6,
+        quantity_incoming: 8, in_transit: 2, source_api_version: null,
+      });
+      await service.insertItem(csvItem);
+      await service.insertItemStockLocation(csvStock);
+      await service.insertItem({ item_id: 'old-api-item', name: 'Old API', cache_source: 'api' });
+      await service.insertItemStockLocation(stockRow('old-api-stock', 'old-api-item'));
+
+      const snapshot = inventorySnapshot('generation-success');
+      await service.replaceInventorySnapshot(snapshot);
+
+      expect(await service.getAllItems()).toEqual(expect.arrayContaining([
+        expect.objectContaining(csvItem),
+        expect.objectContaining(snapshot.items[0]),
+      ]));
+      expect(await service.getItem('old-api-item')).toBeUndefined();
+      expect(await service.getAllItemStockLocations()).toEqual(expect.arrayContaining([
+        expect.objectContaining(csvStock),
+        expect.objectContaining(snapshot.stockRows[0]),
+      ]));
+      expect(await service.getInventoryCacheMeta()).toEqual(snapshot.meta);
+      expect(rawTextMeta(testDbPath, INVENTORY_SNAPSHOT_META_KEY)).toBe(JSON.stringify(snapshot.meta));
+      expect(rawTextMeta(testDbPath, INVENTORY_ACCOUNT_META_KEY)).toBe(snapshot.meta.accountIdentity);
+      expect(await service.getCacheState()).toMatchObject({
+        schemaVersion: 7, itemCount: 2, stockLocationCount: 2,
+        lastItemSync: snapshot.meta.completedAt, lastFullItemSync: snapshot.meta.completedAt,
+        inventorySourceApiVersion: '3',
+      });
+    });
+
+    it('resolves shared item identities to v3 while preserving CSV stock across snapshots', async () => {
+      await service.insertItem({ item_id: 'shared-item', name: 'CSV item', cache_source: 'csv' });
+      const csvStock = stockRow('csv-shared-stock', 'shared-item', {
+        cache_source: 'csv', source_api_version: null, quantity_reserved: 4,
+      });
+      await service.insertItemStockLocation(csvStock);
+      const first = inventorySnapshot('generation-first', [{
+        item_id: 'shared-item', name: 'V3 item', cache_source: 'api', source_api_version: '3',
+      }], [stockRow('api-first-stock', 'shared-item')]);
+
+      await service.replaceInventorySnapshot(first);
+      expect(await service.getItem('shared-item')).toMatchObject({
+        name: 'V3 item', cache_source: 'api', source_api_version: '3',
+      });
+      expect(await service.getItemStockLocations('shared-item')).toEqual(expect.arrayContaining([
+        expect.objectContaining(csvStock),
+        expect.objectContaining(first.stockRows[0]),
+      ]));
+
+      const second = inventorySnapshot('generation-second', [{
+        item_id: 'shared-item', name: 'V3 item updated', cache_source: 'api', source_api_version: '3',
+      }], [stockRow('api-second-stock', 'shared-item')]);
+      await service.replaceInventorySnapshot(second);
+
+      expect(await service.getItemStockLocations('shared-item')).toEqual(expect.arrayContaining([
+        expect.objectContaining(csvStock),
+        expect.objectContaining(second.stockRows[0]),
+      ]));
+      expect(await service.getItemStockLocations('shared-item')).toHaveLength(2);
+      expect(await service.getInventoryCacheMeta()).toEqual(second.meta);
+    });
+
+    it('fails inventory metadata closed on schema, account, metadata, and row-count mismatches', async () => {
+      const snapshot = inventorySnapshot('generation-authority');
+      await service.replaceInventorySnapshot(snapshot);
+      const db = new Database(testDbPath);
+      try {
+        const state = await service.getCacheState();
+        db.prepare(`UPDATE cache_meta SET value = ? WHERE key = 'state'`)
+          .run(JSON.stringify({ ...state, schemaVersion: 6 }));
+        expect(await service.getInventoryCacheMeta()).toBeNull();
+        db.prepare(`UPDATE cache_meta SET value = ? WHERE key = 'state'`).run(JSON.stringify(state));
+
+        db.prepare('UPDATE cache_meta SET value = ? WHERE key = ?')
+          .run('salesbinder:other', INVENTORY_ACCOUNT_META_KEY);
+        expect(await service.getInventoryCacheMeta()).toBeNull();
+        db.prepare('UPDATE cache_meta SET value = ? WHERE key = ?')
+          .run(snapshot.meta.accountIdentity, INVENTORY_ACCOUNT_META_KEY);
+
+        db.prepare('UPDATE cache_meta SET value = ? WHERE key = ?')
+          .run(JSON.stringify({ ...snapshot.meta, unexpected: true }), INVENTORY_SNAPSHOT_META_KEY);
+        expect(await service.getInventoryCacheMeta()).toBeNull();
+        db.prepare('UPDATE cache_meta SET value = ? WHERE key = ?')
+          .run(JSON.stringify(snapshot.meta), INVENTORY_SNAPSHOT_META_KEY);
+
+        db.prepare(`DELETE FROM item_stock_locations WHERE cache_source = 'api'`).run();
+        expect(await service.getInventoryCacheMeta()).toBeNull();
+      } finally {
+        db.close();
+      }
+    });
+
+    it('clears inventory authority and preserves valid mirror metadata only with matching rows', async () => {
+      const snapshot = inventorySnapshot('generation-mirror');
+      const mirrorState: CacheState = {
+        lastSync: 100, lastFullSync: 100, documentCount: 0, itemDocumentCount: 0,
+        accountName: 'source', schemaVersion: 7, itemCount: 1, stockLocationCount: 1,
+        inventorySourceApiVersion: '3',
+      };
+      await service.replaceMirror({
+        accounts: [], categorySnapshot: null, inventoryCacheMeta: snapshot.meta,
+        items: snapshot.items, itemStockLocations: snapshot.stockRows, documents: [],
+        itemDocuments: [], paymentTransactions: [], cacheState: mirrorState,
+        paymentSyncStatus: null, pulledAt: 100,
+      });
+      expect(await service.getInventoryCacheMeta()).toEqual(snapshot.meta);
+
+      expect(() => service.replaceMirror({
+        accounts: [], categorySnapshot: null, inventoryCacheMeta: { ...snapshot.meta, itemCount: 2 },
+        items: snapshot.items, itemStockLocations: snapshot.stockRows, documents: [],
+        itemDocuments: [], paymentTransactions: [], cacheState: mirrorState,
+        paymentSyncStatus: null, pulledAt: 200,
+      })).toThrow(/metadata does not match/);
+      expect(await service.getInventoryCacheMeta()).toEqual(snapshot.meta);
+
+      await service.clearAll();
+      expect(await service.getInventoryCacheMeta()).toBeNull();
+      expect(rawTextMeta(testDbPath, INVENTORY_SNAPSHOT_META_KEY)).toBeUndefined();
+      expect(rawTextMeta(testDbPath, INVENTORY_ACCOUNT_META_KEY)).toBeUndefined();
+    });
+
+    it('invalidates v3 authority after non-snapshot item and stock mutations', async () => {
+      const snapshot = inventorySnapshot('generation-mutation');
+      await service.replaceInventorySnapshot(snapshot);
+
+      await service.insertItem({
+        ...snapshot.items[0], name: 'Changed outside snapshot', source_api_version: '2.0',
+      });
+      expect(await service.getInventoryCacheMeta()).toBeNull();
+      expect((await service.getCacheState())?.inventorySourceApiVersion).toBeUndefined();
+      expect(rawTextMeta(testDbPath, INVENTORY_SNAPSHOT_META_KEY)).toBeUndefined();
+
+      await service.replaceInventorySnapshot(snapshot);
+      await service.replaceItemStockLocations(snapshot.items[0].item_id, [{
+        ...snapshot.stockRows[0], quantity_on_hand: 999, source_api_version: '2.0',
+      }]);
+      expect(await service.getInventoryCacheMeta()).toBeNull();
+      expect((await service.getCacheState())?.inventorySourceApiVersion).toBeUndefined();
+    });
+
+    it('invalidates v3 authority when category reconciliation changes fingerprinted names', async () => {
+      const inventory = inventorySnapshot('generation-category', [{
+        item_id: 'snapshot-item', name: 'Snapshot item', category_id: 'category-1',
+        category_name: 'Old category', cache_source: 'api', source_api_version: '3',
+      }], [stockRow('snapshot-stock', 'snapshot-item', { category_name: 'Old category' })]);
+      await service.replaceInventorySnapshot(inventory);
+
+      await service.replaceCategorySnapshot({
+        rows: [{
+          category_id: 'category-1', name: 'Renamed category', item_count: 1,
+          parent_id: null, parent_name: null, inventory_type: 'quantity',
+          custom_fields_json: null, created: null, modified: 101, cache_source: 'api',
+          source_api_version: '3', imported_at: 101,
+        }],
+        meta: {
+          version: 1, status: 'complete', accountIdentity: inventory.meta.accountIdentity,
+          startedAt: 100, completedAt: 101, count: 1, page: 1, pages: 1,
+          sourceRowCount: 1, storedRowCount: 1, schemaVersion: 7,
+          sourceApiVersion: '3', generation: 'category-generation',
+          fingerprint: 'sha256:category-generation',
+        },
+      });
+
+      expect((await service.getItem('snapshot-item'))?.category_name).toBe('Renamed category');
+      expect(await service.getInventoryCacheMeta()).toBeNull();
+      expect((await service.getCacheState())?.inventorySourceApiVersion).toBeUndefined();
+    });
+
+    it('publishes mirror inventory authority only when category reconciliation preserves final rows', async () => {
+      const inventory = inventorySnapshot('generation-category-mirror', [{
+        item_id: 'snapshot-item', name: 'Snapshot item', category_id: 'category-1',
+        category_name: 'Canonical', cache_source: 'api', source_api_version: '3',
+      }], [stockRow('snapshot-stock', 'snapshot-item', { category_name: 'Canonical' })]);
+      const categorySnapshot = {
+        rows: [{
+          category_id: 'category-1', name: 'Canonical', item_count: 1,
+          parent_id: null, parent_name: null, inventory_type: 'quantity' as const,
+          custom_fields_json: null, created: null, modified: 101, cache_source: 'api' as const,
+          source_api_version: '3' as const, imported_at: 101,
+        }],
+        meta: {
+          version: 1 as const, status: 'complete' as const,
+          accountIdentity: inventory.meta.accountIdentity, startedAt: 100, completedAt: 101,
+          count: 1, page: 1, pages: 1, sourceRowCount: 1, storedRowCount: 1,
+          schemaVersion: 7 as const, sourceApiVersion: '3' as const,
+          generation: 'category-mirror', fingerprint: 'sha256:category-mirror',
+        },
+      };
+      const mirrorState: CacheState = {
+        lastSync: 101, lastFullSync: 101, documentCount: 0, itemDocumentCount: 0,
+        accountName: 'source', schemaVersion: 7, inventorySourceApiVersion: '3',
+      };
+
+      await service.replaceMirror({
+        accounts: [], categorySnapshot, inventoryCacheMeta: inventory.meta,
+        items: inventory.items, itemStockLocations: inventory.stockRows,
+        documents: [], itemDocuments: [], paymentTransactions: [], cacheState: mirrorState,
+        paymentSyncStatus: null, pulledAt: 101,
+      });
+      expect(await service.getInventoryCacheMeta()).toEqual(inventory.meta);
+      expect((await service.getCacheState())?.inventorySourceApiVersion).toBe('3');
+
+      expect(() => service.replaceMirror({
+        accounts: [], categorySnapshot: {
+          ...categorySnapshot,
+          rows: [{ ...categorySnapshot.rows[0], name: 'Different canonical name' }],
+        },
+        inventoryCacheMeta: inventory.meta, items: inventory.items,
+        itemStockLocations: inventory.stockRows, documents: [], itemDocuments: [],
+        paymentTransactions: [], cacheState: mirrorState, paymentSyncStatus: null, pulledAt: 102,
+      })).toThrow(/category reconciliation.*inventory metadata/i);
+      expect(await service.getInventoryCacheMeta()).toEqual(inventory.meta);
     });
   });
 
@@ -1004,6 +1349,111 @@ describe('SQLiteCacheService', () => {
   });
 });
 
+function createLegacyV6InventoryDatabase(dbPath: string): void {
+  const db = new Database(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE items (
+        item_id TEXT PRIMARY KEY, item_number INTEGER NULL, name TEXT NOT NULL,
+        description TEXT NULL, sku TEXT NULL, serial_number TEXT NULL, barcode TEXT NULL,
+        category_id TEXT NULL, category_name TEXT NULL, quantity REAL NULL,
+        quantity_reserved REAL NULL, quantity_available REAL NULL, quantity_incoming REAL NULL,
+        in_transit REAL NULL, threshold REAL NULL, cost REAL NULL, price REAL NULL,
+        valuation REAL NULL, published INTEGER NULL, archived INTEGER NULL, created TEXT NULL,
+        modified INTEGER NULL, cache_source TEXT NOT NULL DEFAULT 'api', imported_at INTEGER NULL
+      );
+      CREATE TABLE item_stock_locations (
+        stock_row_id TEXT PRIMARY KEY, item_id TEXT NOT NULL, item_number INTEGER NULL,
+        variation_id TEXT NULL, variation_location_id TEXT NULL, location_id TEXT NULL,
+        location_name TEXT NULL, category_name TEXT NULL,
+        quantity_on_hand REAL NOT NULL DEFAULT 0,
+        quantity_reserved REAL NOT NULL DEFAULT 0,
+        quantity_available REAL NOT NULL DEFAULT 0,
+        quantity_incoming REAL NOT NULL DEFAULT 0,
+        in_transit REAL NOT NULL DEFAULT 0,
+        price REAL NULL, cost REAL NULL, valuation REAL NULL, barcode TEXT NULL,
+        cache_source TEXT NOT NULL DEFAULT 'api', imported_at INTEGER NULL,
+        FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE
+      );
+      CREATE TABLE categories (
+        category_id TEXT PRIMARY KEY, name TEXT NOT NULL, item_count INTEGER NULL,
+        parent_id TEXT NULL, parent_name TEXT NULL, created TEXT NULL, modified INTEGER NULL,
+        cache_source TEXT NOT NULL DEFAULT 'api', imported_at INTEGER NOT NULL
+      );
+      CREATE TABLE category_cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE INDEX idx_stock_item ON item_stock_locations(item_id);
+      CREATE INDEX idx_stock_location ON item_stock_locations(location_id);
+      INSERT INTO items (
+        item_id, item_number, name, quantity_reserved, quantity_available,
+        quantity_incoming, in_transit, cache_source, imported_at
+      ) VALUES
+        ('legacy-api-item', 701, 'Legacy API item', 2, 9, 3, 4, 'api', 610),
+        ('legacy-csv-item', 702, 'Legacy CSV item', 5, 17, 6, 7, 'csv', 620);
+      INSERT INTO item_stock_locations (
+        stock_row_id, item_id, item_number, variation_id, variation_location_id,
+        location_id, location_name, category_name, quantity_on_hand,
+        quantity_reserved, quantity_available, quantity_incoming, in_transit,
+        price, cost, valuation, barcode, cache_source, imported_at
+      ) VALUES
+        ('legacy-api-stock', 'legacy-api-item', 701, 'variation-api', 'variation-location-api',
+         'location-api', 'API Warehouse', 'API Category', 11, 2, 9, 3, 4,
+         19.5, 8.25, 90.75, 'API-BARCODE', 'api', 610),
+        ('legacy-csv-stock', 'legacy-csv-item', 702, 'variation-csv', 'variation-location-csv',
+         'location-csv', 'CSV Warehouse', 'CSV Category', 22, 5, 17, 6, 7,
+         29.5, 18.25, 401.5, 'CSV-BARCODE', 'csv', 620);
+      PRAGMA user_version = 6;
+    `);
+  } finally {
+    db.close();
+  }
+}
+
+function inventorySnapshot(
+  generation: string,
+  items: ItemRow[] = [{
+    item_id: 'snapshot-item', name: 'Snapshot item', cache_source: 'api', source_api_version: '3',
+  }],
+  stockRows: ItemStockLocationRow[] = [stockRow('snapshot-stock', 'snapshot-item')],
+): InventorySnapshot {
+  return {
+    items,
+    stockRows,
+    meta: {
+      version: 1,
+      status: 'complete',
+      accountIdentity: 'salesbinder:test-account',
+      startedAt: 90,
+      completedAt: 100,
+      itemCount: items.filter((row) => row.cache_source === 'api' && row.source_api_version === '3').length,
+      stockRowCount: stockRows.filter((row) => row.cache_source === 'api' && row.source_api_version === '3').length,
+      schemaVersion: 7,
+      sourceApiVersion: '3',
+      generation,
+      fingerprint: `sha256:${generation}`,
+    },
+  };
+}
+
+function stockRow(
+  stock_row_id: string,
+  item_id: string,
+  overrides: Partial<ItemStockLocationRow> = {},
+): ItemStockLocationRow {
+  return {
+    stock_row_id,
+    item_id,
+    quantity_on_hand: 10,
+    quantity_reserved: null,
+    quantity_available: null,
+    quantity_incoming: null,
+    in_transit: null,
+    cache_source: 'api',
+    source_api_version: '3',
+    ...overrides,
+  };
+}
+
 function createLegacyV1Database(dbPath: string): void {
   const db = new Database(dbPath);
   try {
@@ -1227,4 +1677,13 @@ function legacyItemsTableSql(): string {
       imported_at INTEGER NULL
     );
   `;
+}
+
+function rawTextMeta(dbPath: string, key: string): string | undefined {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    return (db.prepare('SELECT value FROM cache_meta WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+  } finally {
+    db.close();
+  }
 }

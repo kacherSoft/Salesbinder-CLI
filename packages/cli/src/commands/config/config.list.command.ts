@@ -12,7 +12,8 @@ import { CONFIG_PATH, type SalesBinderConfig } from '@salesbinder/sdk';
 export function registerConfigList(program: Command): void {
   program
     .command('config:list')
-    .description(`List all configured SalesBinder accounts
+    .description(
+      `List all configured SalesBinder accounts
 
 Example:
   salesbinder config:list
@@ -24,7 +25,8 @@ Shows:
   - Which account is set as default
 
 Use --account flag with other commands to switch accounts:
-  salesbinder items list --account production`)
+  salesbinder items list --account production`
+    )
     .action(() => {
       try {
         if (!fs.existsSync(CONFIG_PATH)) {
@@ -49,10 +51,17 @@ Use --account flag with other commands to switch accounts:
           name,
           subdomain: acct.subdomain,
           apiVersion: acct.apiVersion,
+          has_v3_api_key: Boolean(acct.v3ApiKey),
           isDefault: name === config.defaultAccount,
         }));
 
-        console.log(JSON.stringify({ configured: true, defaultAccount: config.defaultAccount, accounts }, null, 2));
+        console.log(
+          JSON.stringify(
+            { configured: true, defaultAccount: config.defaultAccount, accounts },
+            null,
+            2
+          )
+        );
       } catch (error) {
         console.error(
           JSON.stringify({

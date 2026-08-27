@@ -24,6 +24,12 @@ export interface ResumeCacheSnapshot {
   categorySchemaVersion: number | null;
   categoryGeneration: string | null;
   categoryFingerprint: string | null;
+  inventoryStatus: 'complete' | 'uninitialized';
+  inventoryCompletedAt: number | null;
+  inventorySchemaVersion: number | null;
+  inventorySourceApiVersion: '3' | null;
+  inventoryGeneration: string | null;
+  inventoryFingerprint: string | null;
   documentCount: number;
   itemDocumentCount: number;
   paymentTransactionCount: number;
@@ -36,7 +42,7 @@ export interface ResumeCacheSnapshot {
 }
 
 export interface FullResumeCheckpoint {
-  version: 3;
+  version: 4;
   runType: 'full-resume';
   accountName: string;
   syncTarget: FullResumeSyncTarget;
@@ -80,7 +86,7 @@ interface CacheIdentityOptions {
   databaseUrl?: string;
 }
 
-const CHECKPOINT_VERSION = 3;
+const CHECKPOINT_VERSION = 4;
 const PHASES: FullResumePhase[] = ['accounts', 'categories', 'documents', 'items', 'deleted-log'];
 const SNAPSHOT_COUNT_FIELDS: Array<keyof ResumeCacheSnapshot> = [
   'accountCount',
@@ -100,19 +106,36 @@ const SNAPSHOT_CATEGORY_FIELDS: Array<keyof ResumeCacheSnapshot> = [
   'categoryGeneration',
   'categoryFingerprint',
 ];
+const SNAPSHOT_INVENTORY_FIELDS: Array<keyof ResumeCacheSnapshot> = [
+  'inventoryStatus',
+  'inventoryCompletedAt',
+  'inventorySchemaVersion',
+  'inventorySourceApiVersion',
+  'inventoryGeneration',
+  'inventoryFingerprint',
+];
 const SNAPSHOT_FIELDS = [
   ...SNAPSHOT_COUNT_FIELDS,
   ...SNAPSHOT_WATERMARK_FIELDS,
   ...SNAPSHOT_PAYMENT_FIELDS,
   ...SNAPSHOT_CATEGORY_FIELDS,
+  ...SNAPSHOT_INVENTORY_FIELDS,
 ];
 const PHASE_FIELDS: Record<FullResumePhase, Array<keyof ResumeCacheSnapshot>> = {
   accounts: ['accountCount', 'lastAccountSync'],
   categories: ['categoryCount', ...SNAPSHOT_CATEGORY_FIELDS],
   documents: ['documentCount', 'itemDocumentCount', 'paymentTransactionCount', 'paymentSyncStatusFingerprint'],
-  items: ['itemCount', 'stockLocationCount', 'lastItemSync'],
+  items: ['itemCount', 'stockLocationCount', 'lastItemSync', ...SNAPSHOT_INVENTORY_FIELDS],
   'deleted-log': ['lastDeletedSync'],
 };
+const DELETED_LOG_MUTABLE_COUNT_FIELDS = new Set<keyof ResumeCacheSnapshot>([
+  'accountCount',
+  'documentCount',
+  'itemDocumentCount',
+  'paymentTransactionCount',
+  'itemCount',
+  'stockLocationCount',
+]);
 
 export function sanitizeCheckpointAccountName(accountName: string): string {
   return accountName.replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -245,14 +268,7 @@ export class FullResumeCheckpointStore {
       return;
     }
     if (checkpoint.phase === 'deleted-log') {
-      if (this.isPhaseComplete(checkpoint, 'categories')) {
-        this.validatePhaseSnapshot(
-          checkpoint,
-          current,
-          'categories',
-          ['categoryCount', ...SNAPSHOT_CATEGORY_FIELDS],
-        );
-      }
+      this.validateDeletedLogResume(checkpoint, current);
       return;
     }
     for (const phase of checkpoint.completedPhases) {
@@ -303,6 +319,36 @@ export class FullResumeCheckpointStore {
       if (current[field] !== evidence[field]) {
         throw this.invalidCheckpoint(`${phase} cache state changed at ${field}`);
       }
+    }
+  }
+
+  private validateDeletedLogResume(
+    checkpoint: FullResumeCheckpoint,
+    current: ResumeCacheSnapshot,
+  ): void {
+    let latestEvidence: ResumeCacheSnapshot | undefined;
+    for (const phase of checkpoint.completedPhases) {
+      if (phase === 'deleted-log') continue;
+      const evidence = checkpoint.phaseEvidence[phase];
+      if (!evidence) throw this.invalidCheckpoint(`${phase} phase evidence is missing`);
+      latestEvidence = evidence;
+      for (const field of PHASE_FIELDS[phase]) {
+        if (DELETED_LOG_MUTABLE_COUNT_FIELDS.has(field)) {
+          // A failed deleted-log pass can already have applied idempotent deletes.
+          // Permit those decreases, but reject additions from another cache writer.
+          if (Number(current[field]) > Number(evidence[field])) {
+            throw this.invalidCheckpoint(`${phase} cache state increased at ${field}`);
+          }
+          continue;
+        }
+        if (current[field] !== evidence[field]) {
+          throw this.invalidCheckpoint(`${phase} cache state changed at ${field}`);
+        }
+      }
+    }
+
+    if (latestEvidence && current.lastDeletedSync !== latestEvidence.lastDeletedSync) {
+      throw this.invalidCheckpoint('deleted-log cache state changed at lastDeletedSync');
     }
   }
 
@@ -380,6 +426,12 @@ function validSnapshot(value: unknown): value is ResumeCacheSnapshot {
     (value.categorySchemaVersion === null || validNonNegativeInteger(value.categorySchemaVersion)) &&
     (value.categoryGeneration === null || typeof value.categoryGeneration === 'string') &&
     (value.categoryFingerprint === null || typeof value.categoryFingerprint === 'string') &&
+    (value.inventoryStatus === 'complete' || value.inventoryStatus === 'uninitialized') &&
+    (value.inventoryCompletedAt === null || validNonNegativeInteger(value.inventoryCompletedAt)) &&
+    (value.inventorySchemaVersion === null || validNonNegativeInteger(value.inventorySchemaVersion)) &&
+    (value.inventorySourceApiVersion === null || value.inventorySourceApiVersion === '3') &&
+    (value.inventoryGeneration === null || typeof value.inventoryGeneration === 'string') &&
+    (value.inventoryFingerprint === null || typeof value.inventoryFingerprint === 'string') &&
     (value.paymentSyncStatusFingerprint === null ||
       (typeof value.paymentSyncStatusFingerprint === 'string' && /^[a-f0-9]{64}$/.test(value.paymentSyncStatusFingerprint)));
 }

@@ -75,6 +75,7 @@ Configure when the cache is considered stale (default: 3600 seconds = 1 hour).
     "default": {
       "subdomain": "acme",
       "apiKey": "your-key",
+      "v3ApiKey": "your-v3-bearer-key",
       "apiVersion": "2.0"
     }
   },
@@ -84,6 +85,8 @@ Configure when the cache is considered stale (default: 3600 seconds = 1 hour).
   }
 }
 ```
+
+`apiKey` remains the v2 credential used for accounts, documents, delta sync, and the deleted log. Add the optional `v3ApiKey` to make inventory and category cache refreshes use the v3 Bearer API. New configurations can set both with `salesbinder config:init --subdomain acme --api-key <v2-key> --v3-api-key <v3-key>`; for an existing configuration, add `v3ApiKey` to that account entry manually. The v3 key must have read access to items and categories, and the cache can only contain records visible to that key.
 
 **Via environment variable** (overrides config):
 ```bash
@@ -128,6 +131,8 @@ The PostgreSQL schema is created automatically on first use.
 Cache schema v4 keeps archive and payment safety intact. Accounts preserve their existing active/archived boolean behavior. Items and documents use `0` for active, `1` for archived, and `NULL` when the source cannot report lifecycle state; a later row with unknown state does not erase a known value. Payment tables and payment-sync metadata remain additive. Cache schema v5 adds shipping fields on documents and line items: `documents.date_sent`, `documents.shipped_percent`, and `item_documents.quantity_shipped`.
 
 Cache schema v6 makes categories a first-class cache feature in SQLite and PostgreSQL. A successful snapshot atomically replaces `categories`, stores typed completion metadata in `category_cache_meta`, writes a matching generation marker, and reconciles category names on items and stock-location rows. Invalid pagination or an interrupted fetch performs no category writes. Rolling back to v5 may leave v6 columns or rows physically present; after re-upgrade they remain non-authoritative until a new v6 category snapshot completes.
+
+Cache schema v7 records the source API version for inventory and category rows. With `v3ApiKey` configured, items, variation-location details, and categories are fetched as complete validated v3 snapshots and published atomically; archive coverage uses `archived=all`. Embedded variation locations retain their names, while a parent item's direct `location_id` has no location name unless the item payload supplies one. Without that key, the CLI keeps the v2 cache path for compatibility but stores inventory values missing from the v2 response as `NULL` instead of fabricating zeroes. CSV-derived stock rows and their numeric values remain unchanged; when a CSV and API item share an ID, the v3 row is the canonical item master. For direct SQL, treat `NULL` as unknown—not as zero—and check the snapshot metadata before treating a cache as authoritative.
 
 | Feature | SQLite (local mirror) | PostgreSQL (shared upstream) |
 |---------|------------------------|-------------------------------|
@@ -611,7 +616,7 @@ node packages/cli/dist/cli.js cache sync --full
 # Backfill invoice payment transactions (resumable)
 node packages/cli/dist/cli.js cache sync-payments
 
-# Check cache status (includes authoritative category snapshot metadata)
+# Check cache status (includes authoritative category and inventory snapshot metadata)
 node packages/cli/dist/cli.js cache status
 
 # Clear cache data
@@ -620,11 +625,11 @@ node packages/cli/dist/cli.js cache clear
 
 `cache sync --pull` is the only sync path that refreshes the local SQLite mirror. If the requested mirror refresh fails, the command exits non-zero and reports the pull error.
 
-Every normal, delta, full, and full-resume sync fetches categories as a complete validated snapshot. Pagination metadata (`count`, `page`, and `pages`) must remain coherent across every page. The previous category snapshot and derived item/stock names remain unchanged if fetch or validation fails.
+Every normal, delta, full, and full-resume sync fetches categories as a complete validated snapshot. When `v3ApiKey` is configured, inventory is also rebuilt from one complete validated v3 snapshot on every sync because the API does not expose a safe inventory delta contract. Pagination metadata must remain coherent across every page, and two consecutive v3 membership reads must agree before publication. The previous category or inventory snapshot remains unchanged if fetch or validation fails.
 
-`cache sync --full-resume` writes a private checkpoint under the per-account cache directory with restrictive permissions and resumes completed phases in this order: accounts, categories, documents, items, deleted log. Category generation and content fingerprint are checkpoint evidence, so a same-count rename or parent change invalidates stale evidence. The checkpoint is bound to the account, sync target, schema, and cache identity; older v5 checkpoints, malformed files, and cross-account checkpoints fail closed and ask for `--reset-checkpoint`.
+`cache sync --full-resume` writes a private checkpoint under the per-account cache directory with restrictive permissions and resumes completed phases in this order: accounts, categories, documents, items, deleted log. Category and inventory generations and content fingerprints are checkpoint evidence, so a same-count content change invalidates stale evidence. The checkpoint is bound to the account, sync target, schema, and cache identity; checkpoints from older schemas, malformed files, and cross-account checkpoints fail closed and ask for `--reset-checkpoint`. A resumed v3 item phase always reruns the entire atomic inventory snapshot rather than resuming midway through it.
 
-`cache clear` deletes category rows, category snapshot metadata, and the generation marker. PostgreSQL deliberately preserves its immutable SalesBinder account binding; use a separate database when changing accounts.
+`cache clear` deletes category rows, category snapshot metadata, and the generation marker. PostgreSQL deliberately preserves its immutable SalesBinder account binding; use a separate database when changing accounts. SQLite also verifies its durable account binding before deleting the local file. For a legacy SQLite file created before binding markers existed, `cache clear --force-unbound` is the explicit recovery path; it works only when both markers are absent and never overrides a mismatched or partial binding.
 
 Use `cache sync-payments` once per account to populate `payment_transactions` and `cache_meta.payment_sync_status` for historical payment reporting. If the command stops partway through, rerun it; it resumes from the saved cursor. After the cache reaches `complete`, run `cache sync` once to catch invoices modified during the backfill; later normal syncs continue refreshing invoice payment rows.
 

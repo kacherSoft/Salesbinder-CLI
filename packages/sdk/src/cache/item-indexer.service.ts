@@ -100,14 +100,19 @@ export class ItemIndexerService {
       category_id: item.category_id ?? item.category?.id ?? null,
       category_name: categoryName(item, categoryNames),
       quantity: item.quantity,
+      quantity_reserved: observedNumber(item.quantity_reserved),
+      quantity_available: observedNumber(item.quantity_available),
+      quantity_incoming: observedNumber(item.quantity_incoming),
+      in_transit: observedNumber(item.in_transit),
       threshold: item.threshold,
       cost: item.cost,
       price: item.price,
       published: item.published == null ? null : item.published ? 1 : 0,
       archived: item.archived == null ? null : item.archived ? 1 : 0,
-      created: item.created,
-      modified: toUnix(item.modified),
+      created: item.created ?? (item as Item & { created_at?: string }).created_at ?? null,
+      modified: toUnix(item.modified ?? (item as Item & { updated_at?: string }).updated_at),
       cache_source: 'api',
+      source_api_version: '2.0',
     };
   }
 
@@ -127,15 +132,16 @@ export class ItemIndexerService {
         location_id: item.location?.id ?? null,
         location_name: item.location?.name ?? null,
         category_name: categoryName(item, categoryNames),
-        quantity_on_hand: item.quantity ?? 0,
-        quantity_reserved: 0,
-        quantity_available: item.quantity ?? 0,
-        quantity_incoming: 0,
-        in_transit: 0,
+        quantity_on_hand: requiredNumber(item.quantity, 'item.quantity'),
+        quantity_reserved: observedNumber(item.quantity_reserved),
+        quantity_available: observedNumber(item.quantity_available),
+        quantity_incoming: observedNumber(item.quantity_incoming),
+        in_transit: observedNumber(item.in_transit),
         price: item.price,
         cost: item.cost,
         barcode: item.barcode ?? null,
         cache_source: 'api',
+        source_api_version: '2.0',
       });
     }
 
@@ -148,7 +154,7 @@ export class ItemIndexerService {
     location: ItemVariationLocation,
     categoryNames: Map<string, string> | null,
   ): ItemStockLocationRow {
-    const quantity = location.quantity ?? 0;
+    const quantity = requiredNumber(location.quantity, 'variation location quantity');
     return {
       stock_row_id: String(location.id ?? syntheticId('api-stock', item.id, variationId, location.location_id ?? 'none')),
       item_id: item.id,
@@ -158,14 +164,15 @@ export class ItemIndexerService {
       location_id: location.location_id ?? null,
       category_name: categoryName(item, categoryNames),
       quantity_on_hand: quantity,
-      quantity_reserved: 0,
-      quantity_available: quantity,
-      quantity_incoming: 0,
-      in_transit: 0,
+      quantity_reserved: observedNumber(location.quantity_reserved),
+      quantity_available: observedNumber(location.quantity_available),
+      quantity_incoming: observedNumber(location.quantity_incoming),
+      in_transit: observedNumber(location.in_transit),
       price: item.price,
       cost: item.cost,
       barcode: item.barcode ?? null,
       cache_source: 'api',
+      source_api_version: '2.0',
     };
   }
 
@@ -181,6 +188,7 @@ export class ItemIndexerService {
       itemCount: await this.cache.getItemCount(),
       stockLocationCount: await this.cache.getStockLocationCount(),
       lastItemSync: now,
+      inventorySourceApiVersion: '2.0',
     };
   }
 }
@@ -191,9 +199,22 @@ function toCategoryNameIndex(snapshot: CategorySnapshot | null): Map<string, str
 }
 
 function categoryName(item: Item, categoryNames: Map<string, string> | null): string | null {
-  if (!categoryNames) return item.category?.name ?? null;
+  if (!categoryNames) return item.category_name ?? item.category?.name ?? null;
   const categoryId = item.category_id ?? item.category?.id;
   return categoryId ? categoryNames.get(categoryId) ?? null : null;
+}
+
+function observedNumber(value: unknown): number | null {
+  if (value == null) return null;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(parsed)) throw new Error('SalesBinder returned a non-numeric stock balance');
+  return parsed;
+}
+
+function requiredNumber(value: unknown, field: string): number {
+  const parsed = observedNumber(value);
+  if (parsed == null) throw new Error(`SalesBinder item detail is missing required ${field}`);
+  return parsed;
 }
 
 function syntheticId(...parts: string[]): string {

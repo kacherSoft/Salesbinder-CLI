@@ -13,11 +13,13 @@ import { CONFIG_PATH } from '@salesbinder/sdk';
 export function registerConfigInit(program: Command): void {
   program
     .command('config:init')
-    .description(`Initialize CLI configuration
+    .description(
+      `Initialize CLI configuration
 
 Examples:
   salesbinder config:init
   salesbinder config:init --subdomain acme --api-key <key>
+  salesbinder config:init --subdomain acme --api-key <key> --v3-api-key <v3-key>
   salesbinder config:init --subdomain acme --api-key <key> --account-name production
 
 This command:
@@ -33,9 +35,15 @@ To get your API key:
 Options:
   --subdomain     Your SalesBinder subdomain (e.g., "acme" from acme.salesbinder.com)
   --api-key       Your SalesBinder API key from Settings > API Access
-  --account-name  Account name for this configuration (default: "default")`)
-    .option('--subdomain <subdomain>', 'Your SalesBinder subdomain (e.g., "acme" from acme.salesbinder.com)')
+  --v3-api-key    Optional SalesBinder API v3 key
+  --account-name  Account name for this configuration (default: "default")`
+    )
+    .option(
+      '--subdomain <subdomain>',
+      'Your SalesBinder subdomain (e.g., "acme" from acme.salesbinder.com)'
+    )
     .option('--api-key <key>', 'Your SalesBinder API key')
+    .option('--v3-api-key <key>', 'Optional SalesBinder API v3 key')
     .option('--account-name <name>', 'Account name for this configuration', 'default')
     .action(async (options) => {
       try {
@@ -52,8 +60,8 @@ Options:
         }
 
         // Prompt for missing values
-        const subdomain = options.subdomain || await promptRequired('Subdomain (e.g., "acme")');
-        const apiKey = options.apiKey || await promptRequired('API Key');
+        const subdomain = options.subdomain || (await promptRequired('Subdomain (e.g., "acme")'));
+        const apiKey = options.apiKey || (await promptRequired('API Key'));
 
         // Create config directory
         const configDir = path.dirname(CONFIG_PATH);
@@ -66,6 +74,7 @@ Options:
             [options.accountName]: {
               subdomain,
               apiKey,
+              ...(options.v3ApiKey ? { v3ApiKey: options.v3ApiKey } : {}),
               apiVersion: '2.0',
               timeout: 30000,
             },
@@ -107,7 +116,9 @@ Options:
 async function promptRequired(label: string): Promise<string> {
   // For non-interactive use, error out
   if (!process.stdin.isTTY) {
-    throw new Error(`Missing required value: ${label}. Use --${label.toLowerCase().replace(' ', '-')} flag.`);
+    throw new Error(
+      `Missing required value: ${label}. Use --${label.toLowerCase().replace(' ', '-')} flag.`
+    );
   }
 
   // Simple readline prompt

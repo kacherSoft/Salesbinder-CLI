@@ -8,10 +8,26 @@ import type { ListParams } from './common.types.js';
 export interface Category {
   id: string;
   name: string;
-  item_count: number;
+  item_count?: number;
   parent_id: string | null;
-  created: string;
-  modified: string;
+  inventory_type?: 'quantity' | 'unique';
+  custom_fields?: CategoryCustomField[];
+  created?: string;
+  modified?: string;
+}
+
+export interface CategoryCustomField {
+  id: string;
+  name: string;
+  display_order: number;
+  display_on_inventory_list: boolean;
+  publish_on_documents: boolean;
+}
+
+export interface V3Category extends Omit<Category, 'item_count' | 'created' | 'modified'> {
+  object: 'item_category';
+  inventory_type: 'quantity' | 'unique';
+  custom_fields: CategoryCustomField[];
 }
 
 /** Create category DTO */

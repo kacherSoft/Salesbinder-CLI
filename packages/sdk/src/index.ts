@@ -2,7 +2,7 @@
  * SalesBinder SDK - Main entry point
  */
 
-export { SalesBinderClient } from './resources/index.js';
+export { SalesBinderClient, SalesBinderV3Client } from './resources/index.js';
 
 // Re-export types for convenience
 export * from './types/common.types.js';

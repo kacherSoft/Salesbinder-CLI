@@ -120,6 +120,7 @@ export interface ItemRow {
   created?: string | null;
   modified?: number | null;
   cache_source?: 'api' | 'csv';
+  source_api_version?: ApiSourceVersion | null;
   imported_at?: number | null;
 }
 
@@ -134,17 +135,20 @@ export interface ItemStockLocationRow {
   location_name?: string | null;
   category_name?: string | null;
   quantity_on_hand: number;
-  quantity_reserved: number;
-  quantity_available: number;
-  quantity_incoming: number;
-  in_transit: number;
+  quantity_reserved: number | null;
+  quantity_available: number | null;
+  quantity_incoming: number | null;
+  in_transit: number | null;
   price?: number | null;
   cost?: number | null;
   valuation?: number | null;
   barcode?: string | null;
   cache_source?: 'api' | 'csv';
+  source_api_version?: ApiSourceVersion | null;
   imported_at?: number | null;
 }
+
+export type ApiSourceVersion = '2.0' | '3';
 
 /** Database schema row for cache_meta table */
 export interface CacheMetaRow {
@@ -152,9 +156,11 @@ export interface CacheMetaRow {
   value: string;
 }
 
-/** Category cache v6 metadata keys shared by both cache backends. */
-export const CATEGORY_SNAPSHOT_META_KEY = 'category_cache.v6.snapshot';
-export const CATEGORY_GENERATION_META_KEY = 'category_cache.v6.generation';
+/** Authoritative snapshot metadata keys shared by both cache backends. */
+export const CATEGORY_SNAPSHOT_META_KEY = 'category_cache.v7.snapshot';
+export const CATEGORY_GENERATION_META_KEY = 'category_cache.v7.generation';
+export const INVENTORY_SNAPSHOT_META_KEY = 'inventory_cache.v7.snapshot';
+export const INVENTORY_ACCOUNT_META_KEY = 'inventory_cache.v7.account_identity';
 
 /** Conservative API bounds used before category pagination allocates or loops. */
 export const MAX_CATEGORY_PAGES = 10_000;
@@ -167,9 +173,12 @@ export interface CategoryCacheRow {
   item_count: number | null;
   parent_id: string | null;
   parent_name: string | null;
+  inventory_type: 'quantity' | 'unique' | null;
+  custom_fields_json: string | null;
   created: string | null;
   modified: number | null;
   cache_source: 'api';
+  source_api_version: ApiSourceVersion;
   imported_at: number;
 }
 
@@ -185,7 +194,8 @@ export interface CategoryCacheMeta {
   pages: number;
   sourceRowCount: number;
   storedRowCount: number;
-  schemaVersion: 6;
+  schemaVersion: 7;
+  sourceApiVersion: ApiSourceVersion;
   generation: string;
   fingerprint: string;
 }
@@ -194,6 +204,27 @@ export interface CategoryCacheMeta {
 export interface CategorySnapshot {
   rows: CategoryCacheRow[];
   meta: CategoryCacheMeta;
+}
+
+/** Complete validated v3 inventory snapshot published in one cache transaction. */
+export interface InventorySnapshot {
+  items: ItemRow[];
+  stockRows: ItemStockLocationRow[];
+  meta: InventoryCacheMeta;
+}
+
+export interface InventoryCacheMeta {
+  version: 1;
+  status: 'complete';
+  accountIdentity: string;
+  startedAt: number;
+  completedAt: number;
+  itemCount: number;
+  stockRowCount: number;
+  schemaVersion: 7;
+  sourceApiVersion: '3';
+  generation: string;
+  fingerprint: string;
 }
 
 /** Immutable identity assigned to a one-account PostgreSQL cache database. */
@@ -216,7 +247,7 @@ export function createSalesBinderAccountBinding(subdomain: string): CacheAccount
 }
 
 /** Cache sync state metadata */
-export const CACHE_SCHEMA_VERSION = 6;
+export const CACHE_SCHEMA_VERSION = 7;
 
 export interface CacheState {
   lastSync: number; // Unix timestamp
@@ -235,6 +266,7 @@ export interface CacheState {
   lastCategorySync?: number;
   lastItemSync?: number;
   lastFullItemSync?: number;
+  inventorySourceApiVersion?: ApiSourceVersion;
   lastDeletedSync?: number;
 }
 

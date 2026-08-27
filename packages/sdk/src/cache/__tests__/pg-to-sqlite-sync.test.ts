@@ -365,6 +365,59 @@ describe('PgToSqliteSyncService', () => {
       expect(targetDb.getRawMeta('pg_pull_timestamp')).toBe(54321);
     });
 
+    it('replaceMirror publishes v3 authority after final category reconciliation', async () => {
+      const accountIdentity = 'salesbinder:mirror';
+      const item: ItemRow = {
+        item_id: 'mirror-v3-item', name: 'Mirror v3 item', category_id: 'category-1',
+        category_name: 'Canonical category', cache_source: 'api', source_api_version: '3',
+      };
+      const stock: ItemStockLocationRow = {
+        stock_row_id: 'mirror-v3-stock', item_id: item.item_id,
+        category_name: 'Canonical category', quantity_on_hand: 4,
+        quantity_reserved: 1, quantity_available: 3, quantity_incoming: null,
+        in_transit: null, cache_source: 'api', source_api_version: '3',
+      };
+      const inventoryCacheMeta = {
+        version: 1 as const, status: 'complete' as const, accountIdentity,
+        startedAt: 400, completedAt: 401, itemCount: 1, stockRowCount: 1,
+        schemaVersion: 7 as const, sourceApiVersion: '3' as const,
+        generation: 'mirror-inventory-generation', fingerprint: 'sha256:mirror-inventory',
+      };
+
+      await targetDb.replaceMirror({
+        accounts: [],
+        categorySnapshot: {
+          rows: [{
+            category_id: 'category-1', name: 'Canonical category', item_count: 1,
+            parent_id: null, parent_name: null, inventory_type: 'quantity',
+            custom_fields_json: null, created: null, modified: 401,
+            cache_source: 'api', source_api_version: '3', imported_at: 401,
+          }],
+          meta: {
+            version: 1, status: 'complete', accountIdentity, startedAt: 400,
+            completedAt: 401, count: 1, page: 1, pages: 1, sourceRowCount: 1,
+            storedRowCount: 1, schemaVersion: 7, sourceApiVersion: '3',
+            generation: 'mirror-category-generation', fingerprint: 'sha256:mirror-category',
+          },
+        },
+        inventoryCacheMeta,
+        items: [item], itemStockLocations: [stock], documents: [], itemDocuments: [],
+        paymentTransactions: [],
+        cacheState: {
+          lastSync: 401, lastFullSync: 401, documentCount: 0, itemDocumentCount: 0,
+          accountName: 'mirror', schemaVersion: 7, inventorySourceApiVersion: '3',
+        },
+        paymentSyncStatus: null,
+        pulledAt: 401,
+      });
+
+      expect(await targetDb.getInventoryCacheMeta()).toEqual(inventoryCacheMeta);
+      expect((await targetDb.getItem(item.item_id))?.category_name).toBe('Canonical category');
+      expect((await targetDb.getItemStockLocations(item.item_id))[0].category_name)
+        .toBe('Canonical category');
+      expect((await targetDb.getCacheState())?.inventorySourceApiVersion).toBe('3');
+    });
+
     it('getRawMeta / setRawMeta should store and retrieve pull timestamp', () => {
       const now = Date.now();
       targetDb.setRawMeta('pg_pull_timestamp', String(now));

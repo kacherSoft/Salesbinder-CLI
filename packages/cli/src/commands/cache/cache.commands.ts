@@ -63,10 +63,12 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
       try {
         const {
           SalesBinderClient,
+          SalesBinderV3Client,
           AccountIndexerService,
           CategoryIndexerService,
           DocumentIndexerService,
           ItemIndexerService,
+          V3InventoryIndexerService,
           DeletedLogSyncService,
           createPostgresCacheService,
           SQLiteCacheService,
@@ -78,8 +80,10 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
         } = await import('@salesbinder/sdk');
 
         const accountName = program.opts().account || 'default';
-        const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
+        const accountConfig = loadConfig(accountName);
+        const accountBinding = createSalesBinderAccountBinding(accountConfig.subdomain);
         const client = new SalesBinderClient(accountName);
+        const v3Client = accountConfig.v3ApiKey ? new SalesBinderV3Client(accountName) : null;
         const effectiveFull = Boolean(options.full || options.fullResume);
         const dbUrl = process.env.SALESBINDER_DB_URL;
 
@@ -147,7 +151,12 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
         const lookbackEnv = process.env[['SALESBINDER', 'SYNC', 'LOOKBACK', 'SECONDS'].join('_')];
         const syncLookbackSeconds = lookbackEnv ? parseInt(lookbackEnv, 10) : (prefs?.syncLookbackSeconds ?? 604800);
         const accountIndexer = new AccountIndexerService(client, cacheService, accountName, syncLookbackSeconds);
-        const categoryIndexer = new CategoryIndexerService(client, cacheService, accountBinding.accountIdentity);
+        const categoryIndexer = new CategoryIndexerService(
+          v3Client ?? client,
+          cacheService,
+          accountBinding.accountIdentity,
+          v3Client ? '3' : '2.0',
+        );
         const indexer = new DocumentIndexerService(
           client,
           cacheService,
@@ -156,7 +165,9 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           syncLookbackSeconds,
           { deferGlobalWatermark: true },
         );
-        const itemIndexer = new ItemIndexerService(client, cacheService, accountName, syncLookbackSeconds);
+        const itemIndexer = v3Client
+          ? new V3InventoryIndexerService(v3Client, cacheService, accountName, accountBinding.accountIdentity)
+          : new ItemIndexerService(client, cacheService, accountName, syncLookbackSeconds);
         const deletedLogSync = new DeletedLogSyncService(client, cacheService, accountName, syncLookbackSeconds);
         const activeResume: ActiveFullResume | null = checkpoint && checkpointStore ? { checkpoint, store: checkpointStore } : null;
         const captureCheckpointSnapshot = () =>
@@ -223,14 +234,16 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
         const itemResult = await runFullResumePhase(
           'items',
           { itemsProcessed: 0, stockRowsProcessed: 0 },
-          () => itemIndexer.sync(activeResume ? {
-            full: effectiveFull,
-            resume: {
-              page: activeResume.checkpoint.items?.page,
-              itemIndex: activeResume.checkpoint.items?.itemIndex,
-              onItemCheckpoint: (position) => activeResume.store.markItemPosition(activeResume.checkpoint, position),
-            },
-          } : effectiveFull),
+          () => v3Client
+            ? (itemIndexer as InstanceType<typeof V3InventoryIndexerService>).sync()
+            : (itemIndexer as InstanceType<typeof ItemIndexerService>).sync(activeResume ? {
+              full: effectiveFull,
+              resume: {
+                page: activeResume.checkpoint.items?.page,
+                itemIndex: activeResume.checkpoint.items?.itemIndex,
+                onItemCheckpoint: (position) => activeResume.store.markItemPosition(activeResume.checkpoint, position),
+              },
+            } : effectiveFull),
         );
 
         const deletedResult = await runFullResumePhase(
@@ -325,6 +338,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           sync_target: syncTarget,
           sync_type: result.type,
           sync_lookback_seconds: result.syncLookbackSeconds,
+          inventory_source_api_version: v3Client ? '3' : '2.0',
           accounts_processed: accountResult.accountsProcessed,
           customers_processed: accountResult.customersProcessed,
           suppliers_processed: accountResult.suppliersProcessed,
@@ -411,11 +425,15 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
 
 Example:
   salesbinder cache clear
+  salesbinder cache clear --force-unbound
 
 For SQLite: removes the local cache file.
 For PostgreSQL: truncates all cache tables.
+Use --force-unbound only to delete a legacy SQLite cache that has no account-binding markers.
+It never overrides an existing binding.
 Next sync will perform a full resync.`)
-    .action(async () => {
+    .option('--force-unbound', 'Delete a legacy SQLite cache only when account-binding markers are absent')
+    .action(async (options: { forceUnbound?: boolean }) => {
       let cacheService: CacheService | null = null;
       let lockKey: string | null = null;
       let lockAcquired = false;
@@ -423,12 +441,18 @@ Next sync will perform a full resync.`)
       try {
         const dbUrl = process.env.SALESBINDER_DB_URL;
         const accountName = program.opts().account || 'default';
-        const { createSalesBinderAccountBinding, loadConfig } = await import('@salesbinder/sdk');
-        const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
 
         if (dbUrl) {
+          if (options.forceUnbound) {
+            throw new Error('--force-unbound applies only to the SQLite cache backend.');
+          }
           // PostgreSQL: truncate tables
-          const { PostgresCacheService } = await import('@salesbinder/sdk');
+          const {
+            PostgresCacheService,
+            createSalesBinderAccountBinding,
+            loadConfig,
+          } = await import('@salesbinder/sdk');
+          const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
           const pgCache = new PostgresCacheService(dbUrl);
           cacheService = pgCache;
           await pgCache.ensureSchema();
@@ -472,7 +496,15 @@ Next sync will perform a full resync.`)
           const { SQLiteCacheService } = await import('@salesbinder/sdk');
           const sqliteCache = new SQLiteCacheService(accountName);
           cacheService = sqliteCache;
-          lockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
+          if (options.forceUnbound) {
+            await sqliteCache.verifyUnboundForDeletion();
+            lockKey = `salesbinder-cache-file:${cacheFile}`;
+          } else {
+            const { createSalesBinderAccountBinding, loadConfig } = await import('@salesbinder/sdk');
+            const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
+            await sqliteCache.verifyAccountBinding(accountBinding);
+            lockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
+          }
           lockAcquired = await sqliteCache.tryAcquireSyncLock(lockKey);
           if (!lockAcquired) {
             throw new Error('Another cache sync is already running for this account.');
@@ -481,6 +513,10 @@ Next sync will perform a full resync.`)
           // Get file size before deletion
           const stats = statSync(cacheFile);
           const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+
+          // Close SQLite while retaining the external lock. This checkpoints
+          // WAL state and prevents unlinking an actively-open database handle.
+          sqliteCache.closeDatabaseForDeletion();
 
           // Delete cache file and related files
           unlinkSync(cacheFile);
@@ -589,7 +625,8 @@ Displays:
   - Cache file location or connection info
   - Account name
   - Last sync time
-  - Document counts
+  - Document and inventory counts
+  - Category and inventory snapshot authority
   - Freshness status`)
     .action(async () => {
       let cacheService: import('@salesbinder/sdk').CacheService | null = null;
@@ -635,6 +672,7 @@ Displays:
           const stale = await indexer.isCacheStale();
           const counts = await collectCacheCounts(cacheService);
           const categoryMeta = await cacheService.getCategoryCacheMeta();
+          const inventoryMeta = await cacheService.getInventoryCacheMeta();
 
           await cacheService.close();
           cacheService = null;
@@ -665,6 +703,7 @@ Displays:
                   sync_status: syncStatus,
                   payment_sync_status: paymentSyncStatus ?? 'not_initialized',
                   categories: categoryMeta ?? 'not_initialized',
+                  inventory: inventoryMeta ?? 'not_initialized',
                 }
               : {
                   message: 'Cache exists but no metadata found. May need full sync.',
@@ -715,6 +754,7 @@ Displays:
           const stale = await indexer.isCacheStale();
           const counts = await collectCacheCounts(cacheService);
           const categoryMeta = await cacheService.getCategoryCacheMeta();
+          const inventoryMeta = await cacheService.getInventoryCacheMeta();
 
           await cacheService.close();
           cacheService = null;
@@ -737,6 +777,7 @@ Displays:
                   sync_status: syncStatus,
                   payment_sync_status: paymentSyncStatus ?? 'not_initialized',
                   categories: categoryMeta ?? 'not_initialized',
+                  inventory: inventoryMeta ?? 'not_initialized',
                 }
               : {
                   message: 'Cache exists but no metadata found. May need full sync.',
@@ -834,6 +875,7 @@ async function captureFullResumeCacheSnapshot(
 ): Promise<ResumeCacheSnapshot> {
   const state = await cacheService.getCacheState();
   const categoryMeta = await cacheService.getCategoryCacheMeta();
+  const inventoryMeta = await cacheService.getInventoryCacheMeta();
   const [
     accountCount,
     categoryCount,
@@ -863,6 +905,12 @@ async function captureFullResumeCacheSnapshot(
     categorySchemaVersion: categoryMeta?.schemaVersion ?? null,
     categoryGeneration: categoryMeta?.generation ?? null,
     categoryFingerprint: categoryMeta?.fingerprint ?? null,
+    inventoryStatus: inventoryMeta ? 'complete' : 'uninitialized',
+    inventoryCompletedAt: inventoryMeta?.completedAt ?? null,
+    inventorySchemaVersion: inventoryMeta?.schemaVersion ?? null,
+    inventorySourceApiVersion: inventoryMeta?.sourceApiVersion ?? null,
+    inventoryGeneration: inventoryMeta?.generation ?? null,
+    inventoryFingerprint: inventoryMeta?.fingerprint ?? null,
     documentCount,
     itemDocumentCount,
     paymentTransactionCount,

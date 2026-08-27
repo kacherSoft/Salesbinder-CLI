@@ -75,6 +75,7 @@ export async function pullFromPostgres(
     const allPayments = await getAllPaymentTransactions(pg);
     const allAccounts = await getAllAccounts(pg);
     const categorySnapshot = await pg.getCategorySnapshot();
+    const inventoryCacheMeta = await pg.getInventoryCacheMeta();
     const allMasterItems = await getAllItems(pg);
     const allStockRows = await getAllStockRows(pg);
     const pgState = await pg.getCacheState();
@@ -84,6 +85,7 @@ export async function pullFromPostgres(
     await sqlite.replaceMirror({
       accounts: allAccounts,
       categorySnapshot,
+      inventoryCacheMeta,
       items: allMasterItems,
       itemStockLocations: allStockRows,
       documents: allDocs,

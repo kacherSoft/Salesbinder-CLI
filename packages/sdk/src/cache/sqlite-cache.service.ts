@@ -24,12 +24,17 @@ import type {
   ItemRow,
   ItemSalesByPeriodRow,
   ItemStockLocationRow,
+  InventoryCacheMeta,
+  InventorySnapshot,
   PriceDistributionRow,
 } from './types.js';
 import {
   CACHE_SCHEMA_VERSION,
   CATEGORY_GENERATION_META_KEY,
   CATEGORY_SNAPSHOT_META_KEY,
+  INVENTORY_ACCOUNT_META_KEY,
+  INVENTORY_SNAPSHOT_META_KEY,
+  createSalesBinderAccountBinding,
 } from './types.js';
 import { PAYMENT_SYNC_STATUS_KEY, PAYMENT_TRANSACTION_COLUMNS } from './payment-cache.constants.js';
 import type { PaymentSyncStatus, PaymentTransactionRow } from './payment-sync.types.js';
@@ -66,22 +71,28 @@ const ACCOUNT_COLUMNS = [
 
 const CATEGORY_COLUMNS = [
   'category_id', 'name', 'item_count', 'parent_id', 'parent_name',
-  'created', 'modified', 'cache_source', 'imported_at',
+  'inventory_type', 'custom_fields_json', 'created', 'modified', 'cache_source',
+  'source_api_version', 'imported_at',
 ] as const;
 
 const ITEM_COLUMNS = [
   'item_id', 'item_number', 'name', 'description', 'sku', 'serial_number', 'barcode',
   'category_id', 'category_name', 'quantity', 'quantity_reserved', 'quantity_available',
   'quantity_incoming', 'in_transit', 'threshold', 'cost', 'price', 'valuation',
-  'published', 'archived', 'created', 'modified', 'cache_source', 'imported_at',
+  'published', 'archived', 'created', 'modified', 'cache_source',
+  'source_api_version', 'imported_at',
 ] as const;
 
 const STOCK_COLUMNS = [
   'stock_row_id', 'item_id', 'item_number', 'variation_id', 'variation_location_id',
   'location_id', 'location_name', 'category_name', 'quantity_on_hand',
   'quantity_reserved', 'quantity_available', 'quantity_incoming', 'in_transit',
-  'price', 'cost', 'valuation', 'barcode', 'cache_source', 'imported_at',
+  'price', 'cost', 'valuation', 'barcode', 'cache_source', 'source_api_version',
+  'imported_at',
 ] as const;
+
+const SQLITE_ACCOUNT_IDENTITY_META_KEY = 'cache_account_binding.v1.account_identity';
+const SQLITE_ACCOUNT_SUBDOMAIN_META_KEY = 'cache_account_binding.v1.account_subdomain';
 
 export class SQLiteCacheService implements CacheService {
   private db: Database.Database;
@@ -133,7 +144,7 @@ export class SQLiteCacheService implements CacheService {
         this.migrateSchema(currentVersion);
         this.db.pragma(`user_version = ${CACHE_SCHEMA_VERSION}`);
       });
-      migrate();
+      migrate.immediate();
     }
   }
 
@@ -253,6 +264,7 @@ export class SQLiteCacheService implements CacheService {
         created TEXT NULL,
         modified INTEGER NULL,
         cache_source TEXT NOT NULL DEFAULT 'api',
+        source_api_version TEXT NULL,
         imported_at INTEGER NULL
       );
 
@@ -266,15 +278,16 @@ export class SQLiteCacheService implements CacheService {
         location_name TEXT NULL,
         category_name TEXT NULL,
         quantity_on_hand REAL NOT NULL DEFAULT 0,
-        quantity_reserved REAL NOT NULL DEFAULT 0,
-        quantity_available REAL NOT NULL DEFAULT 0,
-        quantity_incoming REAL NOT NULL DEFAULT 0,
-        in_transit REAL NOT NULL DEFAULT 0,
+        quantity_reserved REAL NULL,
+        quantity_available REAL NULL,
+        quantity_incoming REAL NULL,
+        in_transit REAL NULL,
         price REAL NULL,
         cost REAL NULL,
         valuation REAL NULL,
         barcode TEXT NULL,
         cache_source TEXT NOT NULL DEFAULT 'api',
+        source_api_version TEXT NULL,
         imported_at INTEGER NULL,
         FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE
       );
@@ -295,9 +308,12 @@ export class SQLiteCacheService implements CacheService {
         item_count INTEGER NULL,
         parent_id TEXT NULL,
         parent_name TEXT NULL,
+        inventory_type TEXT NULL,
+        custom_fields_json TEXT NULL,
         created TEXT NULL,
         modified INTEGER NULL,
         cache_source TEXT NOT NULL DEFAULT 'api',
+        source_api_version TEXT NULL,
         imported_at INTEGER NOT NULL
       );
 
@@ -344,8 +360,82 @@ export class SQLiteCacheService implements CacheService {
       ]);
       this.addColumnsIfMissing('item_documents', [['quantity_shipped', 'REAL NULL']]);
     }
+    if (fromVersion < 7) {
+      this.addColumnsIfMissing('items', [['source_api_version', 'TEXT NULL']]);
+      this.addColumnsIfMissing('categories', [
+        ['inventory_type', 'TEXT NULL'],
+        ['custom_fields_json', 'TEXT NULL'],
+        ['source_api_version', 'TEXT NULL'],
+      ]);
+      this.addColumnsIfMissing('item_stock_locations', [['source_api_version', 'TEXT NULL']]);
+      this.nullLegacyApiInventoryValues();
+      this.rebuildStockLocationsForVersion7();
+    }
     // Current indexes may refer to columns introduced by any prior migration.
     this.createIndexes();
+  }
+
+  private nullLegacyApiInventoryValues(): void {
+    this.db.exec(`
+      UPDATE items
+      SET quantity_reserved = NULL,
+          quantity_available = NULL,
+          quantity_incoming = NULL,
+          in_transit = NULL
+      WHERE cache_source = 'api';
+    `);
+  }
+
+  private rebuildStockLocationsForVersion7(): void {
+    this.db.exec(`
+      DROP TABLE IF EXISTS item_stock_locations_v7;
+      CREATE TABLE item_stock_locations_v7 (
+        stock_row_id TEXT PRIMARY KEY,
+        item_id TEXT NOT NULL,
+        item_number INTEGER NULL,
+        variation_id TEXT NULL,
+        variation_location_id TEXT NULL,
+        location_id TEXT NULL,
+        location_name TEXT NULL,
+        category_name TEXT NULL,
+        quantity_on_hand REAL NOT NULL DEFAULT 0,
+        quantity_reserved REAL NULL,
+        quantity_available REAL NULL,
+        quantity_incoming REAL NULL,
+        in_transit REAL NULL,
+        price REAL NULL,
+        cost REAL NULL,
+        valuation REAL NULL,
+        barcode TEXT NULL,
+        cache_source TEXT NOT NULL DEFAULT 'api',
+        source_api_version TEXT NULL,
+        imported_at INTEGER NULL,
+        FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE
+      );
+
+      INSERT INTO item_stock_locations_v7 (
+        stock_row_id, item_id, item_number, variation_id, variation_location_id,
+        location_id, location_name, category_name, quantity_on_hand,
+        quantity_reserved, quantity_available, quantity_incoming, in_transit,
+        price, cost, valuation, barcode, cache_source, source_api_version, imported_at
+      )
+      SELECT
+        stock_row_id, item_id, item_number, variation_id, variation_location_id,
+        location_id, location_name, category_name, quantity_on_hand,
+        CASE WHEN cache_source = 'api' THEN NULL ELSE quantity_reserved END,
+        CASE WHEN cache_source = 'api' THEN NULL ELSE quantity_available END,
+        CASE WHEN cache_source = 'api' THEN NULL ELSE quantity_incoming END,
+        CASE WHEN cache_source = 'api' THEN NULL ELSE in_transit END,
+        price, cost, valuation, barcode, cache_source, source_api_version, imported_at
+      FROM item_stock_locations;
+
+      DROP TABLE item_stock_locations;
+      ALTER TABLE item_stock_locations_v7 RENAME TO item_stock_locations;
+    `);
+    const foreignKeyFailures = this.db.pragma('foreign_key_check') as unknown[];
+    if (foreignKeyFailures.length > 0) {
+      throw new Error('Cannot migrate cache schema v7: item stock foreign-key validation failed.');
+    }
   }
 
   private addVersion2DocumentColumns(): void {
@@ -637,6 +727,7 @@ export class SQLiteCacheService implements CacheService {
 
   replaceCategorySnapshot(snapshot: CategorySnapshot): Promise<void> {
     this.assertCategorySnapshot(snapshot);
+    this.assertSnapshotAccountMatchesBinding(snapshot.meta.accountIdentity);
     const tx = this.db.transaction(() => this.replaceCategorySnapshotInTransaction(snapshot));
     tx.immediate();
     return Promise.resolve();
@@ -675,7 +766,12 @@ export class SQLiteCacheService implements CacheService {
   }
 
   insertItem(item: ItemRow): Promise<void> {
-    this.db.prepare(this.upsertSql('items', ITEM_COLUMNS, 'item_id')).run(...this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)));
+    const tx = this.db.transaction(() => {
+      this.db.prepare(this.upsertSql('items', ITEM_COLUMNS, 'item_id'))
+        .run(...this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)));
+      this.invalidateInventoryAuthorityInTransaction();
+    });
+    tx.immediate();
     return Promise.resolve();
   }
 
@@ -692,21 +788,32 @@ export class SQLiteCacheService implements CacheService {
   }
 
   batchInsertItems(items: ItemRow[]): Promise<void> {
+    if (items.length === 0) return Promise.resolve();
     const insert = this.db.prepare(this.upsertSql('items', ITEM_COLUMNS, 'item_id'));
     const tx = this.db.transaction((rows: ItemRow[]) => {
       for (const row of rows) insert.run(...this.valuesFor(ITEM_COLUMNS, this.normalizeItem(row)));
+      this.invalidateInventoryAuthorityInTransaction();
     });
-    tx(items);
+    tx.immediate(items);
     return Promise.resolve();
   }
 
   deleteItem(itemId: string): Promise<void> {
-    this.db.prepare(`DELETE FROM items WHERE item_id = ?`).run(itemId);
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM items WHERE item_id = ?`).run(itemId);
+      this.invalidateInventoryAuthorityInTransaction();
+    });
+    tx.immediate();
     return Promise.resolve();
   }
 
   insertItemStockLocation(row: ItemStockLocationRow): Promise<void> {
-    this.db.prepare(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id')).run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
+    const tx = this.db.transaction(() => {
+      this.db.prepare(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'))
+        .run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
+      this.invalidateInventoryAuthorityInTransaction();
+    });
+    tx.immediate();
     return Promise.resolve();
   }
 
@@ -724,23 +831,85 @@ export class SQLiteCacheService implements CacheService {
     const tx = this.db.transaction(() => {
       deleteStmt.run(itemId);
       for (const row of rows) insert.run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
+      this.invalidateInventoryAuthorityInTransaction();
     });
-    tx();
+    tx.immediate();
     return Promise.resolve();
   }
 
   batchInsertItemStockLocations(rows: ItemStockLocationRow[]): Promise<void> {
+    if (rows.length === 0) return Promise.resolve();
     const insert = this.db.prepare(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'));
     const tx = this.db.transaction((stockRows: ItemStockLocationRow[]) => {
       for (const row of stockRows) insert.run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
+      this.invalidateInventoryAuthorityInTransaction();
     });
-    tx(rows);
+    tx.immediate(rows);
     return Promise.resolve();
   }
 
   deleteItemStockLocations(itemId: string): Promise<void> {
-    this.db.prepare(`DELETE FROM item_stock_locations WHERE item_id = ?`).run(itemId);
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM item_stock_locations WHERE item_id = ?`).run(itemId);
+      this.invalidateInventoryAuthorityInTransaction();
+    });
+    tx.immediate();
     return Promise.resolve();
+  }
+
+  replaceInventorySnapshot(snapshot: InventorySnapshot): Promise<void> {
+    this.assertInventorySnapshot(snapshot);
+    this.assertSnapshotAccountMatchesBinding(snapshot.meta.accountIdentity);
+    const tx = this.db.transaction(() => {
+      const itemInsert = this.db.prepare(
+        this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
+      );
+      const stockInsert = this.db.prepare(
+        this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
+      );
+      this.db.prepare(`DELETE FROM item_stock_locations WHERE cache_source = 'api'`).run();
+      this.db.exec(`
+        UPDATE items
+        SET cache_source = 'csv', source_api_version = NULL
+        WHERE cache_source = 'api'
+          AND EXISTS (
+            SELECT 1 FROM item_stock_locations AS stock
+            WHERE stock.item_id = items.item_id AND stock.cache_source = 'csv'
+          );
+      `);
+      this.db.prepare(`DELETE FROM items WHERE cache_source = 'api'`).run();
+      for (const item of snapshot.items) {
+        itemInsert.run(...this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)));
+      }
+      for (const row of snapshot.stockRows) {
+        stockInsert.run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
+      }
+      this.writeInventoryMetaInTransaction(snapshot.meta);
+
+      const currentState = this.readCacheState();
+      this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`).run(JSON.stringify({
+        ...(currentState ?? {
+          lastSync: 0,
+          lastFullSync: 0,
+          documentCount: this.count('documents'),
+          itemDocumentCount: this.count('item_documents'),
+          accountName: this.accountName,
+        }),
+        schemaVersion: CACHE_SCHEMA_VERSION,
+        itemCount: this.count('items'),
+        stockLocationCount: this.count('item_stock_locations'),
+        lastItemSync: snapshot.meta.completedAt,
+        lastFullItemSync: snapshot.meta.completedAt,
+        inventorySourceApiVersion: '3',
+      } satisfies CacheState));
+    });
+    tx.immediate();
+    return Promise.resolve();
+  }
+
+  getInventoryCacheMeta(): Promise<InventoryCacheMeta | null> {
+    const read = this.db.transaction(() => this.readAuthoritativeInventoryMeta());
+    return Promise.resolve(read.deferred());
   }
 
   getItemDocumentsForPeriod(itemId: string, startDate: string, endDate: string, contextId: number): Promise<ItemDocumentRow[]> {
@@ -891,7 +1060,21 @@ export class SQLiteCacheService implements CacheService {
   /** Replace the complete local mirror without exposing a partially-written snapshot. */
   replaceMirror(snapshot: SQLiteMirrorSnapshot): Promise<void> {
     assertUniquePaymentTransactionIds(snapshot.paymentTransactions);
-    if (snapshot.categorySnapshot) this.assertCategorySnapshot(snapshot.categorySnapshot);
+    if (snapshot.categorySnapshot) {
+      this.assertCategorySnapshot(snapshot.categorySnapshot);
+      this.assertSnapshotAccountMatchesBinding(snapshot.categorySnapshot.meta.accountIdentity);
+    }
+    if (snapshot.inventoryCacheMeta) {
+      this.assertSnapshotAccountMatchesBinding(snapshot.inventoryCacheMeta.accountIdentity);
+      this.assertInventoryMetaMatchesRows(
+        snapshot.inventoryCacheMeta,
+        snapshot.items,
+        snapshot.itemStockLocations,
+      );
+      if (snapshot.categorySnapshot) {
+        this.assertCategoryReconciliationPreservesInventoryRows(snapshot);
+      }
+    }
     const tx = this.db.transaction(() => {
       this.clearAllInTransaction();
       void this.batchInsertAccounts(snapshot.accounts);
@@ -902,6 +1085,29 @@ export class SQLiteCacheService implements CacheService {
       void this.batchInsertPaymentTransactions(snapshot.paymentTransactions);
       if (snapshot.cacheState) this.setCacheStateInTransaction(snapshot.cacheState);
       if (snapshot.categorySnapshot) this.replaceCategorySnapshotInTransaction(snapshot.categorySnapshot);
+      if (snapshot.inventoryCacheMeta) {
+        this.assertInventoryMetaMatchesRows(
+          snapshot.inventoryCacheMeta,
+          this.db.prepare('SELECT * FROM items').all() as ItemRow[],
+          this.db.prepare('SELECT * FROM item_stock_locations').all() as ItemStockLocationRow[],
+        );
+        this.writeInventoryMetaInTransaction(snapshot.inventoryCacheMeta);
+        const currentState = this.readCacheState() ?? {
+          lastSync: 0,
+          lastFullSync: 0,
+          documentCount: this.count('documents'),
+          itemDocumentCount: this.count('item_documents'),
+          accountName: this.accountName,
+          schemaVersion: CACHE_SCHEMA_VERSION,
+        };
+        this.setCacheStateInTransaction({
+          ...currentState,
+          schemaVersion: CACHE_SCHEMA_VERSION,
+          inventorySourceApiVersion: '3',
+        });
+      } else {
+        this.invalidateInventoryAuthorityInTransaction();
+      }
       if (snapshot.paymentSyncStatus) void this.setPaymentSyncStatus(snapshot.paymentSyncStatus);
       this.setRawMeta('pg_pull_timestamp', String(snapshot.pulledAt));
     });
@@ -955,14 +1161,31 @@ export class SQLiteCacheService implements CacheService {
     }
   }
 
-  ensureAccountBinding(_binding: CacheAccountBinding): Promise<void> {
-    // SQLite files are already isolated by the configured local account name.
-    // Durable database-global binding is required only for shared PostgreSQL caches.
-    return Promise.resolve();
+  async ensureAccountBinding(binding: CacheAccountBinding): Promise<void> {
+    this.bindOrVerifyAccount(binding);
   }
 
-  verifyAccountBinding(_binding: CacheAccountBinding): Promise<void> {
-    return Promise.resolve();
+  async verifyAccountBinding(binding: CacheAccountBinding): Promise<void> {
+    // The mirror path historically verifies before its first replacement. An
+    // empty file is safe to bind here; populated legacy files fail closed.
+    this.bindOrVerifyAccount(binding);
+  }
+
+  async verifyUnboundForDeletion(): Promise<void> {
+    const identity = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+      .get(SQLITE_ACCOUNT_IDENTITY_META_KEY) as CacheMetaRow | undefined;
+    const subdomain = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+      .get(SQLITE_ACCOUNT_SUBDOMAIN_META_KEY) as CacheMetaRow | undefined;
+    if (identity || subdomain) {
+      throw new Error(
+        'SQLite cache already has an account binding. '
+        + 'The unbound recovery option cannot override a bound or partially-bound cache.',
+      );
+    }
+  }
+
+  closeDatabaseForDeletion(): void {
+    if (this.db.open) this.db.close();
   }
 
   private removeStaleSyncLock(path: string): boolean {
@@ -979,7 +1202,7 @@ export class SQLiteCacheService implements CacheService {
 
   async close(): Promise<void> {
     for (const lockKey of [...this.syncLocks.keys()]) await this.releaseSyncLock(lockKey);
-    if (this.db) this.db.close();
+    if (this.db?.open) this.db.close();
   }
 
   isOpen(): boolean {
@@ -1034,6 +1257,7 @@ export class SQLiteCacheService implements CacheService {
           AND items.category_id IS NOT NULL
       );
     `);
+    this.invalidateInventoryAuthorityInTransaction();
   }
 
   private readAuthoritativeCategoryMeta(): CategoryCacheMeta | null {
@@ -1047,10 +1271,192 @@ export class SQLiteCacheService implements CacheService {
     try {
       const meta = JSON.parse(row.value) as unknown;
       if (!isCategoryCacheMeta(meta) || meta.generation !== marker.value) return null;
+      const binding = this.readPersistedAccountIdentity();
+      if (binding && meta.accountIdentity !== binding) return null;
       if (meta.storedRowCount !== this.count('categories')) return null;
       return meta;
     } catch {
       return null;
+    }
+  }
+
+  private readAuthoritativeInventoryMeta(): InventoryCacheMeta | null {
+    const state = this.readCacheState();
+    if (
+      state?.schemaVersion !== CACHE_SCHEMA_VERSION
+      || state.inventorySourceApiVersion !== '3'
+    ) return null;
+    const row = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+      .get(INVENTORY_SNAPSHOT_META_KEY) as CacheMetaRow | undefined;
+    const account = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+      .get(INVENTORY_ACCOUNT_META_KEY) as CacheMetaRow | undefined;
+    if (!row || !account) return null;
+    try {
+      const meta = JSON.parse(row.value) as unknown;
+      if (!isInventoryCacheMeta(meta) || meta.accountIdentity !== account.value) return null;
+      const binding = this.readPersistedAccountIdentity();
+      if (binding && meta.accountIdentity !== binding) return null;
+      if (!this.inventoryCountsMatch(meta)) return null;
+      return meta;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeInventoryMetaInTransaction(meta: InventoryCacheMeta): void {
+    this.db.prepare('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)')
+      .run(INVENTORY_SNAPSHOT_META_KEY, JSON.stringify(meta));
+    this.db.prepare('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)')
+      .run(INVENTORY_ACCOUNT_META_KEY, meta.accountIdentity);
+  }
+
+  private invalidateInventoryAuthorityInTransaction(): void {
+    this.db.prepare('DELETE FROM cache_meta WHERE key IN (?, ?)')
+      .run(INVENTORY_SNAPSHOT_META_KEY, INVENTORY_ACCOUNT_META_KEY);
+    const currentState = this.readCacheState();
+    if (!currentState || currentState.inventorySourceApiVersion !== '3') return;
+    const stateWithoutInventoryAuthority = { ...currentState };
+    delete stateWithoutInventoryAuthority.inventorySourceApiVersion;
+    this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`)
+      .run(JSON.stringify(stateWithoutInventoryAuthority));
+  }
+
+  private assertCategoryReconciliationPreservesInventoryRows(snapshot: SQLiteMirrorSnapshot): void {
+    if (!snapshot.categorySnapshot) return;
+    const categoryNames = new Map(snapshot.categorySnapshot.rows.map((row) => [row.category_id, row.name]));
+    const items = new Map(snapshot.items.map((row) => [row.item_id, row]));
+    for (const item of snapshot.items.filter(isV3ApiRow)) {
+      if (item.category_id === null || item.category_id === undefined) continue;
+      if ((categoryNames.get(item.category_id) ?? null) !== (item.category_name ?? null)) {
+        throw new Error('Category reconciliation would change rows covered by inventory metadata.');
+      }
+    }
+    for (const stock of snapshot.itemStockLocations.filter(isV3ApiRow)) {
+      const item = items.get(stock.item_id);
+      if (!item || item.category_id === null || item.category_id === undefined) continue;
+      if ((categoryNames.get(item.category_id) ?? null) !== (stock.category_name ?? null)) {
+        throw new Error('Category reconciliation would change rows covered by inventory metadata.');
+      }
+    }
+  }
+
+  private bindOrVerifyAccount(binding: CacheAccountBinding): void {
+    const canonical = createSalesBinderAccountBinding(binding.accountSubdomain);
+    if (canonical.accountIdentity !== binding.accountIdentity) {
+      throw new Error('SQLite cache account identity does not match its normalized SalesBinder subdomain.');
+    }
+    const tx = this.db.transaction(() => {
+      const identity = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+        .get(SQLITE_ACCOUNT_IDENTITY_META_KEY) as CacheMetaRow | undefined;
+      const subdomain = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+        .get(SQLITE_ACCOUNT_SUBDOMAIN_META_KEY) as CacheMetaRow | undefined;
+      if (!identity && !subdomain) {
+        if (this.databaseContainsPayloadRows()) {
+          throw new Error(
+            'SQLite cache database is populated but has no account binding. '
+            + 'Use a matching empty cache file or rebuild this cache before binding it.',
+          );
+        }
+        this.db.prepare('INSERT INTO cache_meta (key, value) VALUES (?, ?)')
+          .run(SQLITE_ACCOUNT_IDENTITY_META_KEY, canonical.accountIdentity);
+        this.db.prepare('INSERT INTO cache_meta (key, value) VALUES (?, ?)')
+          .run(SQLITE_ACCOUNT_SUBDOMAIN_META_KEY, canonical.accountSubdomain);
+        return;
+      }
+      if (
+        !identity || !subdomain
+        || identity.value !== canonical.accountIdentity
+        || subdomain.value !== canonical.accountSubdomain
+      ) {
+        throw new Error(
+          `SQLite cache database is not bound to ${canonical.accountIdentity}. `
+          + 'Use the matching cache file or rebuild a fresh cache for this SalesBinder account.',
+        );
+      }
+    });
+    tx.immediate();
+  }
+
+  private assertSnapshotAccountMatchesBinding(accountIdentity: string): void {
+    const persistedIdentity = this.readPersistedAccountIdentity();
+    if (persistedIdentity && persistedIdentity !== accountIdentity) {
+      throw new Error(
+        `SQLite cache database is not bound to ${accountIdentity}. `
+        + 'Use the matching cache file or rebuild a fresh cache for this SalesBinder account.',
+      );
+    }
+  }
+
+  private readPersistedAccountIdentity(): string | null {
+    const row = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+      .get(SQLITE_ACCOUNT_IDENTITY_META_KEY) as CacheMetaRow | undefined;
+    return row?.value ?? null;
+  }
+
+  private databaseContainsPayloadRows(): boolean {
+    const tables = [
+      'accounts', 'documents', 'item_documents', 'items', 'item_stock_locations',
+      'payment_transactions', 'categories', 'category_cache_meta',
+    ];
+    if (tables.some((table) => this.count(table) > 0)) return true;
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM cache_meta
+      WHERE key NOT IN (?, ?)
+    `).get(SQLITE_ACCOUNT_IDENTITY_META_KEY, SQLITE_ACCOUNT_SUBDOMAIN_META_KEY) as { count: number };
+    return row.count > 0;
+  }
+
+  private inventoryCountsMatch(meta: InventoryCacheMeta): boolean {
+    const itemCounts = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+             SUM(CASE WHEN source_api_version = '3' THEN 1 ELSE 0 END) AS v3
+      FROM items WHERE cache_source = 'api'
+    `).get() as { total: number; v3: number | null };
+    const stockCounts = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+             SUM(CASE WHEN source_api_version = '3' THEN 1 ELSE 0 END) AS v3
+      FROM item_stock_locations WHERE cache_source = 'api'
+    `).get() as { total: number; v3: number | null };
+    return itemCounts.total === meta.itemCount
+      && (itemCounts.v3 ?? 0) === meta.itemCount
+      && stockCounts.total === meta.stockRowCount
+      && (stockCounts.v3 ?? 0) === meta.stockRowCount;
+  }
+
+  private assertInventorySnapshot(snapshot: InventorySnapshot): void {
+    if (!snapshot || !Array.isArray(snapshot.items) || !Array.isArray(snapshot.stockRows)) {
+      throw new Error('Inventory snapshot is incomplete or invalid.');
+    }
+    this.assertInventoryMetaMatchesRows(snapshot.meta, snapshot.items, snapshot.stockRows);
+    const itemIds = new Set<string>();
+    for (const item of snapshot.items) {
+      if (!isInventoryItemRow(item) || itemIds.has(item.item_id)) {
+        throw new Error('Inventory snapshot contains an invalid or duplicate item row.');
+      }
+      itemIds.add(item.item_id);
+    }
+    const stockIds = new Set<string>();
+    for (const row of snapshot.stockRows) {
+      if (!isInventoryStockRow(row) || stockIds.has(row.stock_row_id) || !itemIds.has(row.item_id)) {
+        throw new Error('Inventory snapshot contains an invalid, duplicate, or orphan stock row.');
+      }
+      stockIds.add(row.stock_row_id);
+    }
+  }
+
+  private assertInventoryMetaMatchesRows(
+    meta: InventoryCacheMeta,
+    items: ItemRow[],
+    stockRows: ItemStockLocationRow[],
+  ): void {
+    if (
+      !isInventoryCacheMeta(meta)
+      || meta.itemCount !== items.filter(isV3ApiRow).length
+      || meta.stockRowCount !== stockRows.filter(isV3ApiRow).length
+      || meta.itemCount !== items.filter((row) => row.cache_source === 'api').length
+      || meta.stockRowCount !== stockRows.filter((row) => row.cache_source === 'api').length
+    ) {
+      throw new Error('Inventory snapshot metadata does not match its authoritative API rows.');
     }
   }
 
@@ -1097,6 +1503,8 @@ export class SQLiteCacheService implements CacheService {
     const persistedState = this.readCacheState();
     if (state.schemaVersion === CACHE_SCHEMA_VERSION && persistedState?.schemaVersion !== CACHE_SCHEMA_VERSION) {
       this.db.prepare('DELETE FROM cache_meta WHERE key = ?').run(CATEGORY_GENERATION_META_KEY);
+      this.db.prepare('DELETE FROM cache_meta WHERE key IN (?, ?)')
+        .run(INVENTORY_SNAPSHOT_META_KEY, INVENTORY_ACCOUNT_META_KEY);
     }
     this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`).run(JSON.stringify(state));
   }
@@ -1111,8 +1519,9 @@ export class SQLiteCacheService implements CacheService {
       DELETE FROM accounts;
       DELETE FROM categories;
       DELETE FROM category_cache_meta;
-      DELETE FROM cache_meta;
     `);
+    this.db.prepare('DELETE FROM cache_meta WHERE key NOT IN (?, ?)')
+      .run(SQLITE_ACCOUNT_IDENTITY_META_KEY, SQLITE_ACCOUNT_SUBDOMAIN_META_KEY);
   }
 
   private count(table: string, where?: string, params: unknown[] = []): number {
@@ -1176,10 +1585,10 @@ export class SQLiteCacheService implements CacheService {
     return {
       ...row,
       quantity_on_hand: row.quantity_on_hand ?? 0,
-      quantity_reserved: row.quantity_reserved ?? 0,
-      quantity_available: row.quantity_available ?? 0,
-      quantity_incoming: row.quantity_incoming ?? 0,
-      in_transit: row.in_transit ?? 0,
+      quantity_reserved: row.quantity_reserved ?? null,
+      quantity_available: row.quantity_available ?? null,
+      quantity_incoming: row.quantity_incoming ?? null,
+      in_transit: row.in_transit ?? null,
       cache_source: row.cache_source ?? 'api',
     };
   }
@@ -1199,7 +1608,7 @@ const isCategoryCacheMeta = (value: unknown): value is CategoryCacheMeta => {
   if (!isRecord(value)) return false;
   const exactKeys = [
     'accountIdentity', 'completedAt', 'count', 'fingerprint', 'generation', 'page',
-    'pages', 'schemaVersion', 'sourceRowCount', 'startedAt', 'status',
+    'pages', 'schemaVersion', 'sourceApiVersion', 'sourceRowCount', 'startedAt', 'status',
     'storedRowCount', 'version',
   ];
   return hasExactKeys(value, exactKeys)
@@ -1215,6 +1624,7 @@ const isCategoryCacheMeta = (value: unknown): value is CategoryCacheMeta => {
     && isNonNegativeInteger(value.sourceRowCount)
     && isNonNegativeInteger(value.storedRowCount)
     && value.schemaVersion === CACHE_SCHEMA_VERSION
+    && isApiSourceVersion(value.sourceApiVersion)
     && isNonEmptyString(value.generation)
     && isNonEmptyString(value.fingerprint)
     && (value.count === 0
@@ -1229,11 +1639,59 @@ const isCategoryCacheRow = (value: unknown): value is CategoryCacheRow => {
     && (value.item_count === null || isNonNegativeInteger(value.item_count))
     && (value.parent_id === null || isNonEmptyString(value.parent_id))
     && (value.parent_name === null || isNonEmptyString(value.parent_name))
+    && (value.inventory_type === null || value.inventory_type === 'quantity' || value.inventory_type === 'unique')
+    && (value.custom_fields_json === null || isTextWithoutNullByte(value.custom_fields_json))
     && (value.created === null || isTextWithoutNullByte(value.created))
     && (value.modified === null || isNonNegativeInteger(value.modified))
     && value.cache_source === 'api'
+    && isApiSourceVersion(value.source_api_version)
     && isNonNegativeInteger(value.imported_at);
 };
+
+const isInventoryCacheMeta = (value: unknown): value is InventoryCacheMeta => {
+  if (!isRecord(value)) return false;
+  const exactKeys = [
+    'accountIdentity', 'completedAt', 'fingerprint', 'generation', 'itemCount',
+    'schemaVersion', 'sourceApiVersion', 'startedAt', 'status', 'stockRowCount', 'version',
+  ];
+  return hasExactKeys(value, exactKeys)
+    && value.version === 1
+    && value.status === 'complete'
+    && isNonEmptyString(value.accountIdentity)
+    && isNonNegativeInteger(value.startedAt)
+    && isNonNegativeInteger(value.completedAt)
+    && value.completedAt >= value.startedAt
+    && isNonNegativeInteger(value.itemCount)
+    && isNonNegativeInteger(value.stockRowCount)
+    && value.schemaVersion === CACHE_SCHEMA_VERSION
+    && value.sourceApiVersion === '3'
+    && isNonEmptyString(value.generation)
+    && isNonEmptyString(value.fingerprint);
+};
+
+const isInventoryItemRow = (value: unknown): value is ItemRow => {
+  if (!isRecord(value)) return false;
+  return isNonEmptyString(value.item_id)
+    && isNonEmptyString(value.name)
+    && value.cache_source === 'api'
+    && value.source_api_version === '3';
+};
+
+const isInventoryStockRow = (value: unknown): value is ItemStockLocationRow => {
+  if (!isRecord(value)) return false;
+  return isNonEmptyString(value.stock_row_id)
+    && isNonEmptyString(value.item_id)
+    && isFiniteNumber(value.quantity_on_hand)
+    && isNullableFiniteNumber(value.quantity_reserved)
+    && isNullableFiniteNumber(value.quantity_available)
+    && isNullableFiniteNumber(value.quantity_incoming)
+    && isNullableFiniteNumber(value.in_transit)
+    && value.cache_source === 'api'
+    && value.source_api_version === '3';
+};
+
+const isV3ApiRow = (value: ItemRow | ItemStockLocationRow): boolean =>
+  value.cache_source === 'api' && value.source_api_version === '3';
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
@@ -1252,6 +1710,15 @@ const isTextWithoutNullByte = (value: unknown): value is string =>
 
 const isNonNegativeInteger = (value: unknown): value is number =>
   Number.isSafeInteger(value) && (value as number) >= 0;
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
+const isNullableFiniteNumber = (value: unknown): value is number | null =>
+  value === null || isFiniteNumber(value);
+
+const isApiSourceVersion = (value: unknown): value is '2.0' | '3' =>
+  value === '2.0' || value === '3';
 
 const isProcessAlive = (pid: number) => {
   try {

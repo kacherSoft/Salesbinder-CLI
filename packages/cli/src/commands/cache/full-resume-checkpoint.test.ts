@@ -24,9 +24,15 @@ function snapshot(overrides: Partial<ResumeCacheSnapshot> = {}): ResumeCacheSnap
     categoryCount: 5,
     categoryStatus: 'complete',
     categoryCompletedAt: 150,
-    categorySchemaVersion: 6,
+    categorySchemaVersion: 7,
     categoryGeneration: 'generation-a',
     categoryFingerprint: 'sha256:category-a',
+    inventoryStatus: 'complete',
+    inventoryCompletedAt: 175,
+    inventorySchemaVersion: 7,
+    inventorySourceApiVersion: '3',
+    inventoryGeneration: 'inventory-generation-a',
+    inventoryFingerprint: 'sha256:inventory-a',
     documentCount: 20,
     itemDocumentCount: 30,
     paymentTransactionCount: 35,
@@ -195,6 +201,20 @@ describe('FullResumeCheckpointStore', () => {
     }))).toThrow(/categories.*reset-checkpoint/i);
   });
 
+  it('rejects item resume when same-count inventory content changes', () => {
+    const store = createStore();
+    const checkpoint = store.loadOrCreate();
+    completePhase(store, checkpoint, 'accounts');
+    completePhase(store, checkpoint, 'categories');
+    completePhase(store, checkpoint, 'documents');
+    completePhase(store, checkpoint, 'items');
+
+    expect(() => store.validateCompletedPhases(checkpoint, snapshot({
+      inventoryGeneration: 'inventory-generation-b',
+      inventoryFingerprint: 'sha256:inventory-b',
+    }))).toThrow(/items.*reset-checkpoint/i);
+  });
+
   it('rejects document resume after payment sync metadata changes with the same count', () => {
     const store = createStore();
     const checkpoint = store.loadOrCreate();
@@ -208,7 +228,7 @@ describe('FullResumeCheckpointStore', () => {
       .toThrow(/documents.*reset-checkpoint/i);
   });
 
-  it('allows deleted-log resume after earlier phase counts changed', () => {
+  it('allows deleted-log resume after an interrupted run partially deleted cached rows', () => {
     const store = createStore();
     const checkpoint = store.loadOrCreate();
     completePhase(store, checkpoint, 'accounts');
@@ -222,10 +242,8 @@ describe('FullResumeCheckpointStore', () => {
       documentCount: 18,
       itemDocumentCount: 27,
       paymentTransactionCount: 34,
-      paymentSyncStatusFingerprint: 'b'.repeat(64),
       itemCount: 39,
       stockLocationCount: 49,
-      lastDeletedSync: 301,
     }))).not.toThrow();
   });
 
@@ -245,6 +263,68 @@ describe('FullResumeCheckpointStore', () => {
       categoryGeneration: null,
       categoryFingerprint: null,
     }))).toThrow(/categories.*reset-checkpoint/i);
+  });
+
+  it('rejects deleted-log resume when inventory authority changed with the same counts', () => {
+    const store = createStore();
+    const checkpoint = store.loadOrCreate();
+    completePhase(store, checkpoint, 'accounts');
+    completePhase(store, checkpoint, 'categories');
+    completePhase(store, checkpoint, 'documents');
+    completePhase(store, checkpoint, 'items');
+    store.markPhaseStarted(checkpoint, 'deleted-log');
+
+    expect(() => store.validateCompletedPhases(checkpoint, snapshot({
+      inventoryGeneration: 'inventory-generation-b',
+      inventoryFingerprint: 'sha256:inventory-b',
+    }))).toThrow(/items.*reset-checkpoint/i);
+  });
+
+  it.each([
+    ['accounts', { lastAccountSync: 101 }],
+    ['documents', { paymentSyncStatusFingerprint: 'b'.repeat(64) }],
+    ['items', { lastItemSync: 201 }],
+  ])('rejects deleted-log resume when completed %s authority changed', (phase, changes) => {
+    const store = createStore();
+    const checkpoint = store.loadOrCreate();
+    completePhase(store, checkpoint, 'accounts');
+    completePhase(store, checkpoint, 'categories');
+    completePhase(store, checkpoint, 'documents');
+    completePhase(store, checkpoint, 'items');
+    store.markPhaseStarted(checkpoint, 'deleted-log');
+
+    expect(() => store.validateCompletedPhases(checkpoint, snapshot(changes)))
+      .toThrow(new RegExp(`${phase}.*reset-checkpoint`, 'i'));
+  });
+
+  it.each([
+    ['accounts', { accountCount: 11 }],
+    ['documents', { documentCount: 21 }],
+    ['items', { itemCount: 41 }],
+  ])('rejects deleted-log resume when completed %s rows increased', (phase, changes) => {
+    const store = createStore();
+    const checkpoint = store.loadOrCreate();
+    completePhase(store, checkpoint, 'accounts');
+    completePhase(store, checkpoint, 'categories');
+    completePhase(store, checkpoint, 'documents');
+    completePhase(store, checkpoint, 'items');
+    store.markPhaseStarted(checkpoint, 'deleted-log');
+
+    expect(() => store.validateCompletedPhases(checkpoint, snapshot(changes)))
+      .toThrow(new RegExp(`${phase}.*reset-checkpoint`, 'i'));
+  });
+
+  it('rejects deleted-log resume after another deleted-log sync advanced the watermark', () => {
+    const store = createStore();
+    const checkpoint = store.loadOrCreate();
+    completePhase(store, checkpoint, 'accounts');
+    completePhase(store, checkpoint, 'categories');
+    completePhase(store, checkpoint, 'documents');
+    completePhase(store, checkpoint, 'items');
+    store.markPhaseStarted(checkpoint, 'deleted-log');
+
+    expect(() => store.validateCompletedPhases(checkpoint, snapshot({ lastDeletedSync: 301 })))
+      .toThrow(/deleted-log.*reset-checkpoint/i);
   });
 
   it('validates deleted-log completion against the final cache snapshot', () => {

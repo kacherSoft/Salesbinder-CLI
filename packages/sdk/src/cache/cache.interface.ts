@@ -12,6 +12,8 @@ import type {
   ItemDocumentRow,
   ItemRow,
   ItemStockLocationRow,
+  InventoryCacheMeta,
+  InventorySnapshot,
   CacheState,
   CacheSyncStatus,
   ItemSalesByPeriodRow,
@@ -25,6 +27,8 @@ export interface SQLiteMirrorSnapshot {
   accounts: AccountRow[];
   /** Null means the source category cache is not authoritative. */
   categorySnapshot: CategorySnapshot | null;
+  /** Null means the source inventory snapshot is not authoritative. */
+  inventoryCacheMeta?: InventoryCacheMeta | null;
   items: ItemRow[];
   itemStockLocations: ItemStockLocationRow[];
   documents: DocumentRow[];
@@ -110,6 +114,10 @@ export interface CacheService {
   replaceItemStockLocations(itemId: string, rows: ItemStockLocationRow[]): Promise<void>;
   batchInsertItemStockLocations(rows: ItemStockLocationRow[]): Promise<void>;
   deleteItemStockLocations(itemId: string): Promise<void>;
+  /** Atomically publish a complete validated v3 item and stock snapshot. */
+  replaceInventorySnapshot(snapshot: InventorySnapshot): Promise<void>;
+  /** Return authoritative v3 inventory metadata, or null when unavailable. */
+  getInventoryCacheMeta(): Promise<InventoryCacheMeta | null>;
 
   // ============ Analytics Query Helpers ============
 

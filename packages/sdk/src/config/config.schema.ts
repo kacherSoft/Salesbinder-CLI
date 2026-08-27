@@ -8,6 +8,8 @@ export interface AccountConfig {
   subdomain: string;
   /** API key from SalesBinder profile */
   apiKey: string;
+  /** Optional API v3 key used by Bearer-authenticated snapshot resources */
+  v3ApiKey?: string;
   /** API version (default: "2.0") */
   apiVersion: string;
   /** Request timeout in milliseconds */

@@ -9,7 +9,7 @@ import {
 } from '../types.js';
 import type { CacheState, CategoryCacheRow, CategorySnapshot } from '../types.js';
 
-describe('SQLite category cache v6', () => {
+describe('SQLite category cache v7', () => {
   let path: string;
   let cache: SQLiteCacheService;
 
@@ -23,14 +23,17 @@ describe('SQLite category cache v6', () => {
     for (const suffix of ['', '-wal', '-shm']) rmSync(`${path}${suffix}`, { force: true });
   });
 
-  it('creates the exact unseeded v6 category schemas', () => {
+  it('creates the exact unseeded v7 category schemas', () => {
     const db = new Database(path, { readonly: true });
     try {
       expect(db.pragma('user_version', { simple: true })).toBe(CACHE_SCHEMA_VERSION);
       expect(tableColumns(db, 'categories')).toEqual([
         ['category_id', 'TEXT', 0, 1], ['name', 'TEXT', 1, 0], ['item_count', 'INTEGER', 0, 0],
-        ['parent_id', 'TEXT', 0, 0], ['parent_name', 'TEXT', 0, 0], ['created', 'TEXT', 0, 0],
-        ['modified', 'INTEGER', 0, 0], ['cache_source', 'TEXT', 1, 0], ['imported_at', 'INTEGER', 1, 0],
+        ['parent_id', 'TEXT', 0, 0], ['parent_name', 'TEXT', 0, 0],
+        ['inventory_type', 'TEXT', 0, 0], ['custom_fields_json', 'TEXT', 0, 0],
+        ['created', 'TEXT', 0, 0], ['modified', 'INTEGER', 0, 0],
+        ['cache_source', 'TEXT', 1, 0], ['source_api_version', 'TEXT', 0, 0],
+        ['imported_at', 'INTEGER', 1, 0],
       ]);
       expect(tableColumns(db, 'category_cache_meta')).toEqual([
         ['key', 'TEXT', 0, 1], ['value', 'TEXT', 1, 0],
@@ -56,7 +59,7 @@ describe('SQLite category cache v6', () => {
 
     cache = new SQLiteCacheService('local-account', path);
     const migrated = new Database(path, { readonly: true });
-    expect(migrated.pragma('user_version', { simple: true })).toBe(6);
+    expect(migrated.pragma('user_version', { simple: true })).toBe(7);
     migrated.close();
     await cache.close();
 
@@ -104,7 +107,7 @@ describe('SQLite category cache v6', () => {
     expect((await cache.getAllItemStockLocations()).map(({ stock_row_id, category_name }) => [stock_row_id, category_name]).sort()).toEqual([
       ['known-stock', 'Child'], ['missing-stock', null], ['weak-stock', 'display-only'],
     ]);
-    expect((await cache.getCacheState())?.schemaVersion).toBe(6);
+    expect((await cache.getCacheState())?.schemaVersion).toBe(7);
     await cache.setCacheState({ ...(await cache.getCacheState())!, lastSync: 2 });
     expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBe('gen-1');
   });
@@ -145,7 +148,7 @@ describe('SQLite category cache v6', () => {
     expect(await cache.getCategorySnapshot()).toBeNull();
   });
 
-  it('fails closed without mutating stale authority, then invalidates it on the v6 state transition', async () => {
+  it('fails closed without mutating stale authority, then invalidates it on the v7 state transition', async () => {
     await cache.replaceCategorySnapshot(snapshot('stale-generation', [category('old', 'Old')]));
     const db = new Database(path);
     db.prepare(`UPDATE cache_meta SET value = ? WHERE key = 'state'`).run(JSON.stringify(state(5)));
@@ -159,10 +162,10 @@ describe('SQLite category cache v6', () => {
     expect(await cache.getCategoryCount()).toBe(0);
     expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBe('stale-generation');
 
-    await cache.setCacheState(state(6));
+    await cache.setCacheState(state(7));
     expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBeUndefined();
     expect(await cache.getCategorySnapshot()).toBeNull();
-    await cache.setCacheState({ ...state(6), lastSync: 2 });
+    await cache.setCacheState({ ...state(7), lastSync: 2 });
     expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBeUndefined();
   });
 
@@ -186,7 +189,7 @@ describe('SQLite category cache v6', () => {
       categorySnapshot: authoritative ? snapshot('mirror-generation', [category('new', 'Canonical')]) : null,
       items: [{ item_id: 'mirror-item', name: 'Mirror', category_id: 'new', category_name: 'Incoming' }],
       itemStockLocations: [stock('mirror-stock', 'mirror-item', 'Incoming')],
-      documents: [], itemDocuments: [], paymentTransactions: [], cacheState: state(6),
+      documents: [], itemDocuments: [], paymentTransactions: [], cacheState: state(7),
       paymentSyncStatus: null, pulledAt: 123,
     });
 
@@ -209,7 +212,7 @@ describe('SQLite category cache v6', () => {
       accounts: [], categorySnapshot: snapshot('new-generation', [category('new', 'New')]),
       items: [{ item_id: 'new-item', name: 'New item', category_id: 'new', category_name: 'Incoming' }],
       itemStockLocations: [stock('new-stock', 'new-item', 'Incoming')], documents: [], itemDocuments: [],
-      paymentTransactions: [], cacheState: state(6), paymentSyncStatus: null, pulledAt: 456,
+      paymentTransactions: [], cacheState: state(7), paymentSyncStatus: null, pulledAt: 456,
     })).toThrow(/forced mirror failure/);
 
     expect(await cache.getCategorySnapshot()).toEqual(snapshot('old-generation', [category('old', 'Old')]));
@@ -219,26 +222,75 @@ describe('SQLite category cache v6', () => {
     expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBe('old-generation');
   });
 
-  it('treats SQLite account binding as an isolated-file no-op', async () => {
-    await expect(cache.ensureAccountBinding({ accountIdentity: 'salesbinder:one', accountSubdomain: 'one' })).resolves.toBeUndefined();
-    await expect(cache.ensureAccountBinding({ accountIdentity: 'salesbinder:two', accountSubdomain: 'two' })).resolves.toBeUndefined();
-    await expect(cache.verifyAccountBinding({ accountIdentity: 'salesbinder:one', accountSubdomain: 'one' })).resolves.toBeUndefined();
+  it('durably binds an empty SQLite file and rejects alias-collision account mismatches', async () => {
+    const first = { accountIdentity: 'salesbinder:one', accountSubdomain: 'one' };
+    const second = { accountIdentity: 'salesbinder:two', accountSubdomain: 'two' };
+    await cache.ensureAccountBinding(first);
+    await cache.insertItem({ item_id: 'bound-item', name: 'Bound item' });
+
+    await expect(cache.ensureAccountBinding(second)).rejects.toThrow(/not bound to salesbinder:two/i);
+    await expect(cache.verifyAccountBinding(second)).rejects.toThrow(/not bound to salesbinder:two/i);
+    expect(await cache.getItem('bound-item')).toBeDefined();
+
+    await cache.close();
+    cache = new SQLiteCacheService('colliding:alias', path);
+    await expect(cache.verifyAccountBinding(first)).resolves.toBeUndefined();
     const db = new Database(path, { readonly: true });
-    expect(tableExists(db, 'cache_account_binding')).toBe(false);
-    db.close();
+    try {
+      expect(metaValue(db, 'cache_account_binding.v1.account_identity')).toBe(first.accountIdentity);
+      expect(metaValue(db, 'cache_account_binding.v1.account_subdomain')).toBe(first.accountSubdomain);
+      expect(tableExists(db, 'cache_account_binding')).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('refuses to adopt a populated legacy SQLite file without a durable binding', async () => {
+    await cache.insertItem({ item_id: 'legacy-item', name: 'Legacy item' });
+
+    await expect(cache.ensureAccountBinding({
+      accountIdentity: 'salesbinder:one', accountSubdomain: 'one',
+    })).rejects.toThrow(/populated but has no account binding/i);
+
+    expect(await cache.getItem('legacy-item')).toBeDefined();
+  });
+
+  it('preserves the durable account binding when cache payloads are cleared', async () => {
+    const binding = { accountIdentity: 'salesbinder:one', accountSubdomain: 'one' };
+    await cache.ensureAccountBinding(binding);
+    await cache.insertItem({ item_id: 'clear-item', name: 'Clear item' });
+
+    await cache.clearAll();
+
+    await expect(cache.verifyAccountBinding(binding)).resolves.toBeUndefined();
+    await expect(cache.verifyAccountBinding({
+      accountIdentity: 'salesbinder:two', accountSubdomain: 'two',
+    })).rejects.toThrow(/not bound to salesbinder:two/i);
+    expect(await cache.getItem('clear-item')).toBeUndefined();
+  });
+
+  it('permits forced deletion only for a completely unbound legacy file', async () => {
+    await cache.insertItem({ item_id: 'legacy-delete-item', name: 'Legacy delete item' });
+    await expect(cache.verifyUnboundForDeletion()).resolves.toBeUndefined();
+
+    cache.setRawMeta('cache_account_binding.v1.account_identity', 'salesbinder:one');
+    cache.setRawMeta('cache_account_binding.v1.account_subdomain', 'one');
+
+    await expect(cache.verifyUnboundForDeletion()).rejects.toThrow(/has an account binding/i);
   });
 });
 
 const category = (category_id: string, name: string, parent_id: string | null = null, parent_name: string | null = null): CategoryCacheRow => ({
-  category_id, name, item_count: null, parent_id, parent_name, created: null, modified: null,
-  cache_source: 'api', imported_at: 100,
+  category_id, name, item_count: null, parent_id, parent_name,
+  inventory_type: null, custom_fields_json: null, created: null, modified: null,
+  cache_source: 'api', source_api_version: '2.0', imported_at: 100,
 });
 
 const snapshot = (generation: string, rows: CategoryCacheRow[]): CategorySnapshot => ({
   rows,
   meta: { version: 1, status: 'complete', accountIdentity: 'salesbinder:test', startedAt: 90, completedAt: 100,
     count: rows.length, page: 1, pages: rows.length ? 1 : 0, sourceRowCount: rows.length,
-    storedRowCount: rows.length, schemaVersion: 6, generation, fingerprint: `sha256:${generation}` },
+    storedRowCount: rows.length, schemaVersion: 7, sourceApiVersion: '2.0', generation, fingerprint: `sha256:${generation}` },
 });
 
 const state = (schemaVersion: number): CacheState => ({
