@@ -3,7 +3,11 @@ import { Command } from 'commander';
 const mockExistsSync = jest.fn((_path: unknown) => true);
 const mockUnlinkSync = jest.fn((_path: unknown) => undefined);
 const mockStatSync = jest.fn((_path: unknown) => ({ size: 1024 * 1024 }));
-const mockLoadConfig = jest.fn((_accountName: string) => ({ subdomain: 'example' }));
+type MockAccountConfig = { subdomain: string; v3ApiKey?: string };
+const mockLoadConfig = jest.fn<MockAccountConfig, [string]>((_accountName: string) => ({
+  subdomain: 'example',
+  v3ApiKey: 'test-v3-key',
+}));
 
 jest.mock('fs', () => ({
   ...jest.requireActual('fs'),
@@ -59,6 +63,12 @@ const pullFromPostgres = jest.fn<Promise<{
   stockRowsPulled: number;
   duration: string;
 }>, []>();
+const createPostgresCacheService = jest.fn(async () => outerPgService);
+const categoryIndexerConstructor = jest.fn();
+const v3InventoryIndexerConstructor = jest.fn();
+
+class MockSalesBinderClient {}
+class MockSalesBinderV3Client {}
 
 class SuccessfulAccountIndexer {
   async sync() {
@@ -83,6 +93,10 @@ class SuccessfulDocumentIndexer {
 }
 
 class SuccessfulCategoryIndexer {
+  constructor(...args: unknown[]) {
+    categoryIndexerConstructor(...args);
+  }
+
   async sync() {
     phaseOrder.push('categories');
     return { categoriesProcessed: 0, snapshot: null };
@@ -90,6 +104,10 @@ class SuccessfulCategoryIndexer {
 }
 
 class SuccessfulItemIndexer {
+  constructor(...args: unknown[]) {
+    v3InventoryIndexerConstructor(...args);
+  }
+
   async sync() {
     phaseOrder.push('items');
     return { itemsProcessed: 0, stockRowsProcessed: 0 };
@@ -106,18 +124,19 @@ class SuccessfulDeletedLogSync {
 let registerCacheCommands: typeof import('./cache.commands.js').registerCacheCommands;
 
 jest.mock('@salesbinder/sdk', () => ({
-  SalesBinderClient: class {},
+  SalesBinderClient: MockSalesBinderClient,
+  SalesBinderV3Client: MockSalesBinderV3Client,
   AccountIndexerService: SuccessfulAccountIndexer,
   CategoryIndexerService: SuccessfulCategoryIndexer,
   DocumentIndexerService: SuccessfulDocumentIndexer,
-  ItemIndexerService: SuccessfulItemIndexer,
+  V3InventoryIndexerService: SuccessfulItemIndexer,
   DeletedLogSyncService: SuccessfulDeletedLogSync,
   SQLiteCacheService: class {
     constructor() {
       return sqliteCacheService;
     }
   },
-  createPostgresCacheService: jest.fn(async () => outerPgService),
+  createPostgresCacheService,
   pullFromPostgres,
   loadPreferences: jest.fn(() => ({})),
   loadConfig: (accountName: string) => mockLoadConfig(accountName),
@@ -172,6 +191,7 @@ describe('cache sync --pull lock ordering', () => {
     outerPgLockHeld = false;
     phaseOrder = [];
     jest.clearAllMocks();
+    mockLoadConfig.mockReturnValue({ subdomain: 'example', v3ApiKey: 'test-v3-key' });
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
   });
@@ -196,9 +216,36 @@ describe('cache sync --pull lock ordering', () => {
 
     expect(pullFromPostgres).toHaveBeenCalledTimes(1);
     expect(phaseOrder).toEqual(['accounts', 'categories', 'documents', 'items', 'deleted-log']);
+    expect(categoryIndexerConstructor).toHaveBeenCalledWith(
+      expect.any(MockSalesBinderV3Client),
+      outerPgService,
+      'salesbinder:example',
+      '3',
+    );
+    expect(v3InventoryIndexerConstructor).toHaveBeenCalledWith(
+      expect.any(MockSalesBinderV3Client),
+      outerPgService,
+      'default',
+      'salesbinder:example',
+    );
     expect(outerPgService.releaseSyncLock).toHaveBeenCalledTimes(1);
     expect(outerPgService.close).toHaveBeenCalledTimes(1);
     expect(process.exitCode).toBeUndefined();
+  });
+
+  it('fails before opening a cache backend when the v3 key is missing', async () => {
+    mockLoadConfig.mockReturnValueOnce({ subdomain: 'example' });
+
+    await runExplicitPull();
+
+    expect(process.exitCode).toBe(1);
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('API v3 key is required'));
+    expect(createPostgresCacheService).not.toHaveBeenCalled();
+    expect(outerPgService.ensureAccountBinding).not.toHaveBeenCalled();
+    expect(outerPgService.tryAcquireSyncLock).not.toHaveBeenCalled();
+    expect(outerPgService.setSyncStatus).not.toHaveBeenCalled();
+    expect(pullFromPostgres).not.toHaveBeenCalled();
+    expect(phaseOrder).toEqual([]);
   });
 
   it('keeps pull failures nonzero without attempting a second outer lock release', async () => {

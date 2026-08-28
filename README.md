@@ -86,7 +86,7 @@ Configure when the cache is considered stale (default: 3600 seconds = 1 hour).
 }
 ```
 
-`apiKey` remains the v2 credential used for accounts, documents, delta sync, and the deleted log. Add the optional `v3ApiKey` to make inventory and category cache refreshes use the v3 Bearer API. New configurations can set both with `salesbinder config:init --subdomain acme --api-key <v2-key> --v3-api-key <v3-key>`; for an existing configuration, add `v3ApiKey` to that account entry manually. The v3 key must have read access to items and categories, and the cache can only contain records visible to that key.
+`apiKey` remains the v2 credential used for accounts, documents, delta sync, and the deleted log. `v3ApiKey` is required by `cache sync` for inventory and category snapshots; there is no v2 fallback for those cache resources. New configurations can set both with `salesbinder config:init --subdomain acme --api-key <v2-key> --v3-api-key <v3-key>`; for an existing configuration, add `v3ApiKey` to that account entry manually. The v3 key must have read access to items and categories, and the cache can only contain records visible to that key. If it is missing, `cache sync` exits before opening or mutating the cache backend.
 
 **Via environment variable** (overrides config):
 ```bash
@@ -99,7 +99,7 @@ export SALESBINDER_CACHE_STALE_SECONDS=7200  # 2 hours
 
 Delta sync uses a lookback window so late SalesBinder edits are not missed. Default is `604800` seconds, or 7 days.
 
-Set `preferences.syncLookbackSeconds` in `~/.salesbinder/config.json` to tune this. The same lookback is applied to account, document, item, and deleted-log delta sync. Categories do not expose a safe delta contract, so every cache sync validates and replaces one complete category snapshot before item indexing.
+Set `preferences.syncLookbackSeconds` in `~/.salesbinder/config.json` to tune this. The lookback is applied to account, document, and deleted-log delta sync. Inventory and categories do not expose a safe delta contract, so every cache sync validates and atomically replaces complete v3 snapshots.
 
 ### Retry Backoff
 
@@ -132,7 +132,7 @@ Cache schema v4 keeps archive and payment safety intact. Accounts preserve their
 
 Cache schema v6 makes categories a first-class cache feature in SQLite and PostgreSQL. A successful snapshot atomically replaces `categories`, stores typed completion metadata in `category_cache_meta`, writes a matching generation marker, and reconciles category names on items and stock-location rows. Invalid pagination or an interrupted fetch performs no category writes. Rolling back to v5 may leave v6 columns or rows physically present; after re-upgrade they remain non-authoritative until a new v6 category snapshot completes.
 
-Cache schema v7 records the source API version for inventory and category rows. With `v3ApiKey` configured, items, variation-location details, and categories are fetched as complete validated v3 snapshots and published atomically; archive coverage uses `archived=all`. Embedded variation locations retain their names, while a parent item's direct `location_id` has no location name unless the item payload supplies one. Without that key, the CLI keeps the v2 cache path for compatibility but stores inventory values missing from the v2 response as `NULL` instead of fabricating zeroes. CSV-derived stock rows and their numeric values remain unchanged; when a CSV and API item share an ID, the v3 row is the canonical item master. For direct SQL, treat `NULL` as unknown—not as zero—and check the snapshot metadata before treating a cache as authoritative.
+Cache schema v7 records the source API version for inventory and category rows. Items, variation-location details, and categories are fetched as complete validated v3 snapshots and published atomically; archive coverage uses `archived=all`. `cache sync` requires `v3ApiKey` and does not fall back to v2 for these resources. Embedded variation locations retain their names, while a parent item's direct `location_id` has no location name unless the item payload supplies one. CSV-derived stock rows and their numeric values remain unchanged; when a CSV and API item share an ID, the v3 row is the canonical item master. For direct SQL, treat `NULL` as unknown—not as zero—and check the snapshot metadata before treating a cache as authoritative.
 
 | Feature | SQLite (local mirror) | PostgreSQL (shared upstream) |
 |---------|------------------------|-------------------------------|
@@ -625,7 +625,7 @@ node packages/cli/dist/cli.js cache clear
 
 `cache sync --pull` is the only sync path that refreshes the local SQLite mirror. If the requested mirror refresh fails, the command exits non-zero and reports the pull error.
 
-Every normal, delta, full, and full-resume sync fetches categories as a complete validated snapshot. When `v3ApiKey` is configured, inventory is also rebuilt from one complete validated v3 snapshot on every sync because the API does not expose a safe inventory delta contract. Pagination metadata must remain coherent across every page, and two consecutive v3 membership reads must agree before publication. The previous category or inventory snapshot remains unchanged if fetch or validation fails.
+Every normal, delta, full, and full-resume sync requires `v3ApiKey` and fetches categories and inventory as complete validated v3 snapshots. There is no v2 fallback for either cache resource. Pagination metadata must remain coherent across every page, and two consecutive v3 membership reads must agree before publication. The previous category or inventory snapshot remains unchanged if fetch or validation fails.
 
 `cache sync --full-resume` writes a private checkpoint under the per-account cache directory with restrictive permissions and resumes completed phases in this order: accounts, categories, documents, items, deleted log. Category and inventory generations and content fingerprints are checkpoint evidence, so a same-count content change invalidates stale evidence. The checkpoint is bound to the account, sync target, schema, and cache identity; checkpoints from older schemas, malformed files, and cross-account checkpoints fail closed and ask for `--reset-checkpoint`. A resumed v3 item phase always reruns the entire atomic inventory snapshot rather than resuming midway through it.
 

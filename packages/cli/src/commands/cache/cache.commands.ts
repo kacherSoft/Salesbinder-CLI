@@ -67,7 +67,6 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           AccountIndexerService,
           CategoryIndexerService,
           DocumentIndexerService,
-          ItemIndexerService,
           V3InventoryIndexerService,
           DeletedLogSyncService,
           createPostgresCacheService,
@@ -81,9 +80,15 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
 
         const accountName = program.opts().account || 'default';
         const accountConfig = loadConfig(accountName);
+        if (!accountConfig.v3ApiKey) {
+          throw new Error(
+            'SalesBinder API v3 key is required for cache sync category and inventory snapshots. '
+            + 'Add v3ApiKey to this account config or rerun config:init with --v3-api-key.'
+          );
+        }
         const accountBinding = createSalesBinderAccountBinding(accountConfig.subdomain);
         const client = new SalesBinderClient(accountName);
-        const v3Client = accountConfig.v3ApiKey ? new SalesBinderV3Client(accountName) : null;
+        const v3Client = new SalesBinderV3Client(accountName);
         const effectiveFull = Boolean(options.full || options.fullResume);
         const dbUrl = process.env.SALESBINDER_DB_URL;
 
@@ -152,10 +157,10 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
         const syncLookbackSeconds = lookbackEnv ? parseInt(lookbackEnv, 10) : (prefs?.syncLookbackSeconds ?? 604800);
         const accountIndexer = new AccountIndexerService(client, cacheService, accountName, syncLookbackSeconds);
         const categoryIndexer = new CategoryIndexerService(
-          v3Client ?? client,
+          v3Client,
           cacheService,
           accountBinding.accountIdentity,
-          v3Client ? '3' : '2.0',
+          '3',
         );
         const indexer = new DocumentIndexerService(
           client,
@@ -165,9 +170,12 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           syncLookbackSeconds,
           { deferGlobalWatermark: true },
         );
-        const itemIndexer = v3Client
-          ? new V3InventoryIndexerService(v3Client, cacheService, accountName, accountBinding.accountIdentity)
-          : new ItemIndexerService(client, cacheService, accountName, syncLookbackSeconds);
+        const itemIndexer = new V3InventoryIndexerService(
+          v3Client,
+          cacheService,
+          accountName,
+          accountBinding.accountIdentity,
+        );
         const deletedLogSync = new DeletedLogSyncService(client, cacheService, accountName, syncLookbackSeconds);
         const activeResume: ActiveFullResume | null = checkpoint && checkpointStore ? { checkpoint, store: checkpointStore } : null;
         const captureCheckpointSnapshot = () =>
@@ -234,16 +242,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
         const itemResult = await runFullResumePhase(
           'items',
           { itemsProcessed: 0, stockRowsProcessed: 0 },
-          () => v3Client
-            ? (itemIndexer as InstanceType<typeof V3InventoryIndexerService>).sync()
-            : (itemIndexer as InstanceType<typeof ItemIndexerService>).sync(activeResume ? {
-              full: effectiveFull,
-              resume: {
-                page: activeResume.checkpoint.items?.page,
-                itemIndex: activeResume.checkpoint.items?.itemIndex,
-                onItemCheckpoint: (position) => activeResume.store.markItemPosition(activeResume.checkpoint, position),
-              },
-            } : effectiveFull),
+          () => itemIndexer.sync(),
         );
 
         const deletedResult = await runFullResumePhase(
@@ -338,7 +337,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
           sync_target: syncTarget,
           sync_type: result.type,
           sync_lookback_seconds: result.syncLookbackSeconds,
-          inventory_source_api_version: v3Client ? '3' : '2.0',
+          inventory_source_api_version: '3',
           accounts_processed: accountResult.accountsProcessed,
           customers_processed: accountResult.customersProcessed,
           suppliers_processed: accountResult.suppliersProcessed,
@@ -374,7 +373,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`)
             full_resume: {
               checkpoint_path: checkpointStore?.checkpointPath,
               completed_phases: checkpoint?.completedPhases ?? [],
-              granularity: 'phase+document-page+document-index+item-page+item-index',
+              granularity: 'phase+document-page+document-index+atomic-v3-inventory-snapshot',
               document_position: checkpoint?.documents,
               item_position: checkpoint?.items,
             },
