@@ -2,6 +2,7 @@
 
 import type { AxiosInstance } from 'axios';
 import type { V3Item, V3ItemVariation, V3ListResponse } from '../types/items.types.js';
+import { ApiResponseValidationError } from './api-response-validation.error.js';
 
 export interface V3ItemListParams {
   page?: number;
@@ -24,10 +25,18 @@ export class V3ItemsResource {
   }
 
   async get(id: string): Promise<V3Item> {
-    const response = await this.client.get<unknown>(`/items/${id}`);
+    const response = await this.client.get<unknown>(`/items/${encodeURIComponent(id)}`);
     const item = response.data;
-    if (!isRecord(item) || item.object !== 'item' || typeof item.id !== 'string') {
-      throw new Error(`Invalid API v3 response for item ${id}: expected an item object`);
+    if (!isRecord(item) || item.object !== 'item') {
+      throw new ApiResponseValidationError(
+        `Invalid API v3 response for item ${id}: expected an item object`
+      );
+    }
+    if (typeof item.id !== 'string') {
+      throw new ApiResponseValidationError(
+        `Invalid API v3 response for item ${id}: expected an item identity`,
+        'identity'
+      );
     }
     return item as unknown as V3Item;
   }
@@ -36,7 +45,9 @@ export class V3ItemsResource {
     id: string,
     params?: V3VariationListParams
   ): Promise<V3ListResponse<V3ItemVariation>> {
-    const response = await this.client.get<unknown>(`/items/${id}/variations`, { params });
+    const response = await this.client.get<unknown>(`/items/${encodeURIComponent(id)}/variations`, {
+      params,
+    });
     return validateV3ListResponse<V3ItemVariation>(response.data, `variations for item ${id}`);
   }
 }
@@ -51,7 +62,9 @@ export function validateV3ListResponse<T>(value: unknown, resource: string): V3L
     !Array.isArray(value.data) ||
     !isRecord(value.pagination)
   ) {
-    throw new Error(`Invalid API v3 response for ${resource}: expected a list envelope`);
+    throw new ApiResponseValidationError(
+      `Invalid API v3 response for ${resource}: expected a list envelope`
+    );
   }
 
   const { page, per_page, total_pages, total_records } = value.pagination;
@@ -61,7 +74,9 @@ export function validateV3ListResponse<T>(value: unknown, resource: string): V3L
     !isNonNegativeInteger(total_pages) ||
     !isNonNegativeInteger(total_records)
   ) {
-    throw new Error(`Invalid API v3 response for ${resource}: expected numeric pagination`);
+    throw new ApiResponseValidationError(
+      `Invalid API v3 response for ${resource}: expected numeric pagination`
+    );
   }
 
   return value as unknown as V3ListResponse<T>;

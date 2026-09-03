@@ -3,8 +3,17 @@
  */
 
 import Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
 import {
-  chmodSync, closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync,
+  chmodSync,
+  closeSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeSync,
 } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -34,7 +43,10 @@ import {
   CATEGORY_SNAPSHOT_META_KEY,
   INVENTORY_ACCOUNT_META_KEY,
   INVENTORY_SNAPSHOT_META_KEY,
+  createInventorySnapshotFingerprint,
   createSalesBinderAccountBinding,
+  isInventoryCacheMeta,
+  inventorySnapshotFingerprintMatches,
 } from './types.js';
 import { PAYMENT_SYNC_STATUS_KEY, PAYMENT_TRANSACTION_COLUMNS } from './payment-cache.constants.js';
 import type { PaymentSyncStatus, PaymentTransactionRow } from './payment-sync.types.js';
@@ -42,57 +54,166 @@ import {
   assertPaymentRowsMatchDocument,
   assertUniquePaymentTransactionIds,
 } from './payment-sync.helpers.js';
+import { createCategoryFingerprint } from './category-indexer.service.js';
+import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
+import { assertCanonicalV3SourceId } from './v3-inventory-source-validation.js';
 
 const DOCUMENT_COLUMNS = [
-  'doc_id', 'context_id', 'doc_number', 'issue_date', 'customer_id', 'modified',
-  'api_doc_id', 'cache_source', 'document_name', 'custom_doc_number',
-  'account_id', 'account_context_id', 'account_name', 'account_number',
-  'user_id', 'salesperson_name', 'customer_name', 'customer_number',
-  'supplier_name', 'supplier_number', 'status_id', 'status_name',
-  'total_price', 'total_cost', 'subtotal', 'associated_document_id',
-  'external_po_number', 'shipping_location', 'date_sent', 'shipped_percent',
-  'is_cancelled', 'archived', 'imported_at',
+  'doc_id',
+  'context_id',
+  'doc_number',
+  'issue_date',
+  'customer_id',
+  'modified',
+  'api_doc_id',
+  'cache_source',
+  'document_name',
+  'custom_doc_number',
+  'account_id',
+  'account_context_id',
+  'account_name',
+  'account_number',
+  'user_id',
+  'salesperson_name',
+  'customer_name',
+  'customer_number',
+  'supplier_name',
+  'supplier_number',
+  'status_id',
+  'status_name',
+  'total_price',
+  'total_cost',
+  'subtotal',
+  'associated_document_id',
+  'external_po_number',
+  'shipping_location',
+  'date_sent',
+  'shipped_percent',
+  'is_cancelled',
+  'archived',
+  'imported_at',
 ] as const;
 
 const ITEM_DOCUMENT_COLUMNS = [
-  'item_id', 'doc_id', 'quantity', 'price', 'document_item_id', 'item_name',
-  'item_number', 'item_sku', 'item_location', 'line_description',
-  'quantity_received', 'quantity_shipped', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
+  'item_id',
+  'doc_id',
+  'quantity',
+  'price',
+  'document_item_id',
+  'item_name',
+  'item_number',
+  'item_sku',
+  'item_location',
+  'line_description',
+  'quantity_received',
+  'quantity_shipped',
+  'cost',
+  'total_amount',
+  'discounted_price',
+  'discount_percent',
 ] as const;
 
 const ACCOUNT_COLUMNS = [
-  'account_id', 'context_id', 'account_number', 'name', 'office_email', 'office_phone',
-  'office_fax', 'url', 'billing_address_1', 'billing_address_2', 'billing_city',
-  'billing_region', 'billing_postal_code', 'billing_country', 'shipping_address_1',
-  'shipping_address_2', 'shipping_city', 'shipping_region', 'shipping_postal_code',
-  'shipping_country', 'vat_number', 'account_manager', 'label_name', 'archived',
-  'last_invoiced', 'created', 'modified', 'cache_source', 'imported_at',
+  'account_id',
+  'context_id',
+  'account_number',
+  'name',
+  'office_email',
+  'office_phone',
+  'office_fax',
+  'url',
+  'billing_address_1',
+  'billing_address_2',
+  'billing_city',
+  'billing_region',
+  'billing_postal_code',
+  'billing_country',
+  'shipping_address_1',
+  'shipping_address_2',
+  'shipping_city',
+  'shipping_region',
+  'shipping_postal_code',
+  'shipping_country',
+  'vat_number',
+  'account_manager',
+  'label_name',
+  'archived',
+  'last_invoiced',
+  'created',
+  'modified',
+  'cache_source',
+  'imported_at',
 ] as const;
 
 const CATEGORY_COLUMNS = [
-  'category_id', 'name', 'item_count', 'parent_id', 'parent_name',
-  'inventory_type', 'custom_fields_json', 'created', 'modified', 'cache_source',
-  'source_api_version', 'imported_at',
+  'category_id',
+  'name',
+  'item_count',
+  'parent_id',
+  'parent_name',
+  'inventory_type',
+  'custom_fields_json',
+  'created',
+  'modified',
+  'cache_source',
+  'source_api_version',
+  'imported_at',
 ] as const;
 
 const ITEM_COLUMNS = [
-  'item_id', 'item_number', 'name', 'description', 'sku', 'serial_number', 'barcode',
-  'category_id', 'category_name', 'quantity', 'quantity_reserved', 'quantity_available',
-  'quantity_incoming', 'in_transit', 'threshold', 'cost', 'price', 'valuation',
-  'published', 'archived', 'created', 'modified', 'cache_source',
-  'source_api_version', 'imported_at',
+  'item_id',
+  'item_number',
+  'name',
+  'description',
+  'sku',
+  'serial_number',
+  'barcode',
+  'category_id',
+  'category_name',
+  'quantity',
+  'quantity_reserved',
+  'quantity_available',
+  'quantity_incoming',
+  'in_transit',
+  'threshold',
+  'cost',
+  'price',
+  'valuation',
+  'published',
+  'archived',
+  'created',
+  'modified',
+  'cache_source',
+  'source_api_version',
+  'imported_at',
 ] as const;
 
 const STOCK_COLUMNS = [
-  'stock_row_id', 'item_id', 'item_number', 'variation_id', 'variation_location_id',
-  'location_id', 'location_name', 'category_name', 'quantity_on_hand',
-  'quantity_reserved', 'quantity_available', 'quantity_incoming', 'in_transit',
-  'price', 'cost', 'valuation', 'barcode', 'cache_source', 'source_api_version',
+  'stock_row_id',
+  'item_id',
+  'item_number',
+  'variation_id',
+  'variation_location_id',
+  'location_id',
+  'location_name',
+  'category_name',
+  'quantity_on_hand',
+  'quantity_reserved',
+  'quantity_available',
+  'quantity_incoming',
+  'in_transit',
+  'price',
+  'cost',
+  'valuation',
+  'barcode',
+  'cache_source',
+  'source_api_version',
   'imported_at',
 ] as const;
 
 const SQLITE_ACCOUNT_IDENTITY_META_KEY = 'cache_account_binding.v1.account_identity';
 const SQLITE_ACCOUNT_SUBDOMAIN_META_KEY = 'cache_account_binding.v1.account_subdomain';
+const POSTGRES_INTEGER_MAX = 2_147_483_647;
 
 export class SQLiteCacheService implements CacheService {
   private db: Database.Database;
@@ -126,7 +247,11 @@ export class SQLiteCacheService implements CacheService {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     if (existsSync(this.dbPath)) {
-      try { chmodSync(this.dbPath, 0o600); } catch { /* ignore */ }
+      try {
+        chmodSync(this.dbPath, 0o600);
+      } catch {
+        /* ignore */
+      }
     }
     return db;
   }
@@ -532,21 +657,28 @@ export class SQLiteCacheService implements CacheService {
   }
 
   private ensureUniqueDocumentApiIdIndex(): void {
-    const duplicate = this.db.prepare(`
+    const duplicate = this.db
+      .prepare(
+        `
       SELECT api_doc_id, COUNT(*) AS count
       FROM documents
       WHERE api_doc_id IS NOT NULL
       GROUP BY api_doc_id
       HAVING COUNT(*) > 1
       LIMIT 1
-    `).get() as { api_doc_id: string; count: number } | undefined;
+    `
+      )
+      .get() as { api_doc_id: string; count: number } | undefined;
     if (duplicate) {
       throw new Error(
-        `Cannot migrate cache schema: documents contains ${duplicate.count} rows with api_doc_id "${duplicate.api_doc_id}". `
-        + 'Resolve duplicate document identities before retrying.'
+        `Cannot migrate cache schema: documents contains ${duplicate.count} rows with api_doc_id "${duplicate.api_doc_id}". ` +
+          'Resolve duplicate document identities before retrying.'
       );
     }
-    const indexes = this.db.pragma('index_list(documents)') as Array<{ name: string; unique: number }>;
+    const indexes = this.db.pragma('index_list(documents)') as Array<{
+      name: string;
+      unique: number;
+    }>;
     const existing = indexes.find(({ name }) => name === 'idx_documents_api_doc_id');
     if (existing && existing.unique !== 1) {
       this.db.exec('DROP INDEX idx_documents_api_doc_id');
@@ -568,23 +700,43 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getDocument(docId: string): Promise<DocumentRow | undefined> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM documents WHERE doc_id = ?`).get(docId) as DocumentRow | undefined);
+    return Promise.resolve(
+      this.db.prepare(`SELECT * FROM documents WHERE doc_id = ?`).get(docId) as
+        | DocumentRow
+        | undefined
+    );
   }
 
   getDocumentByApiId(apiDocId: string): Promise<DocumentRow | undefined> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM documents WHERE api_doc_id = ?`).get(apiDocId) as DocumentRow | undefined);
+    return Promise.resolve(
+      this.db.prepare(`SELECT * FROM documents WHERE api_doc_id = ?`).get(apiDocId) as
+        | DocumentRow
+        | undefined
+    );
   }
 
   getDocumentByNumber(contextId: number, docNumber: number): Promise<DocumentRow | undefined> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM documents WHERE context_id = ? AND doc_number = ?`).get(contextId, docNumber) as DocumentRow | undefined);
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM documents WHERE context_id = ? AND doc_number = ?`)
+        .get(contextId, docNumber) as DocumentRow | undefined
+    );
   }
 
   getDocumentsByContext(contextId: number): Promise<DocumentRow[]> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM documents WHERE context_id = ?`).all(contextId) as DocumentRow[]);
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM documents WHERE context_id = ?`)
+        .all(contextId) as DocumentRow[]
+    );
   }
 
   getDocumentsModifiedSince(timestamp: number): Promise<DocumentRow[]> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM documents WHERE modified > ? ORDER BY modified ASC`).all(timestamp) as DocumentRow[]);
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM documents WHERE modified > ? ORDER BY modified ASC`)
+        .all(timestamp) as DocumentRow[]
+    );
   }
 
   getDocumentCountByContext(contextId: number): Promise<number> {
@@ -599,7 +751,8 @@ export class SQLiteCacheService implements CacheService {
   batchInsertDocuments(docs: DocumentRow[]): Promise<void> {
     const insert = this.db.prepare(this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'));
     const tx = this.db.transaction((documents: DocumentRow[]) => {
-      for (const doc of documents) insert.run(...this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(doc)));
+      for (const doc of documents)
+        insert.run(...this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(doc)));
     });
     tx(docs);
     return Promise.resolve();
@@ -612,14 +765,68 @@ export class SQLiteCacheService implements CacheService {
     return Promise.resolve();
   }
 
+  replaceDocumentBundle(
+    document: DocumentRow,
+    itemDocuments: Omit<ItemDocumentRow, 'id'>[],
+    paymentTransactions?: PaymentTransactionRow[]
+  ): Promise<void> {
+    if (itemDocuments.some((row) => row.doc_id !== document.doc_id)) {
+      throw new Error('Document bundle line items must match the document ID.');
+    }
+    if (paymentTransactions !== undefined) {
+      assertPaymentRowsMatchDocument(document.doc_id, paymentTransactions);
+      assertUniquePaymentTransactionIds(paymentTransactions);
+    }
+
+    const documentInsert = this.db.prepare(this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'));
+    const itemDelete = this.db.prepare(`DELETE FROM item_documents WHERE doc_id = ?`);
+    const itemInsert = this.db.prepare(
+      `INSERT INTO item_documents (${ITEM_DOCUMENT_COLUMNS.join(', ')})` +
+        ` VALUES (${ITEM_DOCUMENT_COLUMNS.map(() => '?').join(', ')})`
+    );
+    const paymentDelete = this.db.prepare(`DELETE FROM payment_transactions WHERE doc_id = ?`);
+    const paymentInsert = this.db.prepare(
+      `INSERT INTO payment_transactions (${PAYMENT_TRANSACTION_COLUMNS.join(', ')})` +
+        ` VALUES (${PAYMENT_TRANSACTION_COLUMNS.map(() => '?').join(', ')})`
+    );
+    const tx = this.db.transaction(() => {
+      const normalizedDocument = this.normalizeDocumentForWrite(document);
+      const resolvedDocId = normalizedDocument['doc_id'];
+      if (typeof resolvedDocId !== 'string' || resolvedDocId.length === 0) {
+        throw new Error('Document bundle requires a valid document ID.');
+      }
+      documentInsert.run(...this.valuesFor(DOCUMENT_COLUMNS, normalizedDocument));
+      itemDelete.run(resolvedDocId);
+      for (const row of itemDocuments) {
+        const resolved = this.normalizeItemDocument({ ...row, doc_id: resolvedDocId });
+        itemInsert.run(...this.valuesFor(ITEM_DOCUMENT_COLUMNS, resolved));
+      }
+      if (paymentTransactions !== undefined) {
+        paymentDelete.run(resolvedDocId);
+        for (const row of paymentTransactions) {
+          const resolved = this.normalizePaymentTransaction({ ...row, doc_id: resolvedDocId });
+          paymentInsert.run(...this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, resolved));
+        }
+      }
+    });
+    tx.immediate();
+    return Promise.resolve();
+  }
+
   insertItemDocument(item: Omit<ItemDocumentRow, 'id'>): Promise<void> {
-    const stmt = this.db.prepare(`INSERT INTO item_documents (${ITEM_DOCUMENT_COLUMNS.join(', ')}) VALUES (${ITEM_DOCUMENT_COLUMNS.map(() => '?').join(', ')})`);
+    const stmt = this.db.prepare(
+      `INSERT INTO item_documents (${ITEM_DOCUMENT_COLUMNS.join(', ')}) VALUES (${ITEM_DOCUMENT_COLUMNS.map(() => '?').join(', ')})`
+    );
     stmt.run(...this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)));
     return Promise.resolve();
   }
 
   getItemDocuments(docId: string): Promise<ItemDocumentRow[]> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM item_documents WHERE doc_id = ?`).all(docId) as ItemDocumentRow[]);
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM item_documents WHERE doc_id = ?`)
+        .all(docId) as ItemDocumentRow[]
+    );
   }
 
   deleteItemDocuments(docId: string): Promise<void> {
@@ -629,9 +836,12 @@ export class SQLiteCacheService implements CacheService {
 
   batchInsertItemDocuments(items: Omit<ItemDocumentRow, 'id'>[]): Promise<void> {
     if (items.length === 0) return Promise.resolve();
-    const insert = this.db.prepare(`INSERT INTO item_documents (${ITEM_DOCUMENT_COLUMNS.join(', ')}) VALUES (${ITEM_DOCUMENT_COLUMNS.map(() => '?').join(', ')})`);
+    const insert = this.db.prepare(
+      `INSERT INTO item_documents (${ITEM_DOCUMENT_COLUMNS.join(', ')}) VALUES (${ITEM_DOCUMENT_COLUMNS.map(() => '?').join(', ')})`
+    );
     const tx = this.db.transaction((rows: Omit<ItemDocumentRow, 'id'>[]) => {
-      for (const item of rows) insert.run(...this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)));
+      for (const item of rows)
+        insert.run(...this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)));
     });
     tx(items);
     return Promise.resolve();
@@ -640,16 +850,20 @@ export class SQLiteCacheService implements CacheService {
   getPaymentTransactions(docId: string): Promise<PaymentTransactionRow[]> {
     return Promise.resolve(
       this.db
-        .prepare(`SELECT * FROM payment_transactions WHERE doc_id = ? ORDER BY transaction_date ASC, transaction_id ASC`)
-        .all(docId) as PaymentTransactionRow[],
+        .prepare(
+          `SELECT * FROM payment_transactions WHERE doc_id = ? ORDER BY transaction_date ASC, transaction_id ASC`
+        )
+        .all(docId) as PaymentTransactionRow[]
     );
   }
 
   getAllPaymentTransactions(): Promise<PaymentTransactionRow[]> {
     return Promise.resolve(
       this.db
-        .prepare(`SELECT * FROM payment_transactions ORDER BY transaction_date ASC, transaction_id ASC`)
-        .all() as PaymentTransactionRow[],
+        .prepare(
+          `SELECT * FROM payment_transactions ORDER BY transaction_date ASC, transaction_id ASC`
+        )
+        .all() as PaymentTransactionRow[]
     );
   }
 
@@ -658,13 +872,18 @@ export class SQLiteCacheService implements CacheService {
     assertUniquePaymentTransactionIds(transactions);
     const deleteStmt = this.db.prepare(`DELETE FROM payment_transactions WHERE doc_id = ?`);
     const insert = this.db.prepare(
-      `INSERT INTO payment_transactions (${PAYMENT_TRANSACTION_COLUMNS.join(', ')})`
-      + ` VALUES (${PAYMENT_TRANSACTION_COLUMNS.map(() => '?').join(', ')})`,
+      `INSERT INTO payment_transactions (${PAYMENT_TRANSACTION_COLUMNS.join(', ')})` +
+        ` VALUES (${PAYMENT_TRANSACTION_COLUMNS.map(() => '?').join(', ')})`
     );
     const tx = this.db.transaction(() => {
       deleteStmt.run(docId);
       for (const transaction of transactions) {
-        insert.run(...this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction)));
+        insert.run(
+          ...this.valuesFor(
+            PAYMENT_TRANSACTION_COLUMNS,
+            this.normalizePaymentTransaction(transaction)
+          )
+        );
       }
     });
     tx();
@@ -674,12 +893,17 @@ export class SQLiteCacheService implements CacheService {
   batchInsertPaymentTransactions(transactions: PaymentTransactionRow[]): Promise<void> {
     assertUniquePaymentTransactionIds(transactions);
     const insert = this.db.prepare(
-      `INSERT INTO payment_transactions (${PAYMENT_TRANSACTION_COLUMNS.join(', ')})`
-      + ` VALUES (${PAYMENT_TRANSACTION_COLUMNS.map(() => '?').join(', ')})`,
+      `INSERT INTO payment_transactions (${PAYMENT_TRANSACTION_COLUMNS.join(', ')})` +
+        ` VALUES (${PAYMENT_TRANSACTION_COLUMNS.map(() => '?').join(', ')})`
     );
     const tx = this.db.transaction((rows: PaymentTransactionRow[]) => {
       for (const transaction of rows) {
-        insert.run(...this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction)));
+        insert.run(
+          ...this.valuesFor(
+            PAYMENT_TRANSACTION_COLUMNS,
+            this.normalizePaymentTransaction(transaction)
+          )
+        );
       }
     });
     tx(transactions);
@@ -687,20 +911,34 @@ export class SQLiteCacheService implements CacheService {
   }
 
   insertAccount(account: AccountRow): Promise<void> {
-    this.db.prepare(this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id')).run(...this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account)));
+    this.db
+      .prepare(this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'))
+      .run(...this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account)));
     return Promise.resolve();
   }
 
   getAccount(accountId: string): Promise<AccountRow | undefined> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM accounts WHERE account_id = ?`).get(accountId) as AccountRow | undefined);
+    return Promise.resolve(
+      this.db.prepare(`SELECT * FROM accounts WHERE account_id = ?`).get(accountId) as
+        | AccountRow
+        | undefined
+    );
   }
 
   getAccountByNumber(contextId: number, accountNumber: number): Promise<AccountRow | undefined> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM accounts WHERE context_id = ? AND account_number = ?`).get(contextId, accountNumber) as AccountRow | undefined);
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM accounts WHERE context_id = ? AND account_number = ?`)
+        .get(contextId, accountNumber) as AccountRow | undefined
+    );
   }
 
   getAccountsByName(contextId: number, name: string): Promise<AccountRow[]> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM accounts WHERE context_id = ? AND name = ?`).all(contextId, name) as AccountRow[]);
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM accounts WHERE context_id = ? AND name = ?`)
+        .all(contextId, name) as AccountRow[]
+    );
   }
 
   getAllAccounts(): Promise<AccountRow[]> {
@@ -708,13 +946,18 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getAccountsModifiedSince(timestamp: number): Promise<AccountRow[]> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM accounts WHERE COALESCE(modified, 0) > ? ORDER BY modified ASC`).all(timestamp) as AccountRow[]);
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM accounts WHERE COALESCE(modified, 0) > ? ORDER BY modified ASC`)
+        .all(timestamp) as AccountRow[]
+    );
   }
 
   batchInsertAccounts(accounts: AccountRow[]): Promise<void> {
     const insert = this.db.prepare(this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'));
     const tx = this.db.transaction((rows: AccountRow[]) => {
-      for (const row of rows) insert.run(...this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(row)));
+      for (const row of rows)
+        insert.run(...this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(row)));
     });
     tx(accounts);
     return Promise.resolve();
@@ -734,40 +977,38 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getCategorySnapshot(): Promise<CategorySnapshot | null> {
-    const read = this.db.transaction(() => {
-      const meta = this.readAuthoritativeCategoryMeta();
-      if (!meta) return null;
-      const rows = this.getAllCategoryRows();
-      return rows.length === meta.storedRowCount ? { rows, meta } : null;
-    });
+    const read = this.db.transaction(() => this.readAuthoritativeCategorySnapshot());
     return Promise.resolve(read.deferred());
   }
 
   getCategoryCacheMeta(): Promise<CategoryCacheMeta | null> {
-    const read = this.db.transaction(() => this.readAuthoritativeCategoryMeta());
+    const read = this.db.transaction(() => this.readAuthoritativeCategorySnapshot()?.meta ?? null);
     return Promise.resolve(read.deferred());
   }
 
   getCategory(categoryId: string): Promise<CategoryCacheRow | undefined> {
-    const read = this.db.transaction(() => this.readAuthoritativeCategoryMeta()
-      ? this.db.prepare('SELECT * FROM categories WHERE category_id = ?').get(categoryId) as CategoryCacheRow | undefined
-      : undefined);
+    const read = this.db.transaction(() =>
+      this.readAuthoritativeCategorySnapshot()?.rows.find((row) => row.category_id === categoryId)
+    );
     return Promise.resolve(read.deferred());
   }
 
   getAllCategories(): Promise<CategoryCacheRow[]> {
-    const read = this.db.transaction(() => this.readAuthoritativeCategoryMeta() ? this.getAllCategoryRows() : []);
+    const read = this.db.transaction(() => this.readAuthoritativeCategorySnapshot()?.rows ?? []);
     return Promise.resolve(read.deferred());
   }
 
   getCategoryCount(): Promise<number> {
-    const read = this.db.transaction(() => this.readAuthoritativeCategoryMeta() ? this.count('categories') : 0);
+    const read = this.db.transaction(
+      () => this.readAuthoritativeCategorySnapshot()?.meta.storedRowCount ?? 0
+    );
     return Promise.resolve(read.deferred());
   }
 
   insertItem(item: ItemRow): Promise<void> {
     const tx = this.db.transaction(() => {
-      this.db.prepare(this.upsertSql('items', ITEM_COLUMNS, 'item_id'))
+      this.db
+        .prepare(this.upsertSql('items', ITEM_COLUMNS, 'item_id'))
         .run(...this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)));
       this.invalidateInventoryAuthorityInTransaction();
     });
@@ -776,7 +1017,9 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getItem(itemId: string): Promise<ItemRow | undefined> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM items WHERE item_id = ?`).get(itemId) as ItemRow | undefined);
+    return Promise.resolve(
+      this.db.prepare(`SELECT * FROM items WHERE item_id = ?`).get(itemId) as ItemRow | undefined
+    );
   }
 
   getAllItems(): Promise<ItemRow[]> {
@@ -784,7 +1027,11 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getItemsModifiedSince(timestamp: number): Promise<ItemRow[]> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM items WHERE COALESCE(modified, 0) > ? ORDER BY modified ASC`).all(timestamp) as ItemRow[]);
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM items WHERE COALESCE(modified, 0) > ? ORDER BY modified ASC`)
+        .all(timestamp) as ItemRow[]
+    );
   }
 
   batchInsertItems(items: ItemRow[]): Promise<void> {
@@ -809,7 +1056,8 @@ export class SQLiteCacheService implements CacheService {
 
   insertItemStockLocation(row: ItemStockLocationRow): Promise<void> {
     const tx = this.db.transaction(() => {
-      this.db.prepare(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'))
+      this.db
+        .prepare(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'))
         .run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
       this.invalidateInventoryAuthorityInTransaction();
     });
@@ -818,19 +1066,28 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getItemStockLocations(itemId: string): Promise<ItemStockLocationRow[]> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM item_stock_locations WHERE item_id = ?`).all(itemId) as ItemStockLocationRow[]);
+    return Promise.resolve(
+      this.db
+        .prepare(`SELECT * FROM item_stock_locations WHERE item_id = ?`)
+        .all(itemId) as ItemStockLocationRow[]
+    );
   }
 
   getAllItemStockLocations(): Promise<ItemStockLocationRow[]> {
-    return Promise.resolve(this.db.prepare(`SELECT * FROM item_stock_locations`).all() as ItemStockLocationRow[]);
+    return Promise.resolve(
+      this.db.prepare(`SELECT * FROM item_stock_locations`).all() as ItemStockLocationRow[]
+    );
   }
 
   replaceItemStockLocations(itemId: string, rows: ItemStockLocationRow[]): Promise<void> {
     const deleteStmt = this.db.prepare(`DELETE FROM item_stock_locations WHERE item_id = ?`);
-    const insert = this.db.prepare(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'));
+    const insert = this.db.prepare(
+      this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id')
+    );
     const tx = this.db.transaction(() => {
       deleteStmt.run(itemId);
-      for (const row of rows) insert.run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
+      for (const row of rows)
+        insert.run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
       this.invalidateInventoryAuthorityInTransaction();
     });
     tx.immediate();
@@ -839,9 +1096,12 @@ export class SQLiteCacheService implements CacheService {
 
   batchInsertItemStockLocations(rows: ItemStockLocationRow[]): Promise<void> {
     if (rows.length === 0) return Promise.resolve();
-    const insert = this.db.prepare(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'));
+    const insert = this.db.prepare(
+      this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id')
+    );
     const tx = this.db.transaction((stockRows: ItemStockLocationRow[]) => {
-      for (const row of stockRows) insert.run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
+      for (const row of stockRows)
+        insert.run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
       this.invalidateInventoryAuthorityInTransaction();
     });
     tx.immediate(rows);
@@ -861,11 +1121,9 @@ export class SQLiteCacheService implements CacheService {
     this.assertInventorySnapshot(snapshot);
     this.assertSnapshotAccountMatchesBinding(snapshot.meta.accountIdentity);
     const tx = this.db.transaction(() => {
-      const itemInsert = this.db.prepare(
-        this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
-      );
+      const itemInsert = this.db.prepare(this.upsertSql('items', ITEM_COLUMNS, 'item_id'));
       const stockInsert = this.db.prepare(
-        this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
+        this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id')
       );
       this.db.prepare(`DELETE FROM item_stock_locations WHERE cache_source = 'api'`).run();
       this.db.exec(`
@@ -887,32 +1145,45 @@ export class SQLiteCacheService implements CacheService {
       this.writeInventoryMetaInTransaction(snapshot.meta);
 
       const currentState = this.readCacheState();
-      this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`).run(JSON.stringify({
-        ...(currentState ?? {
-          lastSync: 0,
-          lastFullSync: 0,
-          documentCount: this.count('documents'),
-          itemDocumentCount: this.count('item_documents'),
-          accountName: this.accountName,
-        }),
-        schemaVersion: CACHE_SCHEMA_VERSION,
-        itemCount: this.count('items'),
-        stockLocationCount: this.count('item_stock_locations'),
-        lastItemSync: snapshot.meta.completedAt,
-        lastFullItemSync: snapshot.meta.completedAt,
-        inventorySourceApiVersion: '3',
-      } satisfies CacheState));
+      this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`).run(
+        JSON.stringify({
+          ...(currentState ?? {
+            lastSync: 0,
+            lastFullSync: 0,
+            documentCount: this.count('documents'),
+            itemDocumentCount: this.count('item_documents'),
+            accountName: this.accountName,
+          }),
+          schemaVersion: CACHE_SCHEMA_VERSION,
+          itemCount: this.count('items'),
+          stockLocationCount: this.count('item_stock_locations'),
+          lastItemSync: snapshot.meta.completedAt,
+          lastFullItemSync: snapshot.meta.completedAt,
+          lastSyncAttempt: snapshot.meta.completedAt,
+          inventorySourceApiVersion: '3',
+        } satisfies CacheState)
+      );
     });
     tx.immediate();
     return Promise.resolve();
   }
 
   getInventoryCacheMeta(): Promise<InventoryCacheMeta | null> {
-    const read = this.db.transaction(() => this.readAuthoritativeInventoryMeta());
+    const read = this.db.transaction(() => this.readAuthoritativeInventorySnapshot()?.meta ?? null);
     return Promise.resolve(read.deferred());
   }
 
-  getItemDocumentsForPeriod(itemId: string, startDate: string, endDate: string, contextId: number): Promise<ItemDocumentRow[]> {
+  getInventorySnapshot(): Promise<InventorySnapshot | null> {
+    const read = this.db.transaction(() => this.readAuthoritativeInventorySnapshot());
+    return Promise.resolve(read.deferred());
+  }
+
+  getItemDocumentsForPeriod(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): Promise<ItemDocumentRow[]> {
     const stmt = this.db.prepare(`
       SELECT id.* FROM item_documents id
       JOIN documents d ON d.doc_id = id.doc_id
@@ -923,38 +1194,72 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getLatestItemDocumentDate(itemId: string, contextId: number): Promise<string | undefined> {
-    const row = this.db.prepare(`
+    const row = this.db
+      .prepare(
+        `
       SELECT MAX(d.issue_date) as latest_date
       FROM item_documents id
       JOIN documents d ON d.doc_id = id.doc_id
       WHERE id.item_id = ? AND d.context_id = ?
-    `).get(itemId, contextId) as { latest_date: string | null } | undefined;
+    `
+      )
+      .get(itemId, contextId) as { latest_date: string | null } | undefined;
     return Promise.resolve(row?.latest_date || undefined);
   }
 
-  getItemSalesByPeriod(itemId: string, startDate: string, endDate: string, contextId: number): Promise<ItemSalesByPeriodRow[]> {
-    return Promise.resolve(this.db.prepare(`
+  getItemSalesByPeriod(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): Promise<ItemSalesByPeriodRow[]> {
+    return Promise.resolve(
+      this.db
+        .prepare(
+          `
       SELECT d.issue_date, id.quantity, id.price
       FROM item_documents id
       JOIN documents d ON d.doc_id = id.doc_id
       WHERE id.item_id = ? AND d.context_id = ? AND d.issue_date BETWEEN ? AND ?
       ORDER BY d.issue_date ASC
-    `).all(itemId, contextId, startDate, endDate) as ItemSalesByPeriodRow[]);
+    `
+        )
+        .all(itemId, contextId, startDate, endDate) as ItemSalesByPeriodRow[]
+    );
   }
 
-  getItemPriceDistribution(itemId: string, startDate: string, endDate: string, contextId: number): Promise<PriceDistributionRow[]> {
-    return Promise.resolve(this.db.prepare(`
+  getItemPriceDistribution(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): Promise<PriceDistributionRow[]> {
+    return Promise.resolve(
+      this.db
+        .prepare(
+          `
       SELECT id.price, SUM(ABS(id.quantity)) as total_quantity, SUM(id.quantity * id.price) as total_revenue
       FROM item_documents id
       JOIN documents d ON d.doc_id = id.doc_id
       WHERE id.item_id = ? AND d.context_id = ? AND d.issue_date BETWEEN ? AND ?
       GROUP BY id.price
       ORDER BY id.price ASC
-    `).all(itemId, contextId, startDate, endDate) as PriceDistributionRow[]);
+    `
+        )
+        .all(itemId, contextId, startDate, endDate) as PriceDistributionRow[]
+    );
   }
 
-  getItemSalesByCustomer(itemId: string, startDate: string, endDate: string, contextId: number): Promise<CustomerSalesData[]> {
-    return Promise.resolve(this.db.prepare(`
+  getItemSalesByCustomer(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): Promise<CustomerSalesData[]> {
+    return Promise.resolve(
+      this.db
+        .prepare(
+          `
       SELECT d.customer_id, d.customer_name, SUM(ABS(id.quantity)) as quantity,
              SUM(id.quantity * id.price) as revenue, COUNT(DISTINCT id.doc_id) as order_count
       FROM item_documents id
@@ -962,11 +1267,22 @@ export class SQLiteCacheService implements CacheService {
       WHERE id.item_id = ? AND d.context_id = ? AND d.issue_date BETWEEN ? AND ?
       GROUP BY d.customer_id, d.customer_name
       ORDER BY revenue DESC
-    `).all(itemId, contextId, startDate, endDate) as CustomerSalesData[]);
+    `
+        )
+        .all(itemId, contextId, startDate, endDate) as CustomerSalesData[]
+    );
   }
 
-  getItemSalesByMonth(itemId: string, startDate: string, endDate: string, contextId: number): Promise<{ month: string; quantity: number; revenue: number }[]> {
-    return Promise.resolve(this.db.prepare(`
+  getItemSalesByMonth(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): Promise<{ month: string; quantity: number; revenue: number }[]> {
+    return Promise.resolve(
+      this.db
+        .prepare(
+          `
       SELECT strftime('%Y-%m', d.issue_date) as month, SUM(ABS(id.quantity)) as quantity,
              SUM(id.quantity * id.price) as revenue
       FROM item_documents id
@@ -974,25 +1290,44 @@ export class SQLiteCacheService implements CacheService {
       WHERE id.item_id = ? AND d.context_id = ? AND d.issue_date BETWEEN ? AND ?
       GROUP BY month
       ORDER BY month ASC
-    `).all(itemId, contextId, startDate, endDate) as { month: string; quantity: number; revenue: number }[]);
+    `
+        )
+        .all(itemId, contextId, startDate, endDate) as {
+        month: string;
+        quantity: number;
+        revenue: number;
+      }[]
+    );
   }
 
-  getItemOrderPatterns(itemId: string, startDate: string, endDate: string): Promise<{
-    doc_id: string;
-    quantity: number;
-    price: number;
-    issue_date: string;
-    customer_id: string;
-    context_id: number;
-    doc_number: number;
-  }[]> {
-    return Promise.resolve(this.db.prepare(`
+  getItemOrderPatterns(
+    itemId: string,
+    startDate: string,
+    endDate: string
+  ): Promise<
+    {
+      doc_id: string;
+      quantity: number;
+      price: number;
+      issue_date: string;
+      customer_id: string;
+      context_id: number;
+      doc_number: number;
+    }[]
+  > {
+    return Promise.resolve(
+      this.db
+        .prepare(
+          `
       SELECT id.doc_id, id.quantity, id.price, d.issue_date, d.customer_id, d.context_id, d.doc_number
       FROM item_documents id
       JOIN documents d ON d.doc_id = id.doc_id
       WHERE id.item_id = ? AND d.context_id IN (4, 5) AND d.issue_date BETWEEN ? AND ?
       ORDER BY d.issue_date DESC
-    `).all(itemId, startDate, endDate) as any[]);
+    `
+        )
+        .all(itemId, startDate, endDate) as any[]
+    );
   }
 
   getCacheState(): Promise<CacheState | null> {
@@ -1006,18 +1341,24 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getSyncStatus(): Promise<CacheSyncStatus | null> {
-    const row = this.db.prepare(`SELECT value FROM cache_meta WHERE key = 'sync_status'`).get() as CacheMetaRow | undefined;
-    return Promise.resolve(row ? JSON.parse(row.value) as CacheSyncStatus : null);
+    const row = this.db.prepare(`SELECT value FROM cache_meta WHERE key = 'sync_status'`).get() as
+      | CacheMetaRow
+      | undefined;
+    return Promise.resolve(row ? (JSON.parse(row.value) as CacheSyncStatus) : null);
   }
 
   setSyncStatus(status: CacheSyncStatus): Promise<void> {
-    this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('sync_status', ?)`).run(JSON.stringify(status));
+    this.db
+      .prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('sync_status', ?)`)
+      .run(JSON.stringify(status));
     return Promise.resolve();
   }
 
   getPaymentSyncStatus(): Promise<PaymentSyncStatus | null> {
-    const row = this.db.prepare(`SELECT value FROM cache_meta WHERE key = ?`).get(PAYMENT_SYNC_STATUS_KEY) as CacheMetaRow | undefined;
-    return Promise.resolve(row ? JSON.parse(row.value) as PaymentSyncStatus : null);
+    const row = this.db
+      .prepare(`SELECT value FROM cache_meta WHERE key = ?`)
+      .get(PAYMENT_SYNC_STATUS_KEY) as CacheMetaRow | undefined;
+    return Promise.resolve(row ? (JSON.parse(row.value) as PaymentSyncStatus) : null);
   }
 
   setPaymentSyncStatus(status: PaymentSyncStatus): Promise<void> {
@@ -1040,7 +1381,9 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getAccountCount(contextId?: number): Promise<number> {
-    return Promise.resolve(contextId ? this.count('accounts', 'context_id = ?', [contextId]) : this.count('accounts'));
+    return Promise.resolve(
+      contextId ? this.count('accounts', 'context_id = ?', [contextId]) : this.count('accounts')
+    );
   }
 
   getItemCount(): Promise<number> {
@@ -1066,10 +1409,19 @@ export class SQLiteCacheService implements CacheService {
     }
     if (snapshot.inventoryCacheMeta) {
       this.assertSnapshotAccountMatchesBinding(snapshot.inventoryCacheMeta.accountIdentity);
+      this.assertInventoryRowsAreComplete(
+        snapshot.items.filter(isV3ApiRow),
+        snapshot.itemStockLocations.filter(isV3ApiRow)
+      );
       this.assertInventoryMetaMatchesRows(
         snapshot.inventoryCacheMeta,
         snapshot.items,
-        snapshot.itemStockLocations,
+        snapshot.itemStockLocations
+      );
+      this.assertInventoryFingerprintMatches(
+        snapshot.inventoryCacheMeta,
+        snapshot.items,
+        snapshot.itemStockLocations
       );
       if (snapshot.categorySnapshot) {
         this.assertCategoryReconciliationPreservesInventoryRows(snapshot);
@@ -1084,12 +1436,26 @@ export class SQLiteCacheService implements CacheService {
       void this.batchInsertItemDocuments(snapshot.itemDocuments);
       void this.batchInsertPaymentTransactions(snapshot.paymentTransactions);
       if (snapshot.cacheState) this.setCacheStateInTransaction(snapshot.cacheState);
-      if (snapshot.categorySnapshot) this.replaceCategorySnapshotInTransaction(snapshot.categorySnapshot);
+      if (snapshot.categorySnapshot)
+        this.replaceCategorySnapshotInTransaction(snapshot.categorySnapshot, true);
       if (snapshot.inventoryCacheMeta) {
+        const storedItems = this.db.prepare('SELECT * FROM items').all() as ItemRow[];
+        const storedStockRows = this.db
+          .prepare('SELECT * FROM item_stock_locations')
+          .all() as ItemStockLocationRow[];
+        this.assertInventoryRowsAreComplete(
+          storedItems.filter(isV3ApiRow),
+          storedStockRows.filter(isV3ApiRow)
+        );
         this.assertInventoryMetaMatchesRows(
           snapshot.inventoryCacheMeta,
-          this.db.prepare('SELECT * FROM items').all() as ItemRow[],
-          this.db.prepare('SELECT * FROM item_stock_locations').all() as ItemStockLocationRow[],
+          storedItems,
+          storedStockRows
+        );
+        this.assertInventoryFingerprintMatches(
+          snapshot.inventoryCacheMeta,
+          storedItems,
+          storedStockRows
         );
         this.writeInventoryMetaInTransaction(snapshot.inventoryCacheMeta);
         const currentState = this.readCacheState() ?? {
@@ -1116,7 +1482,9 @@ export class SQLiteCacheService implements CacheService {
   }
 
   getRawMeta(key: string): number | null {
-    const row = this.db.prepare(`SELECT value FROM cache_meta WHERE key = ?`).get(key) as { value: string } | undefined;
+    const row = this.db.prepare(`SELECT value FROM cache_meta WHERE key = ?`).get(key) as
+      | { value: string }
+      | undefined;
     if (!row) return null;
     const num = Number(row.value);
     return Number.isNaN(num) ? null : num;
@@ -1139,12 +1507,25 @@ export class SQLiteCacheService implements CacheService {
           throw new Error('Could not persist the cache sync lock owner.');
         }
         linkSync(tempPath, path);
-        try { unlinkSync(tempPath); } catch { /* The lock link remains authoritative. */ }
+        try {
+          unlinkSync(tempPath);
+        } catch {
+          /* The lock link remains authoritative. */
+        }
         this.syncLocks.set(lockKey, { fd, path });
         return true;
       } catch (error) {
-        if (fd !== null) try { closeSync(fd); } catch { /* Ignore cleanup errors. */ }
-        try { unlinkSync(tempPath); } catch { /* Ignore cleanup errors. */ }
+        if (fd !== null)
+          try {
+            closeSync(fd);
+          } catch {
+            /* Ignore cleanup errors. */
+          }
+        try {
+          unlinkSync(tempPath);
+        } catch {
+          /* Ignore cleanup errors. */
+        }
         if (!isExistingFileError(error)) throw error;
         if (!this.removeStaleSyncLock(path)) return false;
       }
@@ -1156,8 +1537,14 @@ export class SQLiteCacheService implements CacheService {
     const lock = this.syncLocks.get(lockKey);
     if (!lock) return;
     this.syncLocks.delete(lockKey);
-    try { closeSync(lock.fd); } finally {
-      try { unlinkSync(lock.path); } catch { /* Lock already removed. */ }
+    try {
+      closeSync(lock.fd);
+    } finally {
+      try {
+        unlinkSync(lock.path);
+      } catch {
+        /* Lock already removed. */
+      }
     }
   }
 
@@ -1172,14 +1559,16 @@ export class SQLiteCacheService implements CacheService {
   }
 
   async verifyUnboundForDeletion(): Promise<void> {
-    const identity = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+    const identity = this.db
+      .prepare('SELECT value FROM cache_meta WHERE key = ?')
       .get(SQLITE_ACCOUNT_IDENTITY_META_KEY) as CacheMetaRow | undefined;
-    const subdomain = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+    const subdomain = this.db
+      .prepare('SELECT value FROM cache_meta WHERE key = ?')
       .get(SQLITE_ACCOUNT_SUBDOMAIN_META_KEY) as CacheMetaRow | undefined;
     if (identity || subdomain) {
       throw new Error(
-        'SQLite cache already has an account binding. '
-        + 'The unbound recovery option cannot override a bound or partially-bound cache.',
+        'SQLite cache already has an account binding. ' +
+          'The unbound recovery option cannot override a bound or partially-bound cache.'
       );
     }
   }
@@ -1196,7 +1585,12 @@ export class SQLiteCacheService implements CacheService {
       unlinkSync(path);
       return true;
     } catch {
-      try { unlinkSync(path); return true; } catch { return false; }
+      try {
+        unlinkSync(path);
+        return true;
+      } catch {
+        return false;
+      }
     }
   }
 
@@ -1209,15 +1603,21 @@ export class SQLiteCacheService implements CacheService {
     return this.db && this.db.open;
   }
 
-  private replaceCategorySnapshotInTransaction(snapshot: CategorySnapshot): void {
+  private replaceCategorySnapshotInTransaction(
+    snapshot: CategorySnapshot,
+    preserveCsvInventoryRows = false
+  ): void {
+    const inventorySnapshot = this.readAuthoritativeInventorySnapshot();
     const insert = this.db.prepare(
-      `INSERT INTO categories (${CATEGORY_COLUMNS.join(', ')}) VALUES (${CATEGORY_COLUMNS.map(() => '?').join(', ')})`,
+      `INSERT INTO categories (${CATEGORY_COLUMNS.join(', ')}) VALUES (${CATEGORY_COLUMNS.map(() => '?').join(', ')})`
     );
     this.db.prepare('DELETE FROM categories').run();
-    for (const row of snapshot.rows) insert.run(...this.valuesFor(CATEGORY_COLUMNS, row as unknown as Record<string, unknown>));
+    for (const row of snapshot.rows)
+      insert.run(...this.valuesFor(CATEGORY_COLUMNS, row as unknown as Record<string, unknown>));
 
     this.db.prepare('DELETE FROM category_cache_meta').run();
-    this.db.prepare('INSERT INTO category_cache_meta (key, value) VALUES (?, ?)')
+    this.db
+      .prepare('INSERT INTO category_cache_meta (key, value) VALUES (?, ?)')
       .run(CATEGORY_SNAPSHOT_META_KEY, JSON.stringify(snapshot.meta));
 
     const currentState = this.readCacheState();
@@ -1233,16 +1633,23 @@ export class SQLiteCacheService implements CacheService {
       categoryCount: snapshot.rows.length,
       lastCategorySync: snapshot.meta.completedAt,
     };
-    this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`).run(JSON.stringify(state));
-    this.db.prepare('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)')
+    this.db
+      .prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`)
+      .run(JSON.stringify(state));
+    this.db
+      .prepare('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)')
       .run(CATEGORY_GENERATION_META_KEY, snapshot.meta.generation);
 
+    const apiOnlyItemPredicate = preserveCsvInventoryRows ? " AND items.cache_source = 'api'" : '';
+    const apiOnlyStockPredicate = preserveCsvInventoryRows
+      ? " AND item_stock_locations.cache_source = 'api'"
+      : '';
     this.db.exec(`
       UPDATE items
       SET category_name = (
         SELECT categories.name FROM categories WHERE categories.category_id = items.category_id
       )
-      WHERE category_id IS NOT NULL;
+      WHERE category_id IS NOT NULL${apiOnlyItemPredicate};
 
       UPDATE item_stock_locations
       SET category_name = (
@@ -1255,75 +1662,171 @@ export class SQLiteCacheService implements CacheService {
         SELECT 1 FROM items
         WHERE items.item_id = item_stock_locations.item_id
           AND items.category_id IS NOT NULL
-      );
+      )${apiOnlyStockPredicate};
     `);
-    this.invalidateInventoryAuthorityInTransaction();
+    if (inventorySnapshot) {
+      const { meta: inventoryMeta } = inventorySnapshot;
+      const items = this.db
+        .prepare(
+          `
+        SELECT * FROM items
+        WHERE cache_source = 'api' AND source_api_version = '3'
+        ORDER BY item_id
+      `
+        )
+        .all() as ItemRow[];
+      const stockRows = this.db
+        .prepare(
+          `
+        SELECT * FROM item_stock_locations
+        WHERE cache_source = 'api' AND source_api_version = '3'
+        ORDER BY stock_row_id
+      `
+        )
+        .all() as ItemStockLocationRow[];
+      const generation = randomUUID();
+      this.writeInventoryMetaInTransaction({
+        ...inventoryMeta,
+        generation,
+        fingerprint: createInventorySnapshotFingerprint(
+          inventoryMeta.accountIdentity,
+          generation,
+          items,
+          stockRows
+        ),
+      });
+    } else {
+      this.invalidateInventoryAuthorityInTransaction();
+    }
   }
 
   private readAuthoritativeCategoryMeta(): CategoryCacheMeta | null {
     const state = this.readCacheState();
     if (state?.schemaVersion !== CACHE_SCHEMA_VERSION) return null;
-    const marker = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+    const marker = this.db
+      .prepare('SELECT value FROM cache_meta WHERE key = ?')
       .get(CATEGORY_GENERATION_META_KEY) as CacheMetaRow | undefined;
-    const row = this.db.prepare('SELECT value FROM category_cache_meta WHERE key = ?')
+    const row = this.db
+      .prepare('SELECT value FROM category_cache_meta WHERE key = ?')
       .get(CATEGORY_SNAPSHOT_META_KEY) as CacheMetaRow | undefined;
     if (!marker || !row) return null;
+    let meta: unknown;
     try {
-      const meta = JSON.parse(row.value) as unknown;
-      if (!isCategoryCacheMeta(meta) || meta.generation !== marker.value) return null;
-      const binding = this.readPersistedAccountIdentity();
-      if (binding && meta.accountIdentity !== binding) return null;
-      if (meta.storedRowCount !== this.count('categories')) return null;
-      return meta;
+      meta = JSON.parse(row.value) as unknown;
     } catch {
       return null;
     }
+    if (!isCategoryCacheMeta(meta) || meta.generation !== marker.value) return null;
+    const binding = this.readPersistedAccountIdentity();
+    if (binding && meta.accountIdentity !== binding) return null;
+    if (meta.storedRowCount !== this.count('categories')) return null;
+    return meta;
+  }
+
+  private readAuthoritativeCategorySnapshot(): CategorySnapshot | null {
+    const meta = this.readAuthoritativeCategoryMeta();
+    if (!meta) return null;
+    const rows = this.getAllCategoryRows();
+    return rows.length === meta.storedRowCount &&
+      categorySnapshotRowsIssue(rows, meta.sourceApiVersion) === null &&
+      createCategoryFingerprint(meta, rows, CACHE_SCHEMA_VERSION) === meta.fingerprint
+      ? { rows, meta }
+      : null;
   }
 
   private readAuthoritativeInventoryMeta(): InventoryCacheMeta | null {
     const state = this.readCacheState();
-    if (
-      state?.schemaVersion !== CACHE_SCHEMA_VERSION
-      || state.inventorySourceApiVersion !== '3'
-    ) return null;
-    const row = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+    if (state?.schemaVersion !== CACHE_SCHEMA_VERSION || state.inventorySourceApiVersion !== '3')
+      return null;
+    const row = this.db
+      .prepare('SELECT value FROM cache_meta WHERE key = ?')
       .get(INVENTORY_SNAPSHOT_META_KEY) as CacheMetaRow | undefined;
-    const account = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+    const account = this.db
+      .prepare('SELECT value FROM cache_meta WHERE key = ?')
       .get(INVENTORY_ACCOUNT_META_KEY) as CacheMetaRow | undefined;
     if (!row || !account) return null;
+    let meta: unknown;
     try {
-      const meta = JSON.parse(row.value) as unknown;
-      if (!isInventoryCacheMeta(meta) || meta.accountIdentity !== account.value) return null;
-      const binding = this.readPersistedAccountIdentity();
-      if (binding && meta.accountIdentity !== binding) return null;
-      if (!this.inventoryCountsMatch(meta)) return null;
-      return meta;
+      meta = JSON.parse(row.value) as unknown;
+    } catch {
+      return null;
+    }
+    if (
+      !isInventoryCacheMeta(meta) ||
+      !isWellFormedInventoryMetaText(meta) ||
+      meta.accountIdentity !== account.value
+    )
+      return null;
+    const binding = this.readPersistedAccountIdentity();
+    if (binding && meta.accountIdentity !== binding) return null;
+    if (!this.inventoryCountsMatch(meta)) return null;
+    return meta;
+  }
+
+  private readAuthoritativeInventorySnapshot(): InventorySnapshot | null {
+    const meta = this.readAuthoritativeInventoryMeta();
+    if (!meta) return null;
+    const items = this.db
+      .prepare(
+        `
+      SELECT * FROM items
+      WHERE cache_source = 'api' AND source_api_version = '3'
+      ORDER BY item_id
+    `
+      )
+      .all() as ItemRow[];
+    const stockRows = this.db
+      .prepare(
+        `
+      SELECT * FROM item_stock_locations
+      WHERE cache_source = 'api' AND source_api_version = '3'
+      ORDER BY stock_row_id
+    `
+      )
+      .all() as ItemStockLocationRow[];
+    if (
+      items.length !== meta.itemCount ||
+      stockRows.length !== meta.stockRowCount ||
+      inventorySnapshotRowsIssue(items, stockRows) !== null
+    ) {
+      return null;
+    }
+    try {
+      return inventorySnapshotFingerprintMatches(meta, items, stockRows)
+        ? { items, stockRows, meta }
+        : null;
     } catch {
       return null;
     }
   }
 
   private writeInventoryMetaInTransaction(meta: InventoryCacheMeta): void {
-    this.db.prepare('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)')
+    this.db
+      .prepare('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)')
       .run(INVENTORY_SNAPSHOT_META_KEY, JSON.stringify(meta));
-    this.db.prepare('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)')
+    this.db
+      .prepare('INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)')
       .run(INVENTORY_ACCOUNT_META_KEY, meta.accountIdentity);
   }
 
   private invalidateInventoryAuthorityInTransaction(): void {
-    this.db.prepare('DELETE FROM cache_meta WHERE key IN (?, ?)')
+    this.db
+      .prepare('DELETE FROM cache_meta WHERE key IN (?, ?)')
       .run(INVENTORY_SNAPSHOT_META_KEY, INVENTORY_ACCOUNT_META_KEY);
     const currentState = this.readCacheState();
     if (!currentState || currentState.inventorySourceApiVersion !== '3') return;
     const stateWithoutInventoryAuthority = { ...currentState };
     delete stateWithoutInventoryAuthority.inventorySourceApiVersion;
-    this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`)
+    this.db
+      .prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`)
       .run(JSON.stringify(stateWithoutInventoryAuthority));
   }
 
   private assertCategoryReconciliationPreservesInventoryRows(snapshot: SQLiteMirrorSnapshot): void {
     if (!snapshot.categorySnapshot) return;
-    const categoryNames = new Map(snapshot.categorySnapshot.rows.map((row) => [row.category_id, row.name]));
+    const categoryNames = new Map(
+      snapshot.categorySnapshot.rows.map((row) => [row.category_id, row.name])
+    );
     const items = new Map(snapshot.items.map((row) => [row.item_id, row]));
     for (const item of snapshot.items.filter(isV3ApiRow)) {
       if (item.category_id === null || item.category_id === undefined) continue;
@@ -1343,34 +1846,41 @@ export class SQLiteCacheService implements CacheService {
   private bindOrVerifyAccount(binding: CacheAccountBinding): void {
     const canonical = createSalesBinderAccountBinding(binding.accountSubdomain);
     if (canonical.accountIdentity !== binding.accountIdentity) {
-      throw new Error('SQLite cache account identity does not match its normalized SalesBinder subdomain.');
+      throw new Error(
+        'SQLite cache account identity does not match its normalized SalesBinder subdomain.'
+      );
     }
     const tx = this.db.transaction(() => {
-      const identity = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+      const identity = this.db
+        .prepare('SELECT value FROM cache_meta WHERE key = ?')
         .get(SQLITE_ACCOUNT_IDENTITY_META_KEY) as CacheMetaRow | undefined;
-      const subdomain = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+      const subdomain = this.db
+        .prepare('SELECT value FROM cache_meta WHERE key = ?')
         .get(SQLITE_ACCOUNT_SUBDOMAIN_META_KEY) as CacheMetaRow | undefined;
       if (!identity && !subdomain) {
         if (this.databaseContainsPayloadRows()) {
           throw new Error(
-            'SQLite cache database is populated but has no account binding. '
-            + 'Use a matching empty cache file or rebuild this cache before binding it.',
+            'SQLite cache database is populated but has no account binding. ' +
+              'Use a matching empty cache file or rebuild this cache before binding it.'
           );
         }
-        this.db.prepare('INSERT INTO cache_meta (key, value) VALUES (?, ?)')
+        this.db
+          .prepare('INSERT INTO cache_meta (key, value) VALUES (?, ?)')
           .run(SQLITE_ACCOUNT_IDENTITY_META_KEY, canonical.accountIdentity);
-        this.db.prepare('INSERT INTO cache_meta (key, value) VALUES (?, ?)')
+        this.db
+          .prepare('INSERT INTO cache_meta (key, value) VALUES (?, ?)')
           .run(SQLITE_ACCOUNT_SUBDOMAIN_META_KEY, canonical.accountSubdomain);
         return;
       }
       if (
-        !identity || !subdomain
-        || identity.value !== canonical.accountIdentity
-        || subdomain.value !== canonical.accountSubdomain
+        !identity ||
+        !subdomain ||
+        identity.value !== canonical.accountIdentity ||
+        subdomain.value !== canonical.accountSubdomain
       ) {
         throw new Error(
-          `SQLite cache database is not bound to ${canonical.accountIdentity}. `
-          + 'Use the matching cache file or rebuild a fresh cache for this SalesBinder account.',
+          `SQLite cache database is not bound to ${canonical.accountIdentity}. ` +
+            'Use the matching cache file or rebuild a fresh cache for this SalesBinder account.'
         );
       }
     });
@@ -1381,46 +1891,69 @@ export class SQLiteCacheService implements CacheService {
     const persistedIdentity = this.readPersistedAccountIdentity();
     if (persistedIdentity && persistedIdentity !== accountIdentity) {
       throw new Error(
-        `SQLite cache database is not bound to ${accountIdentity}. `
-        + 'Use the matching cache file or rebuild a fresh cache for this SalesBinder account.',
+        `SQLite cache database is not bound to ${accountIdentity}. ` +
+          'Use the matching cache file or rebuild a fresh cache for this SalesBinder account.'
       );
     }
   }
 
   private readPersistedAccountIdentity(): string | null {
-    const row = this.db.prepare('SELECT value FROM cache_meta WHERE key = ?')
+    const row = this.db
+      .prepare('SELECT value FROM cache_meta WHERE key = ?')
       .get(SQLITE_ACCOUNT_IDENTITY_META_KEY) as CacheMetaRow | undefined;
     return row?.value ?? null;
   }
 
   private databaseContainsPayloadRows(): boolean {
     const tables = [
-      'accounts', 'documents', 'item_documents', 'items', 'item_stock_locations',
-      'payment_transactions', 'categories', 'category_cache_meta',
+      'accounts',
+      'documents',
+      'item_documents',
+      'items',
+      'item_stock_locations',
+      'payment_transactions',
+      'categories',
+      'category_cache_meta',
     ];
     if (tables.some((table) => this.count(table) > 0)) return true;
-    const row = this.db.prepare(`
+    const row = this.db
+      .prepare(
+        `
       SELECT COUNT(*) AS count FROM cache_meta
       WHERE key NOT IN (?, ?)
-    `).get(SQLITE_ACCOUNT_IDENTITY_META_KEY, SQLITE_ACCOUNT_SUBDOMAIN_META_KEY) as { count: number };
+    `
+      )
+      .get(SQLITE_ACCOUNT_IDENTITY_META_KEY, SQLITE_ACCOUNT_SUBDOMAIN_META_KEY) as {
+      count: number;
+    };
     return row.count > 0;
   }
 
   private inventoryCountsMatch(meta: InventoryCacheMeta): boolean {
-    const itemCounts = this.db.prepare(`
+    const itemCounts = this.db
+      .prepare(
+        `
       SELECT COUNT(*) AS total,
              SUM(CASE WHEN source_api_version = '3' THEN 1 ELSE 0 END) AS v3
       FROM items WHERE cache_source = 'api'
-    `).get() as { total: number; v3: number | null };
-    const stockCounts = this.db.prepare(`
+    `
+      )
+      .get() as { total: number; v3: number | null };
+    const stockCounts = this.db
+      .prepare(
+        `
       SELECT COUNT(*) AS total,
              SUM(CASE WHEN source_api_version = '3' THEN 1 ELSE 0 END) AS v3
       FROM item_stock_locations WHERE cache_source = 'api'
-    `).get() as { total: number; v3: number | null };
-    return itemCounts.total === meta.itemCount
-      && (itemCounts.v3 ?? 0) === meta.itemCount
-      && stockCounts.total === meta.stockRowCount
-      && (stockCounts.v3 ?? 0) === meta.stockRowCount;
+    `
+      )
+      .get() as { total: number; v3: number | null };
+    return (
+      itemCounts.total === meta.itemCount &&
+      (itemCounts.v3 ?? 0) === meta.itemCount &&
+      stockCounts.total === meta.stockRowCount &&
+      (stockCounts.v3 ?? 0) === meta.stockRowCount
+    );
   }
 
   private assertInventorySnapshot(snapshot: InventorySnapshot): void {
@@ -1428,40 +1961,59 @@ export class SQLiteCacheService implements CacheService {
       throw new Error('Inventory snapshot is incomplete or invalid.');
     }
     this.assertInventoryMetaMatchesRows(snapshot.meta, snapshot.items, snapshot.stockRows);
-    const itemIds = new Set<string>();
-    for (const item of snapshot.items) {
-      if (!isInventoryItemRow(item) || itemIds.has(item.item_id)) {
-        throw new Error('Inventory snapshot contains an invalid or duplicate item row.');
-      }
-      itemIds.add(item.item_id);
+    this.assertInventoryRowsAreComplete(snapshot.items, snapshot.stockRows);
+    this.assertInventoryFingerprintMatches(snapshot.meta, snapshot.items, snapshot.stockRows);
+  }
+
+  private assertInventoryRowsAreComplete(
+    items: ItemRow[],
+    stockRows: ItemStockLocationRow[]
+  ): void {
+    const rowIssue = inventorySnapshotRowsIssue(items, stockRows);
+    if (rowIssue === 'item') {
+      throw new Error('Inventory snapshot contains an invalid or duplicate item row.');
     }
-    const stockIds = new Set<string>();
-    for (const row of snapshot.stockRows) {
-      if (!isInventoryStockRow(row) || stockIds.has(row.stock_row_id) || !itemIds.has(row.item_id)) {
-        throw new Error('Inventory snapshot contains an invalid, duplicate, or orphan stock row.');
-      }
-      stockIds.add(row.stock_row_id);
+    if (rowIssue === 'stock') {
+      throw new Error('Inventory snapshot contains an invalid, duplicate, or orphan stock row.');
+    }
+    if (rowIssue === 'coverage') {
+      throw new Error('Inventory snapshot must include at least one stock row for every item.');
     }
   }
 
   private assertInventoryMetaMatchesRows(
     meta: InventoryCacheMeta,
     items: ItemRow[],
-    stockRows: ItemStockLocationRow[],
+    stockRows: ItemStockLocationRow[]
   ): void {
     if (
-      !isInventoryCacheMeta(meta)
-      || meta.itemCount !== items.filter(isV3ApiRow).length
-      || meta.stockRowCount !== stockRows.filter(isV3ApiRow).length
-      || meta.itemCount !== items.filter((row) => row.cache_source === 'api').length
-      || meta.stockRowCount !== stockRows.filter((row) => row.cache_source === 'api').length
+      !isInventoryCacheMeta(meta) ||
+      !isWellFormedInventoryMetaText(meta) ||
+      meta.itemCount !== items.filter(isV3ApiRow).length ||
+      meta.stockRowCount !== stockRows.filter(isV3ApiRow).length ||
+      meta.itemCount !== items.filter((row) => row.cache_source === 'api').length ||
+      meta.stockRowCount !== stockRows.filter((row) => row.cache_source === 'api').length
     ) {
       throw new Error('Inventory snapshot metadata does not match its authoritative API rows.');
     }
   }
 
+  private assertInventoryFingerprintMatches(
+    meta: InventoryCacheMeta,
+    items: ItemRow[],
+    stockRows: ItemStockLocationRow[]
+  ): void {
+    const authoritativeItems = items.filter(isV3ApiRow);
+    const authoritativeStockRows = stockRows.filter(isV3ApiRow);
+    if (!inventorySnapshotFingerprintMatches(meta, authoritativeItems, authoritativeStockRows)) {
+      throw new Error('Inventory snapshot fingerprint does not match its authoritative API rows.');
+    }
+  }
+
   private getAllCategoryRows(): CategoryCacheRow[] {
-    return this.db.prepare('SELECT * FROM categories ORDER BY category_id ASC').all() as CategoryCacheRow[];
+    return this.db
+      .prepare('SELECT * FROM categories ORDER BY category_id ASC')
+      .all() as CategoryCacheRow[];
   }
 
   private assertCategorySnapshot(snapshot: CategorySnapshot): void {
@@ -1469,28 +2021,31 @@ export class SQLiteCacheService implements CacheService {
       throw new Error('Category snapshot is incomplete or invalid.');
     }
     if (
-      snapshot.meta.count !== snapshot.rows.length
-      || snapshot.meta.sourceRowCount !== snapshot.rows.length
-      || snapshot.meta.storedRowCount !== snapshot.rows.length
+      snapshot.meta.count !== snapshot.rows.length ||
+      snapshot.meta.sourceRowCount !== snapshot.rows.length ||
+      snapshot.meta.storedRowCount !== snapshot.rows.length
     ) {
       throw new Error('Category snapshot metadata counts do not match its rows.');
     }
-    const names = new Map<string, string>();
-    for (const row of snapshot.rows) {
-      if (!isCategoryCacheRow(row)) throw new Error('Category snapshot contains an invalid row.');
-      if (names.has(row.category_id)) throw new Error(`Category snapshot contains duplicate ID ${row.category_id}.`);
-      names.set(row.category_id, row.name);
+    const rowIssue = categorySnapshotRowsIssue(snapshot.rows, snapshot.meta.sourceApiVersion);
+    if (rowIssue === 'row') {
+      throw new Error('Category snapshot contains an invalid row or duplicate category ID.');
     }
-    for (const row of snapshot.rows) {
-      const expectedParentName = row.parent_id ? names.get(row.parent_id) ?? null : null;
-      if (row.parent_name !== expectedParentName) {
-        throw new Error(`Category snapshot has an inconsistent parent name for ${row.category_id}.`);
-      }
+    if (rowIssue === 'parent') {
+      throw new Error('Category snapshot parent names must be derived from the same snapshot.');
+    }
+    if (
+      createCategoryFingerprint(snapshot.meta, snapshot.rows, CACHE_SCHEMA_VERSION) !==
+      snapshot.meta.fingerprint
+    ) {
+      throw new Error('Category snapshot fingerprint does not match its validated rows.');
     }
   }
 
   private readCacheState(): CacheState | null {
-    const row = this.db.prepare(`SELECT value FROM cache_meta WHERE key = 'state'`).get() as CacheMetaRow | undefined;
+    const row = this.db.prepare(`SELECT value FROM cache_meta WHERE key = 'state'`).get() as
+      | CacheMetaRow
+      | undefined;
     if (!row) return null;
     try {
       return JSON.parse(row.value) as CacheState;
@@ -1501,12 +2056,18 @@ export class SQLiteCacheService implements CacheService {
 
   private setCacheStateInTransaction(state: CacheState): void {
     const persistedState = this.readCacheState();
-    if (state.schemaVersion === CACHE_SCHEMA_VERSION && persistedState?.schemaVersion !== CACHE_SCHEMA_VERSION) {
+    if (
+      state.schemaVersion === CACHE_SCHEMA_VERSION &&
+      persistedState?.schemaVersion !== CACHE_SCHEMA_VERSION
+    ) {
       this.db.prepare('DELETE FROM cache_meta WHERE key = ?').run(CATEGORY_GENERATION_META_KEY);
-      this.db.prepare('DELETE FROM cache_meta WHERE key IN (?, ?)')
+      this.db
+        .prepare('DELETE FROM cache_meta WHERE key IN (?, ?)')
         .run(INVENTORY_SNAPSHOT_META_KEY, INVENTORY_ACCOUNT_META_KEY);
     }
-    this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`).run(JSON.stringify(state));
+    this.db
+      .prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`)
+      .run(JSON.stringify(state));
   }
 
   private clearAllInTransaction(): void {
@@ -1520,12 +2081,15 @@ export class SQLiteCacheService implements CacheService {
       DELETE FROM categories;
       DELETE FROM category_cache_meta;
     `);
-    this.db.prepare('DELETE FROM cache_meta WHERE key NOT IN (?, ?)')
+    this.db
+      .prepare('DELETE FROM cache_meta WHERE key NOT IN (?, ?)')
       .run(SQLITE_ACCOUNT_IDENTITY_META_KEY, SQLITE_ACCOUNT_SUBDOMAIN_META_KEY);
   }
 
   private count(table: string, where?: string, params: unknown[] = []): number {
-    const sql = where ? `SELECT COUNT(*) as count FROM ${table} WHERE ${where}` : `SELECT COUNT(*) as count FROM ${table}`;
+    const sql = where
+      ? `SELECT COUNT(*) as count FROM ${table} WHERE ${where}`
+      : `SELECT COUNT(*) as count FROM ${table}`;
     const result = this.db.prepare(sql).get(...params) as { count: number };
     return result.count;
   }
@@ -1533,9 +2097,11 @@ export class SQLiteCacheService implements CacheService {
   private upsertSql(table: string, columns: readonly string[], conflictColumn: string): string {
     const updates = columns
       .filter((column) => column !== conflictColumn)
-      .map((column) => column === 'archived' && (table === 'documents' || table === 'items')
-        ? `${column} = COALESCE(excluded.${column}, ${table}.${column})`
-        : `${column} = excluded.${column}`)
+      .map((column) =>
+        column === 'archived' && (table === 'documents' || table === 'items')
+          ? `${column} = COALESCE(excluded.${column}, ${table}.${column})`
+          : `${column} = excluded.${column}`
+      )
       .join(', ');
     return `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')}) ON CONFLICT(${conflictColumn}) DO UPDATE SET ${updates}`;
   }
@@ -1559,12 +2125,24 @@ export class SQLiteCacheService implements CacheService {
   }
 
   private normalizeDocumentForWrite(doc: DocumentRow): Record<string, unknown> {
-    const existingByApiId = doc.api_doc_id ? this.db
-      .prepare(`SELECT doc_id FROM documents WHERE api_doc_id = ?`)
-      .get(doc.api_doc_id) as { doc_id: string } | undefined : undefined;
+    assertWellFormedDocumentApiId(doc.api_doc_id);
+    const existingByApiId = doc.api_doc_id
+      ? (this.db
+          .prepare(`SELECT doc_id, api_doc_id FROM documents WHERE api_doc_id = ?`)
+          .get(doc.api_doc_id) as DocumentIdentityRow | undefined)
+      : undefined;
     const existingByNumber = this.db
-      .prepare(`SELECT doc_id FROM documents WHERE context_id = ? AND doc_number = ?`)
-      .get(doc.context_id, doc.doc_number) as { doc_id: string } | undefined;
+      .prepare(`SELECT doc_id, api_doc_id FROM documents WHERE context_id = ? AND doc_number = ?`)
+      .get(doc.context_id, doc.doc_number) as DocumentIdentityRow | undefined;
+    assertWellFormedStoredDocumentIdentity(existingByApiId);
+    assertWellFormedStoredDocumentIdentity(existingByNumber);
+    if (
+      (existingByApiId && existingByNumber && existingByApiId.doc_id !== existingByNumber.doc_id) ||
+      (existingByApiId && existingByApiId.api_doc_id !== doc.api_doc_id) ||
+      (existingByNumber?.api_doc_id != null && existingByNumber.api_doc_id !== doc.api_doc_id)
+    ) {
+      throw new Error('Cache document identity conflict.');
+    }
     const existing = existingByApiId ?? existingByNumber;
     return this.normalizeDocument(existing ? { ...doc, doc_id: existing.doc_id } : doc);
   }
@@ -1574,7 +2152,11 @@ export class SQLiteCacheService implements CacheService {
   }
 
   private normalizeAccount(account: AccountRow): Record<string, unknown> {
-    return { ...account, archived: account.archived ?? 0, cache_source: account.cache_source ?? 'api' };
+    return {
+      ...account,
+      archived: account.archived ?? 0,
+      cache_source: account.cache_source ?? 'api',
+    };
   }
 
   private normalizeItem(item: ItemRow): Record<string, unknown> {
@@ -1601,97 +2183,298 @@ export class SQLiteCacheService implements CacheService {
   }
 }
 
+interface DocumentIdentityRow {
+  doc_id: string;
+  api_doc_id: string | null;
+}
+
+const assertWellFormedDocumentApiId = (value: unknown): void => {
+  if (value != null && (typeof value !== 'string' || hasUnpairedUtf16Surrogate(value))) {
+    throw new Error('Document API identity is invalid.');
+  }
+};
+
+const assertWellFormedStoredDocumentIdentity = (value: DocumentIdentityRow | undefined): void => {
+  if (
+    value &&
+    (typeof value.doc_id !== 'string' ||
+      value.doc_id.length === 0 ||
+      (value.api_doc_id !== null &&
+        (typeof value.api_doc_id !== 'string' || hasUnpairedUtf16Surrogate(value.api_doc_id))))
+  ) {
+    throw new Error('Cached document identity is invalid.');
+  }
+};
+
 const isExistingFileError = (error: unknown) =>
-  typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === 'EEXIST';
+  typeof error === 'object' &&
+  error !== null &&
+  'code' in error &&
+  (error as { code?: string }).code === 'EEXIST';
 
 const isCategoryCacheMeta = (value: unknown): value is CategoryCacheMeta => {
   if (!isRecord(value)) return false;
   const exactKeys = [
-    'accountIdentity', 'completedAt', 'count', 'fingerprint', 'generation', 'page',
-    'pages', 'schemaVersion', 'sourceApiVersion', 'sourceRowCount', 'startedAt', 'status',
-    'storedRowCount', 'version',
+    'accountIdentity',
+    'completedAt',
+    'count',
+    'fingerprint',
+    'generation',
+    'page',
+    'pages',
+    'schemaVersion',
+    'sourceApiVersion',
+    'sourceRowCount',
+    'startedAt',
+    'status',
+    'storedRowCount',
+    'version',
   ];
-  return hasExactKeys(value, exactKeys)
-    && value.version === 1
-    && value.status === 'complete'
-    && isNonEmptyString(value.accountIdentity)
-    && isNonNegativeInteger(value.startedAt)
-    && isNonNegativeInteger(value.completedAt)
-    && value.completedAt >= value.startedAt
-    && isNonNegativeInteger(value.count)
-    && isNonNegativeInteger(value.page)
-    && isNonNegativeInteger(value.pages)
-    && isNonNegativeInteger(value.sourceRowCount)
-    && isNonNegativeInteger(value.storedRowCount)
-    && value.schemaVersion === CACHE_SCHEMA_VERSION
-    && isApiSourceVersion(value.sourceApiVersion)
-    && isNonEmptyString(value.generation)
-    && isNonEmptyString(value.fingerprint)
-    && (value.count === 0
+  return (
+    hasExactKeys(value, exactKeys) &&
+    value.version === 1 &&
+    value.status === 'complete' &&
+    isNonEmptyString(value.accountIdentity) &&
+    isNonNegativeInteger(value.startedAt) &&
+    isNonNegativeInteger(value.completedAt) &&
+    value.completedAt >= value.startedAt &&
+    isNonNegativeInteger(value.count) &&
+    isNonNegativeInteger(value.page) &&
+    isNonNegativeInteger(value.pages) &&
+    isNonNegativeInteger(value.sourceRowCount) &&
+    isNonNegativeInteger(value.storedRowCount) &&
+    value.schemaVersion === CACHE_SCHEMA_VERSION &&
+    isApiSourceVersion(value.sourceApiVersion) &&
+    isNonEmptyString(value.generation) &&
+    isNonEmptyString(value.fingerprint) &&
+    (value.count === 0
       ? value.page === 1 && (value.pages === 0 || value.pages === 1)
-      : value.pages >= 1 && value.page === value.pages);
+      : value.pages >= 1 && value.page === value.pages)
+  );
 };
 
 const isCategoryCacheRow = (value: unknown): value is CategoryCacheRow => {
   if (!isRecord(value)) return false;
-  return isNonEmptyString(value.category_id)
-    && isNonEmptyString(value.name)
-    && (value.item_count === null || isNonNegativeInteger(value.item_count))
-    && (value.parent_id === null || isNonEmptyString(value.parent_id))
-    && (value.parent_name === null || isNonEmptyString(value.parent_name))
-    && (value.inventory_type === null || value.inventory_type === 'quantity' || value.inventory_type === 'unique')
-    && (value.custom_fields_json === null || isTextWithoutNullByte(value.custom_fields_json))
-    && (value.created === null || isTextWithoutNullByte(value.created))
-    && (value.modified === null || isNonNegativeInteger(value.modified))
-    && value.cache_source === 'api'
-    && isApiSourceVersion(value.source_api_version)
-    && isNonNegativeInteger(value.imported_at);
+  return (
+    isCanonicalV3SourceId(value.category_id) &&
+    isNonEmptyString(value.name) &&
+    (value.item_count === null || isNonNegativePostgresInteger(value.item_count)) &&
+    (value.parent_id === null || isCanonicalV3SourceId(value.parent_id)) &&
+    (value.parent_name === null || isNonEmptyString(value.parent_name)) &&
+    (value.inventory_type === null ||
+      value.inventory_type === 'quantity' ||
+      value.inventory_type === 'unique') &&
+    (value.custom_fields_json === null || isTextWithoutNullByte(value.custom_fields_json)) &&
+    (value.created === null || isTextWithoutNullByte(value.created)) &&
+    (value.modified === null || isNonNegativeInteger(value.modified)) &&
+    value.cache_source === 'api' &&
+    isApiSourceVersion(value.source_api_version) &&
+    isNonNegativeInteger(value.imported_at)
+  );
 };
 
-const isInventoryCacheMeta = (value: unknown): value is InventoryCacheMeta => {
-  if (!isRecord(value)) return false;
-  const exactKeys = [
-    'accountIdentity', 'completedAt', 'fingerprint', 'generation', 'itemCount',
-    'schemaVersion', 'sourceApiVersion', 'startedAt', 'status', 'stockRowCount', 'version',
-  ];
-  return hasExactKeys(value, exactKeys)
-    && value.version === 1
-    && value.status === 'complete'
-    && isNonEmptyString(value.accountIdentity)
-    && isNonNegativeInteger(value.startedAt)
-    && isNonNegativeInteger(value.completedAt)
-    && value.completedAt >= value.startedAt
-    && isNonNegativeInteger(value.itemCount)
-    && isNonNegativeInteger(value.stockRowCount)
-    && value.schemaVersion === CACHE_SCHEMA_VERSION
-    && value.sourceApiVersion === '3'
-    && isNonEmptyString(value.generation)
-    && isNonEmptyString(value.fingerprint);
+type CategorySnapshotRowsIssue = 'row' | 'parent';
+
+const categorySnapshotRowsIssue = (
+  rows: CategoryCacheRow[],
+  sourceApiVersion: CategoryCacheMeta['sourceApiVersion']
+): CategorySnapshotRowsIssue | null => {
+  const names = new Map<string, string>();
+  for (const row of rows) {
+    if (
+      !isCategoryCacheRow(row) ||
+      row.source_api_version !== sourceApiVersion ||
+      names.has(row.category_id)
+    ) {
+      return 'row';
+    }
+    names.set(row.category_id, row.name);
+  }
+  for (const row of rows) {
+    const expectedParentName = row.parent_id ? (names.get(row.parent_id) ?? null) : null;
+    if (row.parent_name !== expectedParentName) return 'parent';
+  }
+  return null;
 };
 
 const isInventoryItemRow = (value: unknown): value is ItemRow => {
   if (!isRecord(value)) return false;
-  return isNonEmptyString(value.item_id)
-    && isNonEmptyString(value.name)
-    && value.cache_source === 'api'
-    && value.source_api_version === '3';
+  return (
+    isCanonicalV3SourceId(value.item_id) &&
+    isNonEmptyString(value.name) &&
+    hasOnlyNullableTextWithoutNullBytes(value, INVENTORY_ITEM_TEXT_FIELDS) &&
+    isNullableCanonicalV3SourceId(value.category_id) &&
+    isFiniteNumber(value.quantity) &&
+    hasOnlyFiniteNullableNumbers(value, INVENTORY_ITEM_NUMERIC_FIELDS) &&
+    isNullableNonNegativePostgresInteger(value.item_number) &&
+    isNullableBinaryFlag(value.published) &&
+    isNullableBinaryFlag(value.archived) &&
+    isNullableNonNegativeInteger(value.modified) &&
+    isNullableNonNegativeInteger(value.imported_at) &&
+    value.cache_source === 'api' &&
+    value.source_api_version === '3'
+  );
 };
 
 const isInventoryStockRow = (value: unknown): value is ItemStockLocationRow => {
   if (!isRecord(value)) return false;
-  return isNonEmptyString(value.stock_row_id)
-    && isNonEmptyString(value.item_id)
-    && isFiniteNumber(value.quantity_on_hand)
-    && isNullableFiniteNumber(value.quantity_reserved)
-    && isNullableFiniteNumber(value.quantity_available)
-    && isNullableFiniteNumber(value.quantity_incoming)
-    && isNullableFiniteNumber(value.in_transit)
-    && value.cache_source === 'api'
-    && value.source_api_version === '3';
+  return (
+    isCanonicalV3SourceId(value.stock_row_id) &&
+    isCanonicalV3SourceId(value.item_id) &&
+    hasOnlyNullableTextWithoutNullBytes(value, INVENTORY_STOCK_TEXT_FIELDS) &&
+    isNullableCanonicalV3SourceId(value.variation_id) &&
+    isNullableCanonicalV3SourceId(value.variation_location_id) &&
+    isNullableCanonicalV3SourceId(value.location_id) &&
+    hasValidStockTopology(value) &&
+    isFiniteNumber(value.quantity_on_hand) &&
+    isNullableFiniteNumber(value.quantity_reserved) &&
+    isNullableFiniteNumber(value.quantity_available) &&
+    isNullableFiniteNumber(value.quantity_incoming) &&
+    isNullableFiniteNumber(value.in_transit) &&
+    hasOnlyFiniteNullableNumbers(value, INVENTORY_STOCK_NUMERIC_FIELDS) &&
+    isNullableNonNegativePostgresInteger(value.item_number) &&
+    isNullableNonNegativeInteger(value.imported_at) &&
+    value.cache_source === 'api' &&
+    value.source_api_version === '3'
+  );
 };
+
+type InventorySnapshotRowsIssue = 'item' | 'stock' | 'coverage';
+
+const inventorySnapshotRowsIssue = (
+  items: ItemRow[],
+  stockRows: ItemStockLocationRow[]
+): InventorySnapshotRowsIssue | null => {
+  const itemsById = new Map<string, ItemRow>();
+  for (const item of items) {
+    if (!isInventoryItemRow(item) || itemsById.has(item.item_id)) return 'item';
+    itemsById.set(item.item_id, item);
+  }
+
+  const stockIds = new Set<string>();
+  const coveredItemIds = new Set<string>();
+  const rowKindsByItem = new Map<string, { parent: number; variation: number }>();
+  const rowKindsByVariation = new Map<string, { aggregate: number; detail: number }>();
+  for (const row of stockRows) {
+    const parent = itemsById.get(row.item_id);
+    if (
+      !isInventoryStockRow(row) ||
+      stockIds.has(row.stock_row_id) ||
+      !parent ||
+      !stockRowMatchesParent(row, parent)
+    ) {
+      return 'stock';
+    }
+    stockIds.add(row.stock_row_id);
+    coveredItemIds.add(row.item_id);
+    const rowKinds = rowKindsByItem.get(row.item_id) ?? { parent: 0, variation: 0 };
+    if (row.variation_id == null) {
+      rowKinds.parent += 1;
+    } else {
+      rowKinds.variation += 1;
+      const variationKey = `${row.item_id}\0${row.variation_id}`;
+      const variationKinds = rowKindsByVariation.get(variationKey) ?? {
+        aggregate: 0,
+        detail: 0,
+      };
+      if (row.variation_location_id == null) variationKinds.aggregate += 1;
+      else variationKinds.detail += 1;
+      rowKindsByVariation.set(variationKey, variationKinds);
+    }
+    rowKindsByItem.set(row.item_id, rowKinds);
+  }
+  if (![...itemsById.keys()].every((itemId) => coveredItemIds.has(itemId))) return 'coverage';
+  const hasValidItemTopology = [...rowKindsByItem.values()].every(
+    ({ parent, variation }) => (parent === 1 && variation === 0) || (parent === 0 && variation > 0)
+  );
+  const hasValidVariationTopology = [...rowKindsByVariation.values()].every(
+    ({ aggregate, detail }) => (aggregate === 1 && detail === 0) || (aggregate === 0 && detail > 0)
+  );
+  return hasValidItemTopology && hasValidVariationTopology ? null : 'stock';
+};
+
+const stockRowMatchesParent = (row: ItemStockLocationRow, parent: ItemRow): boolean =>
+  nullableValuesEqual(row.item_number, parent.item_number) &&
+  nullableValuesEqual(row.category_name, parent.category_name) &&
+  nullableValuesEqual(row.price, parent.price) &&
+  nullableValuesEqual(row.cost, parent.cost) &&
+  (row.variation_id != null ||
+    (nullableValuesEqual(row.quantity_on_hand, parent.quantity) &&
+      nullableValuesEqual(row.quantity_reserved, parent.quantity_reserved) &&
+      nullableValuesEqual(row.quantity_available, parent.quantity_available) &&
+      nullableValuesEqual(row.quantity_incoming, parent.quantity_incoming) &&
+      nullableValuesEqual(row.in_transit, parent.in_transit) &&
+      nullableValuesEqual(row.barcode, parent.barcode)));
+
+const nullableValuesEqual = (left: unknown, right: unknown): boolean =>
+  (left ?? null) === (right ?? null);
+
+const INVENTORY_ITEM_NUMERIC_FIELDS = [
+  'item_number',
+  'quantity',
+  'quantity_reserved',
+  'quantity_available',
+  'quantity_incoming',
+  'in_transit',
+  'threshold',
+  'cost',
+  'price',
+  'valuation',
+  'published',
+  'archived',
+  'modified',
+  'imported_at',
+] as const;
+
+const INVENTORY_ITEM_TEXT_FIELDS = [
+  'description',
+  'sku',
+  'serial_number',
+  'barcode',
+  'category_id',
+  'category_name',
+  'created',
+] as const;
+
+const INVENTORY_STOCK_NUMERIC_FIELDS = [
+  'item_number',
+  'quantity_on_hand',
+  'quantity_reserved',
+  'quantity_available',
+  'quantity_incoming',
+  'in_transit',
+  'price',
+  'cost',
+  'valuation',
+  'imported_at',
+] as const;
+
+const INVENTORY_STOCK_TEXT_FIELDS = [
+  'variation_id',
+  'variation_location_id',
+  'location_id',
+  'location_name',
+  'category_name',
+  'barcode',
+] as const;
+
+const hasOnlyFiniteNullableNumbers = (
+  value: Record<string, unknown>,
+  fields: readonly string[]
+): boolean => fields.every((field) => value[field] == null || isFiniteNumber(value[field]));
+
+const hasOnlyNullableTextWithoutNullBytes = (
+  value: Record<string, unknown>,
+  fields: readonly string[]
+): boolean => fields.every((field) => value[field] == null || isTextWithoutNullByte(value[field]));
 
 const isV3ApiRow = (value: ItemRow | ItemStockLocationRow): boolean =>
   value.cache_source === 'api' && value.source_api_version === '3';
+
+const isWellFormedInventoryMetaText = (value: InventoryCacheMeta): boolean =>
+  isNonEmptyString(value.accountIdentity) &&
+  isNonEmptyString(value.generation) &&
+  isNonEmptyString(value.fingerprint);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
@@ -1703,13 +2486,61 @@ const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =
 };
 
 const isNonEmptyString = (value: unknown): value is string =>
-  typeof value === 'string' && value.trim().length > 0 && !value.includes('\0');
+  typeof value === 'string' &&
+  value.trim().length > 0 &&
+  !value.includes('\0') &&
+  !hasUnpairedUtf16Surrogate(value);
 
 const isTextWithoutNullByte = (value: unknown): value is string =>
-  typeof value === 'string' && !value.includes('\0');
+  typeof value === 'string' && !value.includes('\0') && !hasUnpairedUtf16Surrogate(value);
+
+const isCanonicalV3SourceId = (value: unknown): value is string => {
+  if (typeof value !== 'string' || hasUnpairedUtf16Surrogate(value)) return false;
+  try {
+    assertCanonicalV3SourceId(value, 'cache row');
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const isNullableCanonicalV3SourceId = (value: unknown): value is string | null | undefined =>
+  value == null || isCanonicalV3SourceId(value);
+
+const hasValidStockTopology = (value: Record<string, unknown>): boolean => {
+  const hasVariation = value.variation_id != null;
+  const hasVariationLocation = value.variation_location_id != null;
+  const hasLocation = value.location_id != null;
+  return (
+    (!hasVariationLocation ||
+      (hasVariation &&
+        hasLocation &&
+        isCanonicalVariationLocationId(value.variation_location_id) &&
+        value.variation_location_id === value.stock_row_id)) &&
+    (!(hasVariation && hasLocation) || hasVariationLocation)
+  );
+};
+
+const isCanonicalVariationLocationId = (value: unknown): value is string => {
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) return false;
+  const numericId = Number(value);
+  return Number.isSafeInteger(numericId) && String(numericId) === value;
+};
 
 const isNonNegativeInteger = (value: unknown): value is number =>
   Number.isSafeInteger(value) && (value as number) >= 0;
+
+const isNullableNonNegativeInteger = (value: unknown): value is number | null | undefined =>
+  value == null || isNonNegativeInteger(value);
+
+const isNonNegativePostgresInteger = (value: unknown): value is number =>
+  isNonNegativeInteger(value) && value <= POSTGRES_INTEGER_MAX;
+
+const isNullableNonNegativePostgresInteger = (value: unknown): value is number | null | undefined =>
+  value == null || isNonNegativePostgresInteger(value);
+
+const isNullableBinaryFlag = (value: unknown): value is 0 | 1 | null | undefined =>
+  value == null || value === 0 || value === 1;
 
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
@@ -1725,7 +2556,11 @@ const isProcessAlive = (pid: number) => {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return !(typeof error === 'object' && error !== null && 'code' in error
-      && (error as { code?: string }).code === 'ESRCH');
+    return !(
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as { code?: string }).code === 'ESRCH'
+    );
   }
 };

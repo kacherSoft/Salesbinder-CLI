@@ -3,18 +3,24 @@ import { rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SQLiteCacheService } from '../sqlite-cache.service.js';
-import {
-  CACHE_SCHEMA_VERSION,
-  CATEGORY_GENERATION_META_KEY,
+import { createCategoryFingerprint } from '../category-indexer.service.js';
+import { CACHE_SCHEMA_VERSION, CATEGORY_GENERATION_META_KEY } from '../types.js';
+import type {
+  CacheState,
+  CategoryCacheMeta,
+  CategoryCacheRow,
+  CategorySnapshot,
 } from '../types.js';
-import type { CacheState, CategoryCacheRow, CategorySnapshot } from '../types.js';
 
 describe('SQLite category cache v7', () => {
   let path: string;
   let cache: SQLiteCacheService;
 
   beforeEach(() => {
-    path = join(tmpdir(), `sqlite-category-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    path = join(
+      tmpdir(),
+      `sqlite-category-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
     cache = new SQLiteCacheService('local-account', path);
   });
 
@@ -28,15 +34,22 @@ describe('SQLite category cache v7', () => {
     try {
       expect(db.pragma('user_version', { simple: true })).toBe(CACHE_SCHEMA_VERSION);
       expect(tableColumns(db, 'categories')).toEqual([
-        ['category_id', 'TEXT', 0, 1], ['name', 'TEXT', 1, 0], ['item_count', 'INTEGER', 0, 0],
-        ['parent_id', 'TEXT', 0, 0], ['parent_name', 'TEXT', 0, 0],
-        ['inventory_type', 'TEXT', 0, 0], ['custom_fields_json', 'TEXT', 0, 0],
-        ['created', 'TEXT', 0, 0], ['modified', 'INTEGER', 0, 0],
-        ['cache_source', 'TEXT', 1, 0], ['source_api_version', 'TEXT', 0, 0],
+        ['category_id', 'TEXT', 0, 1],
+        ['name', 'TEXT', 1, 0],
+        ['item_count', 'INTEGER', 0, 0],
+        ['parent_id', 'TEXT', 0, 0],
+        ['parent_name', 'TEXT', 0, 0],
+        ['inventory_type', 'TEXT', 0, 0],
+        ['custom_fields_json', 'TEXT', 0, 0],
+        ['created', 'TEXT', 0, 0],
+        ['modified', 'INTEGER', 0, 0],
+        ['cache_source', 'TEXT', 1, 0],
+        ['source_api_version', 'TEXT', 0, 0],
         ['imported_at', 'INTEGER', 1, 0],
       ]);
       expect(tableColumns(db, 'category_cache_meta')).toEqual([
-        ['key', 'TEXT', 0, 1], ['value', 'TEXT', 1, 0],
+        ['key', 'TEXT', 0, 1],
+        ['value', 'TEXT', 1, 0],
       ]);
       expect(count(db, 'category_cache_meta')).toBe(0);
       expect(metaValue(db, CATEGORY_GENERATION_META_KEY)).toBeUndefined();
@@ -93,19 +106,43 @@ describe('SQLite category cache v7', () => {
       { item_id: 'weak', name: 'Weak', category_id: null, category_name: 'display-only' },
     ]);
     await cache.batchInsertItemStockLocations([
-      stock('known-stock', 'known', 'stale'), stock('missing-stock', 'missing', 'stale'),
+      stock('known-stock', 'known', 'stale'),
+      stock('missing-stock', 'missing', 'stale'),
       stock('weak-stock', 'weak', 'display-only'),
     ]);
 
-    await cache.replaceCategorySnapshot(snapshot('gen-1', [category('parent', 'Parent'), category('child', 'Child', 'parent', 'Parent')]));
+    await cache.replaceCategorySnapshot(
+      snapshot('gen-1', [
+        category('parent', 'Parent'),
+        category('child', 'Child', 'parent', 'Parent'),
+      ])
+    );
 
-    expect(await cache.getAllCategories()).toEqual([category('child', 'Child', 'parent', 'Parent'), category('parent', 'Parent')]);
-    expect(await cache.getCategoryCacheMeta()).toMatchObject({ generation: 'gen-1', storedRowCount: 2 });
-    expect((await cache.getAllItems()).map(({ item_id, category_name }) => [item_id, category_name]).sort()).toEqual([
-      ['known', 'Child'], ['missing', null], ['weak', 'display-only'],
+    expect(await cache.getAllCategories()).toEqual([
+      category('child', 'Child', 'parent', 'Parent'),
+      category('parent', 'Parent'),
     ]);
-    expect((await cache.getAllItemStockLocations()).map(({ stock_row_id, category_name }) => [stock_row_id, category_name]).sort()).toEqual([
-      ['known-stock', 'Child'], ['missing-stock', null], ['weak-stock', 'display-only'],
+    expect(await cache.getCategoryCacheMeta()).toMatchObject({
+      generation: 'gen-1',
+      storedRowCount: 2,
+    });
+    expect(
+      (await cache.getAllItems())
+        .map(({ item_id, category_name }) => [item_id, category_name])
+        .sort()
+    ).toEqual([
+      ['known', 'Child'],
+      ['missing', null],
+      ['weak', 'display-only'],
+    ]);
+    expect(
+      (await cache.getAllItemStockLocations())
+        .map(({ stock_row_id, category_name }) => [stock_row_id, category_name])
+        .sort()
+    ).toEqual([
+      ['known-stock', 'Child'],
+      ['missing-stock', null],
+      ['weak-stock', 'display-only'],
     ]);
     expect((await cache.getCacheState())?.schemaVersion).toBe(7);
     await cache.setCacheState({ ...(await cache.getCacheState())!, lastSync: 2 });
@@ -114,13 +151,24 @@ describe('SQLite category cache v7', () => {
 
   it('rolls back rows, meta, marker, and reconciliation when replacement fails', async () => {
     await cache.replaceCategorySnapshot(snapshot('old-generation', [category('old', 'Old')]));
-    await cache.insertItem({ item_id: 'item', name: 'Item', category_id: 'old', category_name: 'Old' });
+    await cache.insertItem({
+      item_id: 'item',
+      name: 'Item',
+      category_id: 'old',
+      category_name: 'Old',
+    });
     const db = new Database(path);
-    db.exec(`CREATE TRIGGER fail_category_name BEFORE UPDATE OF category_name ON items BEGIN SELECT RAISE(ABORT, 'forced category failure'); END;`);
+    db.exec(
+      `CREATE TRIGGER fail_category_name BEFORE UPDATE OF category_name ON items BEGIN SELECT RAISE(ABORT, 'forced category failure'); END;`
+    );
     db.close();
 
-    expect(() => cache.replaceCategorySnapshot(snapshot('new-generation', [category('new', 'New')]))).toThrow(/forced category failure/);
-    expect(await cache.getCategorySnapshot()).toEqual(snapshot('old-generation', [category('old', 'Old')]));
+    expect(() =>
+      cache.replaceCategorySnapshot(snapshot('new-generation', [category('new', 'New')]))
+    ).toThrow(/forced category failure/);
+    expect(await cache.getCategorySnapshot()).toEqual(
+      snapshot('old-generation', [category('old', 'Old')])
+    );
     expect((await cache.getItem('item'))?.category_name).toBe('Old');
     expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBe('old-generation');
   });
@@ -138,7 +186,9 @@ describe('SQLite category cache v7', () => {
     } as CategorySnapshot;
 
     expect(() => cache.replaceCategorySnapshot(invalid)).toThrow(/snapshot/i);
-    expect(await cache.getCategorySnapshot()).toEqual(snapshot('old-generation', [category('old', 'Old')]));
+    expect(await cache.getCategorySnapshot()).toEqual(
+      snapshot('old-generation', [category('old', 'Old')])
+    );
   });
 
   it('rejects category strings containing NUL before persisting fingerprinted rows', async () => {
@@ -182,40 +232,77 @@ describe('SQLite category cache v7', () => {
     }
   });
 
-  it.each([true, false])('mirror handles authoritative=%s category data atomically', async (authoritative) => {
-    await cache.replaceCategorySnapshot(snapshot('old-generation', [category('old', 'Old')]));
-    await cache.replaceMirror({
-      accounts: [],
-      categorySnapshot: authoritative ? snapshot('mirror-generation', [category('new', 'Canonical')]) : null,
-      items: [{ item_id: 'mirror-item', name: 'Mirror', category_id: 'new', category_name: 'Incoming' }],
-      itemStockLocations: [stock('mirror-stock', 'mirror-item', 'Incoming')],
-      documents: [], itemDocuments: [], paymentTransactions: [], cacheState: state(7),
-      paymentSyncStatus: null, pulledAt: 123,
-    });
+  it.each([true, false])(
+    'mirror handles authoritative=%s category data atomically',
+    async (authoritative) => {
+      await cache.replaceCategorySnapshot(snapshot('old-generation', [category('old', 'Old')]));
+      await cache.replaceMirror({
+        accounts: [],
+        categorySnapshot: authoritative
+          ? snapshot('mirror-generation', [category('new', 'Canonical')])
+          : null,
+        items: [
+          { item_id: 'mirror-item', name: 'Mirror', category_id: 'new', category_name: 'Incoming' },
+        ],
+        itemStockLocations: [stock('mirror-stock', 'mirror-item', 'Incoming')],
+        documents: [],
+        itemDocuments: [],
+        paymentTransactions: [],
+        cacheState: state(7),
+        paymentSyncStatus: null,
+        pulledAt: 123,
+      });
 
-    expect((await cache.getItem('mirror-item'))?.category_name).toBe(authoritative ? 'Canonical' : 'Incoming');
-    expect((await cache.getItemStockLocations('mirror-item'))[0].category_name).toBe(authoritative ? 'Canonical' : 'Incoming');
-    expect(await cache.getCategorySnapshot()).toEqual(authoritative
-      ? snapshot('mirror-generation', [category('new', 'Canonical')]) : null);
-    expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBe(authoritative ? 'mirror-generation' : undefined);
-  });
+      expect((await cache.getItem('mirror-item'))?.category_name).toBe(
+        authoritative ? 'Canonical' : 'Incoming'
+      );
+      expect((await cache.getItemStockLocations('mirror-item'))[0].category_name).toBe(
+        authoritative ? 'Canonical' : 'Incoming'
+      );
+      expect(await cache.getCategorySnapshot()).toEqual(
+        authoritative ? snapshot('mirror-generation', [category('new', 'Canonical')]) : null
+      );
+      expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBe(
+        authoritative ? 'mirror-generation' : undefined
+      );
+    }
+  );
 
   it('rolls back the complete mirror when category reconciliation fails', async () => {
-    await cache.insertItem({ item_id: 'old-item', name: 'Old item', category_id: 'old', category_name: 'Old' });
+    await cache.insertItem({
+      item_id: 'old-item',
+      name: 'Old item',
+      category_id: 'old',
+      category_name: 'Old',
+    });
     await cache.insertItemStockLocation(stock('old-stock', 'old-item', 'Old'));
     await cache.replaceCategorySnapshot(snapshot('old-generation', [category('old', 'Old')]));
     const db = new Database(path);
-    db.exec(`CREATE TRIGGER fail_mirror_category BEFORE UPDATE OF category_name ON items BEGIN SELECT RAISE(ABORT, 'forced mirror failure'); END;`);
+    db.exec(
+      `CREATE TRIGGER fail_mirror_category BEFORE UPDATE OF category_name ON items BEGIN SELECT RAISE(ABORT, 'forced mirror failure'); END;`
+    );
     db.close();
 
-    expect(() => cache.replaceMirror({
-      accounts: [], categorySnapshot: snapshot('new-generation', [category('new', 'New')]),
-      items: [{ item_id: 'new-item', name: 'New item', category_id: 'new', category_name: 'Incoming' }],
-      itemStockLocations: [stock('new-stock', 'new-item', 'Incoming')], documents: [], itemDocuments: [],
-      paymentTransactions: [], cacheState: state(7), paymentSyncStatus: null, pulledAt: 456,
-    })).toThrow(/forced mirror failure/);
+    expect(() =>
+      cache.replaceMirror({
+        accounts: [],
+        categorySnapshot: snapshot('new-generation', [category('new', 'New')]),
+        items: [
+          { item_id: 'new-item', name: 'New item', category_id: 'new', category_name: 'Incoming' },
+        ],
+        itemStockLocations: [stock('new-stock', 'new-item', 'Incoming')],
+        documents: [],
+        itemDocuments: [],
+        paymentTransactions: [],
+        cacheState: state(7),
+        paymentSyncStatus: null,
+        pulledAt: 456,
+      })
+    ).toThrow(/forced mirror failure/);
 
-    expect(await cache.getCategorySnapshot()).toEqual(snapshot('old-generation', [category('old', 'Old')]));
+    expect(await cache.getCategorySnapshot()).toEqual(
+      snapshot('old-generation', [category('old', 'Old')])
+    );
     expect(await cache.getItem('old-item')).toBeDefined();
     expect(await cache.getItem('new-item')).toBeUndefined();
     expect((await cache.getItemStockLocations('old-item'))[0].category_name).toBe('Old');
@@ -228,8 +315,12 @@ describe('SQLite category cache v7', () => {
     await cache.ensureAccountBinding(first);
     await cache.insertItem({ item_id: 'bound-item', name: 'Bound item' });
 
-    await expect(cache.ensureAccountBinding(second)).rejects.toThrow(/not bound to salesbinder:two/i);
-    await expect(cache.verifyAccountBinding(second)).rejects.toThrow(/not bound to salesbinder:two/i);
+    await expect(cache.ensureAccountBinding(second)).rejects.toThrow(
+      /not bound to salesbinder:two/i
+    );
+    await expect(cache.verifyAccountBinding(second)).rejects.toThrow(
+      /not bound to salesbinder:two/i
+    );
     expect(await cache.getItem('bound-item')).toBeDefined();
 
     await cache.close();
@@ -237,8 +328,12 @@ describe('SQLite category cache v7', () => {
     await expect(cache.verifyAccountBinding(first)).resolves.toBeUndefined();
     const db = new Database(path, { readonly: true });
     try {
-      expect(metaValue(db, 'cache_account_binding.v1.account_identity')).toBe(first.accountIdentity);
-      expect(metaValue(db, 'cache_account_binding.v1.account_subdomain')).toBe(first.accountSubdomain);
+      expect(metaValue(db, 'cache_account_binding.v1.account_identity')).toBe(
+        first.accountIdentity
+      );
+      expect(metaValue(db, 'cache_account_binding.v1.account_subdomain')).toBe(
+        first.accountSubdomain
+      );
       expect(tableExists(db, 'cache_account_binding')).toBe(false);
     } finally {
       db.close();
@@ -248,9 +343,12 @@ describe('SQLite category cache v7', () => {
   it('refuses to adopt a populated legacy SQLite file without a durable binding', async () => {
     await cache.insertItem({ item_id: 'legacy-item', name: 'Legacy item' });
 
-    await expect(cache.ensureAccountBinding({
-      accountIdentity: 'salesbinder:one', accountSubdomain: 'one',
-    })).rejects.toThrow(/populated but has no account binding/i);
+    await expect(
+      cache.ensureAccountBinding({
+        accountIdentity: 'salesbinder:one',
+        accountSubdomain: 'one',
+      })
+    ).rejects.toThrow(/populated but has no account binding/i);
 
     expect(await cache.getItem('legacy-item')).toBeDefined();
   });
@@ -263,9 +361,12 @@ describe('SQLite category cache v7', () => {
     await cache.clearAll();
 
     await expect(cache.verifyAccountBinding(binding)).resolves.toBeUndefined();
-    await expect(cache.verifyAccountBinding({
-      accountIdentity: 'salesbinder:two', accountSubdomain: 'two',
-    })).rejects.toThrow(/not bound to salesbinder:two/i);
+    await expect(
+      cache.verifyAccountBinding({
+        accountIdentity: 'salesbinder:two',
+        accountSubdomain: 'two',
+      })
+    ).rejects.toThrow(/not bound to salesbinder:two/i);
     expect(await cache.getItem('clear-item')).toBeUndefined();
   });
 
@@ -280,32 +381,95 @@ describe('SQLite category cache v7', () => {
   });
 });
 
-const category = (category_id: string, name: string, parent_id: string | null = null, parent_name: string | null = null): CategoryCacheRow => ({
-  category_id, name, item_count: null, parent_id, parent_name,
-  inventory_type: null, custom_fields_json: null, created: null, modified: null,
-  cache_source: 'api', source_api_version: '2.0', imported_at: 100,
+const category = (
+  category_id: string,
+  name: string,
+  parent_id: string | null = null,
+  parent_name: string | null = null
+): CategoryCacheRow => ({
+  category_id,
+  name,
+  item_count: null,
+  parent_id,
+  parent_name,
+  inventory_type: null,
+  custom_fields_json: null,
+  created: null,
+  modified: null,
+  cache_source: 'api',
+  source_api_version: '2.0',
+  imported_at: 100,
 });
 
-const snapshot = (generation: string, rows: CategoryCacheRow[]): CategorySnapshot => ({
-  rows,
-  meta: { version: 1, status: 'complete', accountIdentity: 'salesbinder:test', startedAt: 90, completedAt: 100,
-    count: rows.length, page: 1, pages: rows.length ? 1 : 0, sourceRowCount: rows.length,
-    storedRowCount: rows.length, schemaVersion: 7, sourceApiVersion: '2.0', generation, fingerprint: `sha256:${generation}` },
-});
+const snapshot = (generation: string, rows: CategoryCacheRow[]): CategorySnapshot => {
+  const meta = {
+    version: 1,
+    status: 'complete',
+    accountIdentity: 'salesbinder:test',
+    startedAt: 90,
+    completedAt: 100,
+    count: rows.length,
+    page: 1,
+    pages: rows.length ? 1 : 0,
+    sourceRowCount: rows.length,
+    storedRowCount: rows.length,
+    schemaVersion: 7,
+    sourceApiVersion: '2.0',
+    generation,
+  } satisfies Omit<CategoryCacheMeta, 'fingerprint'>;
+  return {
+    rows,
+    meta: {
+      ...meta,
+      fingerprint: createCategoryFingerprint(meta, rows, CACHE_SCHEMA_VERSION),
+    },
+  };
+};
 
 const state = (schemaVersion: number): CacheState => ({
-  lastSync: 1, lastFullSync: 1, documentCount: 0, itemDocumentCount: 0, accountName: 'test', schemaVersion,
+  lastSync: 1,
+  lastFullSync: 1,
+  documentCount: 0,
+  itemDocumentCount: 0,
+  accountName: 'test',
+  schemaVersion,
 });
 
 const stock = (stock_row_id: string, item_id: string, category_name: string) => ({
-  stock_row_id, item_id, category_name, quantity_on_hand: 0, quantity_reserved: 0,
-  quantity_available: 0, quantity_incoming: 0, in_transit: 0,
+  stock_row_id,
+  item_id,
+  category_name,
+  quantity_on_hand: 0,
+  quantity_reserved: 0,
+  quantity_available: 0,
+  quantity_incoming: 0,
+  in_transit: 0,
 });
 
 const tableColumns = (db: Database.Database, table: string) =>
-  (db.pragma(`table_info(${table})`) as Array<{ name: string; type: string; notnull: number; pk: number }> )
-    .map(({ name, type, notnull, pk }) => [name, type, notnull, pk]);
-const tableExists = (db: Database.Database, table: string) => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
-const count = (db: Database.Database, table: string) => (db.prepare(`SELECT COUNT(*) count FROM ${table}`).get() as { count: number }).count;
-const metaValue = (db: Database.Database, key: string) => (db.prepare('SELECT value FROM cache_meta WHERE key = ?').get(key) as { value: string } | undefined)?.value;
-const rawMeta = (dbPath: string, key: string) => { const db = new Database(dbPath, { readonly: true }); try { return metaValue(db, key); } finally { db.close(); } };
+  (
+    db.pragma(`table_info(${table})`) as Array<{
+      name: string;
+      type: string;
+      notnull: number;
+      pk: number;
+    }>
+  ).map(({ name, type, notnull, pk }) => [name, type, notnull, pk]);
+const tableExists = (db: Database.Database, table: string) =>
+  Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+const count = (db: Database.Database, table: string) =>
+  (db.prepare(`SELECT COUNT(*) count FROM ${table}`).get() as { count: number }).count;
+const metaValue = (db: Database.Database, key: string) =>
+  (
+    db.prepare('SELECT value FROM cache_meta WHERE key = ?').get(key) as
+      | { value: string }
+      | undefined
+  )?.value;
+const rawMeta = (dbPath: string, key: string) => {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    return metaValue(db, key);
+  } finally {
+    db.close();
+  }
+};

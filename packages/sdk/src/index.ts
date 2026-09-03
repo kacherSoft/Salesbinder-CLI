@@ -17,5 +17,17 @@ export * from './config/config.schema.js';
 // Export config loader
 export { loadConfig, loadPreferences, listAccounts } from './config/config.loader.js';
 
+// Export redacted transport observability and injectable limiter support.
+export { SalesBinderRateLimiter } from './client/salesbinder-rate-limiter.js';
+export type {
+  ClientRuntimeOptions,
+  RateLimitApiVersion,
+  RateLimitObserver,
+  RateLimitObserverEvent,
+  RateLimitObserverEventType,
+  RateLimitReason,
+  SalesBinderRateLimiterOptions,
+} from './client/salesbinder-rate-limiter.js';
+
 // Export cache types and services
 export * from './cache/index.js';

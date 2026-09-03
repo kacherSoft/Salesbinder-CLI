@@ -2,6 +2,7 @@ import type { SalesBinderClient } from '../resources/index.js';
 import { ContextId } from '../types/common.types.js';
 import type { Customer, CustomerListResponse } from '../types/customers.types.js';
 import type { CacheService } from './cache.interface.js';
+import type { CacheSyncProgress, CacheSyncProgressCallback } from './cache-sync-progress.types.js';
 import type { AccountRow, CacheState } from './types.js';
 import { CACHE_SCHEMA_VERSION } from './types.js';
 
@@ -11,6 +12,18 @@ export interface AccountSyncResult {
   suppliersProcessed: number;
 }
 
+export interface AccountSyncOptions {
+  full?: boolean;
+  onProgressEvent?: CacheSyncProgressCallback;
+}
+
+interface ContextSyncResult {
+  processed: number;
+  total: number | null;
+}
+
+type AccountProgress = Omit<CacheSyncProgress, 'phase' | 'apiVersion'>;
+
 export class AccountIndexerService {
   constructor(
     private readonly client: SalesBinderClient,
@@ -19,28 +32,70 @@ export class AccountIndexerService {
     private readonly syncLookbackSeconds = 604800
   ) {}
 
-  async sync(full = false): Promise<AccountSyncResult> {
+  async sync(fullOrOptions: boolean | AccountSyncOptions = false): Promise<AccountSyncResult> {
+    const options = typeof fullOrOptions === 'boolean' ? { full: fullOrOptions } : fullOrOptions;
+    const full = options.full ?? false;
+    this.emit(options.onProgressEvent, {
+      event: 'phase_started',
+      recordsProcessed: 0,
+      recordsTotal: null,
+      indeterminate: true,
+    });
     const state = await this.cache.getCacheState();
-    const since = full ? 0 : Math.max(0, (state?.lastAccountSync ?? state?.lastSync ?? 0) - this.syncLookbackSeconds);
-    const customers = await this.syncContext(ContextId.Customer, since);
-    const suppliers = await this.syncContext(ContextId.Supplier, since);
+    const since = full
+      ? 0
+      : Math.max(0, (state?.lastAccountSync ?? state?.lastSync ?? 0) - this.syncLookbackSeconds);
+    const customers = await this.syncContext(ContextId.Customer, since, 1, options.onProgressEvent);
+    const suppliers = await this.syncContext(ContextId.Supplier, since, 2, options.onProgressEvent);
     const now = Math.floor(Date.now() / 1000);
 
     await this.cache.setCacheState(this.mergeState(state, now));
+    const total = sumKnownTotals(customers.total, suppliers.total);
+    const processed = customers.processed + suppliers.processed;
+    this.emit(options.onProgressEvent, {
+      event: 'phase_completed',
+      recordsProcessed: processed,
+      recordsTotal: total,
+      indeterminate: total === null,
+    });
 
     return {
-      accountsProcessed: customers + suppliers,
-      customersProcessed: customers,
-      suppliersProcessed: suppliers,
+      accountsProcessed: processed,
+      customersProcessed: customers.processed,
+      suppliersProcessed: suppliers.processed,
     };
   }
 
-  private async syncContext(contextId: ContextId, modifiedSince: number): Promise<number> {
+  private async syncContext(
+    contextId: ContextId,
+    modifiedSince: number,
+    pass: number,
+    onProgressEvent?: CacheSyncProgressCallback
+  ): Promise<ContextSyncResult> {
     let page = 1;
     let processed = 0;
+    let pagesTotal: number | null = null;
+    let recordsTotal: number | null = null;
+    let lastCompletedPage = 0;
     let hasMore = true;
 
+    this.emit(onProgressEvent, {
+      event: 'pass_started',
+      pass,
+      recordsProcessed: 0,
+      recordsTotal: null,
+      indeterminate: true,
+    });
     while (hasMore) {
+      this.emit(onProgressEvent, {
+        event: 'page_started',
+        pass,
+        page,
+        pagesTotal,
+        recordsProcessed: processed,
+        recordsTotal,
+        indeterminate: recordsTotal === null,
+      });
       const response = await this.client.customers.list({
         contextId,
         modifiedSince,
@@ -48,15 +103,78 @@ export class AccountIndexerService {
         pageLimit: 200,
       });
       const accounts = this.flattenCustomers(response);
-      if (accounts.length === 0) break;
+      const reportedPages = parseOptionalCount(response.pages);
+      const reportedTotal = parseOptionalCount(response.count);
+      const coherentPages =
+        reportedPages !== null &&
+        (accounts.length === 0
+          ? reportedPages === 0 || reportedPages >= page
+          : reportedPages >= page);
+      if (page === 1) {
+        pagesTotal = coherentPages ? reportedPages : null;
+        recordsTotal = pagesTotal === null ? null : reportedTotal;
+      } else {
+        if (!coherentPages || reportedPages !== pagesTotal) pagesTotal = null;
+        if (pagesTotal === null || reportedTotal === null || reportedTotal !== recordsTotal)
+          recordsTotal = null;
+      }
+      if (accounts.length === 0) {
+        lastCompletedPage = page;
+        this.emit(onProgressEvent, {
+          event: 'page_completed',
+          pass,
+          page,
+          pagesTotal,
+          recordsProcessed: processed,
+          recordsTotal,
+          indeterminate: recordsTotal === null,
+        });
+        break;
+      }
 
-      await this.cache.batchInsertAccounts(accounts.map((account) => this.toAccountRow(account, contextId)));
-      processed += accounts.length;
+      await this.cache.batchInsertAccounts(
+        accounts.map((account) => this.toAccountRow(account, contextId))
+      );
+      for (let index = 0; index < accounts.length; index++) {
+        processed++;
+        if (recordsTotal !== null && processed > recordsTotal) recordsTotal = null;
+        this.emit(onProgressEvent, {
+          event: 'record_processed',
+          pass,
+          page,
+          pagesTotal,
+          recordsProcessed: processed,
+          recordsTotal,
+          indeterminate: recordsTotal === null,
+        });
+      }
+      this.emit(onProgressEvent, {
+        event: 'page_completed',
+        pass,
+        page,
+        pagesTotal,
+        recordsProcessed: processed,
+        recordsTotal,
+        indeterminate: recordsTotal === null,
+      });
+      lastCompletedPage = page;
       hasMore = page < Number(response.pages ?? page);
       page++;
     }
 
-    return processed;
+    recordsTotal = completedRecordTotal(processed, recordsTotal, pagesTotal, lastCompletedPage);
+    this.emit(onProgressEvent, {
+      event: 'pass_completed',
+      pass,
+      recordsProcessed: processed,
+      recordsTotal,
+      indeterminate: recordsTotal === null,
+    });
+    return { processed, total: recordsTotal };
+  }
+
+  private emit(callback: CacheSyncProgressCallback | undefined, progress: AccountProgress): void {
+    callback?.({ phase: 'accounts', apiVersion: '2.0', ...progress });
   }
 
   private flattenCustomers(response: CustomerListResponse): Customer[] {
@@ -66,7 +184,9 @@ export class AccountIndexerService {
 
   private toAccountRow(account: Customer, contextId: ContextId): AccountRow {
     if (account.context_id != null && account.context_id !== contextId) {
-      throw new Error(`Account context mismatch: requested ${contextId}, received ${account.context_id}`);
+      throw new Error(
+        `Account context mismatch: requested ${contextId}, received ${account.context_id}`
+      );
     }
 
     return {
@@ -115,6 +235,38 @@ export class AccountIndexerService {
       lastAccountSync: now,
     };
   }
+}
+
+function completedRecordTotal(
+  processed: number,
+  recordsTotal: number | null,
+  pagesTotal: number | null,
+  lastCompletedPage: number
+): number | null {
+  if (recordsTotal === null || pagesTotal === null || processed !== recordsTotal) return null;
+  return pagesTotal === 0
+    ? processed === 0
+      ? 0
+      : null
+    : lastCompletedPage >= pagesTotal
+      ? recordsTotal
+      : null;
+}
+
+function parseOptionalCount(value: unknown): number | null {
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && /^\d+$/.test(value.trim())
+        ? Number(value)
+        : Number.NaN;
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function sumKnownTotals(...totals: Array<number | null>): number | null {
+  return totals.every((total): total is number => total !== null)
+    ? totals.reduce<number>((sum, total) => sum + total, 0)
+    : null;
 }
 
 function toUnix(value: string | undefined): number | null {

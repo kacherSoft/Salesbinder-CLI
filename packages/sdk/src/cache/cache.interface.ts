@@ -59,6 +59,16 @@ export interface CacheService {
   deleteDocument(docId: string): Promise<void>;
   batchInsertDocuments(docs: DocumentRow[]): Promise<void>;
   batchDeleteDocuments(docIds: string[]): Promise<void>;
+  /**
+   * Atomically replace a document and all of its line items. When payments are
+   * supplied, replace them in the same transaction; omit them to preserve the
+   * existing payment bundle.
+   */
+  replaceDocumentBundle?(
+    document: DocumentRow,
+    itemDocuments: Omit<ItemDocumentRow, 'id'>[],
+    paymentTransactions?: PaymentTransactionRow[]
+  ): Promise<void>;
 
   // ============ Item Document CRUD Operations ============
 
@@ -116,6 +126,8 @@ export interface CacheService {
   deleteItemStockLocations(itemId: string): Promise<void>;
   /** Atomically publish a complete validated v3 item and stock snapshot. */
   replaceInventorySnapshot(snapshot: InventorySnapshot): Promise<void>;
+  /** Atomically read authoritative v3 inventory rows and their matching metadata. */
+  getInventorySnapshot?(): Promise<InventorySnapshot | null>;
   /** Return authoritative v3 inventory metadata, or null when unavailable. */
   getInventoryCacheMeta(): Promise<InventoryCacheMeta | null>;
 
@@ -162,15 +174,17 @@ export interface CacheService {
     itemId: string,
     startDate: string,
     endDate: string
-  ): Promise<{
-    doc_id: string;
-    quantity: number;
-    price: number;
-    issue_date: string;
-    customer_id: string;
-    context_id: number;
-    doc_number: number;
-  }[]>;
+  ): Promise<
+    {
+      doc_id: string;
+      quantity: number;
+      price: number;
+      issue_date: string;
+      customer_id: string;
+      context_id: number;
+      doc_number: number;
+    }[]
+  >;
 
   // ============ Cache Metadata Operations ============
 

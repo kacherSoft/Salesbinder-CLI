@@ -1,4 +1,5 @@
 import type { AxiosInstance } from 'axios';
+import { ApiResponseValidationError } from '../api-response-validation.error.js';
 import { V3ItemsResource } from '../v3-items.resource.js';
 
 const item = {
@@ -120,6 +121,28 @@ describe('V3ItemsResource', () => {
     const resource = createResource(get);
 
     await expect(resource.list()).rejects.toThrow('expected numeric pagination');
+  });
+
+  it('uses a nominal validation error for malformed item detail responses', async () => {
+    const resource = createResource(jest.fn().mockResolvedValue({ data: { object: 'item' } }));
+
+    await expect(resource.get('item-1')).rejects.toBeInstanceOf(ApiResponseValidationError);
+  });
+
+  it('encodes item IDs used as URL path segments', async () => {
+    const get = jest
+      .fn()
+      .mockResolvedValueOnce({ data: { ...item, id: 'item/with?reserved' } })
+      .mockResolvedValueOnce({ data: listEnvelope([], '/api/v3/items/id/variations') });
+    const resource = createResource(get);
+
+    await resource.get('item/with?reserved');
+    await resource.listVariations('item/with?reserved');
+
+    expect(get).toHaveBeenNthCalledWith(1, '/items/item%2Fwith%3Freserved');
+    expect(get).toHaveBeenNthCalledWith(2, '/items/item%2Fwith%3Freserved/variations', {
+      params: undefined,
+    });
   });
 });
 

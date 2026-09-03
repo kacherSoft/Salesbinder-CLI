@@ -1,50 +1,28 @@
-/**
- * Axios HTTP client factory for SalesBinder API
- * Creates configured axios instance with auth, retry, and request tracking
- */
+/** Axios HTTP client factory for the SalesBinder v2 API. */
 
-import axios, { type AxiosInstance, type InternalAxiosRequestConfig } from 'axios';
-import { basicAuthInterceptor, basicAuthInterceptorOptions } from '../auth/basic-auth.interceptor.js';
-import type { RetryConfig } from './retry.handler.js';
-import { generateRequestId } from '../utils/request-id.generator.js';
+import axios, { type AxiosInstance } from 'axios';
+import {
+  basicAuthInterceptor,
+  basicAuthInterceptorOptions,
+} from '../auth/basic-auth.interceptor.js';
 import type { AccountConfig } from '../config/config.schema.js';
+import { generateRequestId } from '../utils/request-id.generator.js';
+import {
+  createV2RateLimitBucketKey,
+  getDefaultRateLimiterRegistry,
+  installRateLimiterInterceptors,
+  type ClientRuntimeOptions,
+} from './salesbinder-rate-limiter.js';
+import {
+  installRetryMetadataInterceptor,
+  installRetryResponseInterceptor,
+} from './retry.handler.js';
 
-const DEFAULT_RETRY_INITIAL_DELAY_MS = 1000;
-const MAX_RETRY_DELAY_MS = 60000;
-
-function getRetryInitialDelayMs(): number {
-  const configuredDelay = Number(process.env.SALESBINDER_RETRY_INITIAL_DELAY_MS);
-  if (!Number.isSafeInteger(configuredDelay) || configuredDelay <= 0) {
-    return DEFAULT_RETRY_INITIAL_DELAY_MS;
-  }
-  return Math.min(configuredDelay, MAX_RETRY_DELAY_MS);
-}
-
-function getRetryAfterDelayMs(value: unknown): number | undefined {
-  if (typeof value !== 'string' && typeof value !== 'number') {
-    return undefined;
-  }
-
-  const retryAfter = String(value).trim();
-  if (/^[+-]?\d+$/.test(retryAfter)) {
-    const delayMs = Number(retryAfter) * 1000;
-    return delayMs > 0 ? Math.min(delayMs, MAX_RETRY_DELAY_MS) : undefined;
-  }
-
-  const retryAt = Date.parse(retryAfter);
-  const delayMs = retryAt - Date.now();
-  if (!Number.isFinite(delayMs) || delayMs <= 0) {
-    return undefined;
-  }
-  return Math.min(delayMs, MAX_RETRY_DELAY_MS);
-}
-
-/**
- * Create configured axios instance for SalesBinder API
- * @param account - Account configuration
- * @returns Axios instance
- */
-export function createAxiosClient(account: AccountConfig): AxiosInstance {
+/** Create a configured, governed Axios instance for the SalesBinder v2 API. */
+export function createAxiosClient(
+  account: AccountConfig,
+  runtimeOptions: ClientRuntimeOptions = {}
+): AxiosInstance {
   const client = axios.create({
     baseURL: `https://${account.subdomain}.salesbinder.com/api/${account.apiVersion}`,
     timeout: account.timeout || 30000,
@@ -55,82 +33,19 @@ export function createAxiosClient(account: AccountConfig): AxiosInstance {
     },
   });
 
-  // Add Basic Auth interceptor
+  const limiter = runtimeOptions.rateLimiterRegistry ?? getDefaultRateLimiterRegistry();
+  const bucketKey = createV2RateLimitBucketKey(account.subdomain, account.apiVersion);
+
+  // Axios request interceptors are LIFO and response interceptors FIFO. Installing the
+  // limiter first makes metadata/auth run before its gate, while it observes 429 before retry.
+  installRateLimiterInterceptors(client, limiter, bucketKey, runtimeOptions.rateLimitObserver);
   client.interceptors.request.use(
     (config) => basicAuthInterceptor(config, account.apiKey),
     undefined,
     basicAuthInterceptorOptions
   );
-
-  // Add request ID to each request
-  client.interceptors.request.use((config) => {
-    // Don't reset retry state if this is a retry
-    if ((config as any).__isRetry) {
-      delete (config as any).__isRetry;
-      return config;
-    }
-    const requestId = generateRequestId();
-    (config as InternalAxiosRequestConfig & { _retry?: RetryConfig })._retry = {
-      attempt: 0,
-      requestId,
-    };
-    return config;
-  });
-
-  // Add retry interceptor for response errors
-  client.interceptors.response.use(
-    (response) => response,
-    async (error) => {
-      const config = error.config as InternalAxiosRequestConfig & { _retry?: RetryConfig };
-      if (!config || !config._retry) {
-        return Promise.reject(error);
-      }
-
-      // Check if we should retry
-      const errorObj = error as any;
-      const retryableStatus = [429, 500, 502, 503, 504, 522];
-      const isRetryable = !errorObj.response || retryableStatus.includes(errorObj.response?.status);
-
-      if (!isRetryable || config._retry.attempt >= 5) {
-        return Promise.reject(error);
-      }
-
-      const { attempt, requestId } = config._retry;
-
-      // Prefer a valid retry-after delay, otherwise use exponential backoff.
-      const retryAfterHeader = errorObj.response?.headers?.['retry-after'];
-      const retryAfterDelay = getRetryAfterDelayMs(retryAfterHeader);
-      const reason = errorObj.response?.status || 'network';
-      let delay: number;
-
-      if (retryAfterDelay !== undefined) {
-        delay = retryAfterDelay;
-      } else {
-        // Calculate delay with exponential backoff
-        const initialDelay = getRetryInitialDelayMs();
-        const JITTER_PERCENT = 0.5;
-        const exponentialDelay = initialDelay * Math.pow(2, attempt);
-        const jitter = exponentialDelay * JITTER_PERCENT * Math.random();
-        delay = exponentialDelay + jitter;
-      }
-
-      // Log retry
-      console.warn(`[${requestId}] Retry ${attempt + 1}/5 after ${(delay / 1000).toFixed(1)}s (reason: ${reason})`);
-
-      // Wait before retry
-      await new Promise(resolve => setTimeout(resolve, delay));
-
-      // Increment attempt counter BEFORE retry
-      config._retry.attempt++;
-
-      // Mark this config as already in retry to prevent the request interceptor from resetting
-      (config as any).__isRetry = true;
-
-      // Retry the request using the axios instance's request method
-      // This properly executes the request instead of returning the config
-      return (client as any).request(config);
-    }
-  );
+  installRetryMetadataInterceptor(client, generateRequestId);
+  installRetryResponseInterceptor(client, 'v2', runtimeOptions.rateLimitObserver);
 
   return client;
 }

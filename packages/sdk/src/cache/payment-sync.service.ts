@@ -8,6 +8,7 @@ import {
   hashPaymentInvoiceSnapshot,
   normalizeDocumentPaymentTransactions,
   nowInSeconds,
+  paymentInvoiceApiDocumentId,
   sanitizePaymentSyncError,
   sortInvoicesForPaymentSync,
 } from './payment-sync.helpers.js';
@@ -21,19 +22,22 @@ export interface PaymentSyncOptions {
 export class PaymentSyncService {
   constructor(
     private readonly client: SalesBinderClient,
-    private readonly cache: CacheService,
+    private readonly cache: CacheService
   ) {}
 
   async syncHistoricalPayments(options: PaymentSyncOptions = {}): Promise<PaymentSyncResult> {
     const runStartedAt = nowInSeconds();
     const startedAtMs = Date.now();
     const previousStatus = await this.cache.getPaymentSyncStatus();
-    const invoices = sortInvoicesForPaymentSync(await this.cache.getDocumentsByContext(DocumentContextId.Invoice));
+    const invoices = sortInvoicesForPaymentSync(
+      await this.cache.getDocumentsByContext(DocumentContextId.Invoice)
+    );
     const snapshotHash = hashPaymentInvoiceSnapshot(invoices);
     const resume = resolveResume(previousStatus, invoices, snapshotHash);
-    const detailDelayMs = process.env.NODE_ENV === 'test' && options.detailDelayMs !== undefined
-      ? Math.max(0, options.detailDelayMs)
-      : PAYMENT_DETAIL_DELAY_MS;
+    const detailDelayMs =
+      process.env.NODE_ENV === 'test' && options.detailDelayMs !== undefined
+        ? Math.max(0, options.detailDelayMs)
+        : PAYMENT_DETAIL_DELAY_MS;
 
     let processedDocuments = resume.startIndex;
     let transactionsProcessed = 0;
@@ -42,7 +46,7 @@ export class PaymentSyncService {
 
     const buildStatus = (
       status: PaymentSyncStatus['status'],
-      overrides: Partial<PaymentSyncStatus> = {},
+      overrides: Partial<PaymentSyncStatus> = {}
     ): PaymentSyncStatus => ({
       status,
       mode: 'full',
@@ -62,13 +66,20 @@ export class PaymentSyncService {
       for (let index = resume.startIndex; index < invoices.length; index++) {
         const invoice = invoices[index];
         if (invoice.cache_source === 'csv' && !invoice.api_doc_id) {
-          throw new Error(`Invoice ${invoice.doc_number} must be reconciled from SalesBinder before payment backfill.`);
+          throw new Error(
+            `Invoice ${invoice.doc_number} must be reconciled from SalesBinder before payment backfill.`
+          );
         }
-        const apiDocumentId = invoice.api_doc_id ?? invoice.doc_id;
+        const apiDocumentId = paymentInvoiceApiDocumentId(invoice);
 
         const document = await this.client.documents.get(apiDocumentId);
         if (document.id !== apiDocumentId) {
-          throw new Error(`Requested document ${apiDocumentId} but SalesBinder returned ${document.id}.`);
+          throw new Error(
+            `Requested document ${apiDocumentId} but SalesBinder returned ${document.id}.`
+          );
+        }
+        if (document.context_id !== DocumentContextId.Invoice) {
+          throw new Error('SalesBinder returned a non-invoice document.');
         }
         const importedAt = nowInSeconds();
         const rows = normalizeDocumentPaymentTransactions(document, invoice.doc_id, importedAt);
@@ -86,9 +97,9 @@ export class PaymentSyncService {
       }
 
       const finalInvoices = sortInvoicesForPaymentSync(
-        await this.cache.getDocumentsByContext(DocumentContextId.Invoice),
+        await this.cache.getDocumentsByContext(DocumentContextId.Invoice)
       );
-      if (!sameInvoiceSet(invoices, finalInvoices)) {
+      if (!sameInvoiceSourceSnapshot(invoices, finalInvoices)) {
         throw new Error('Invoice cache changed during payment backfill; rerun to resume safely.');
       }
 
@@ -98,7 +109,7 @@ export class PaymentSyncService {
           updatedAt: finishedAt,
           finishedAt,
           lastSuccessfulSync: finishedAt,
-        }),
+        })
       );
 
       return {
@@ -119,7 +130,7 @@ export class PaymentSyncService {
             updatedAt: failedAt,
             finishedAt: failedAt,
             error: sanitizePaymentSyncError(error),
-          }),
+          })
         );
       } catch {
         // Failed-status persistence is best-effort; preserve the original sync error.
@@ -131,16 +142,18 @@ export class PaymentSyncService {
 
 function resolveResume(
   previousStatus: PaymentSyncStatus | null,
-  invoiceIds: Array<{ doc_id: string }>,
-  snapshotHash: string,
+  invoiceIds: Array<{ doc_id: string; api_doc_id?: string | null }>,
+  snapshotHash: string
 ) {
   if (previousStatus?.status !== 'backfilling' && previousStatus?.status !== 'failed') {
     return { startIndex: 0, resumed: false, cursor: null as string | null };
   }
   const cursor = previousStatus.cursor;
-  if (!cursor
-    || previousStatus.totalDocuments !== invoiceIds.length
-    || previousStatus.snapshotHash !== snapshotHash) {
+  if (
+    !cursor ||
+    previousStatus.totalDocuments !== invoiceIds.length ||
+    previousStatus.snapshotHash !== snapshotHash
+  ) {
     return { startIndex: 0, resumed: false, cursor: null as string | null };
   }
   const cursorIndex = invoiceIds.findIndex((invoice) => invoice.doc_id === cursor);
@@ -150,6 +163,19 @@ function resolveResume(
   return { startIndex: cursorIndex + 1, resumed: true, cursor };
 }
 
-function sameInvoiceSet(left: Array<{ doc_id: string }>, right: Array<{ doc_id: string }>): boolean {
-  return left.length === right.length && left.every((invoice, index) => invoice.doc_id === right[index]?.doc_id);
+function sameInvoiceSourceSnapshot(
+  left: Array<{ doc_id: string; api_doc_id?: string | null }>,
+  right: Array<{ doc_id: string; api_doc_id?: string | null }>
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((invoice, index) => {
+      const other = right[index];
+      if (!other) return false;
+      return (
+        invoice.doc_id === other.doc_id &&
+        paymentInvoiceApiDocumentId(invoice) === paymentInvoiceApiDocumentId(other)
+      );
+    })
+  );
 }

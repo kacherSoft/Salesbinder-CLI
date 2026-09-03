@@ -3,6 +3,7 @@
  */
 
 import pg, { type PoolClient } from 'pg';
+import { randomUUID } from 'node:crypto';
 import type { CacheService } from './cache.interface.js';
 import type {
   AccountRow,
@@ -27,7 +28,10 @@ import {
   CATEGORY_GENERATION_META_KEY,
   CATEGORY_SNAPSHOT_META_KEY,
   INVENTORY_SNAPSHOT_META_KEY,
+  createInventorySnapshotFingerprint,
   createSalesBinderAccountBinding,
+  inventorySnapshotFingerprintMatches,
+  parseInventoryCacheMeta,
 } from './types.js';
 import { PAYMENT_SYNC_STATUS_KEY, PAYMENT_TRANSACTION_COLUMNS } from './payment-cache.constants.js';
 import type { PaymentSyncStatus, PaymentTransactionRow } from './payment-sync.types.js';
@@ -35,58 +39,167 @@ import {
   assertPaymentRowsMatchDocument,
   assertUniquePaymentTransactionIds,
 } from './payment-sync.helpers.js';
+import { createCategoryFingerprint } from './category-indexer.service.js';
+import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
+import { assertCanonicalV3SourceId } from './v3-inventory-source-validation.js';
 
 const { Pool } = pg;
 
 // Keep the lock identity stable across rolling schema upgrades.
 const DB_WRITE_LOCK_KEY = 'salesbinder.cache.database-write.v6';
 const INVENTORY_NULLABILITY_MIGRATION_META_KEY = 'schema.v7.inventory-nullability-migrated';
+const POSTGRES_INTEGER_MAX = 2_147_483_647;
 
 const CATEGORY_COLUMNS = [
-  'category_id', 'name', 'item_count', 'parent_id', 'parent_name',
-  'inventory_type', 'custom_fields_json', 'created', 'modified', 'cache_source',
-  'source_api_version', 'imported_at',
+  'category_id',
+  'name',
+  'item_count',
+  'parent_id',
+  'parent_name',
+  'inventory_type',
+  'custom_fields_json',
+  'created',
+  'modified',
+  'cache_source',
+  'source_api_version',
+  'imported_at',
 ] as const;
 
 const DOCUMENT_COLUMNS = [
-  'doc_id', 'context_id', 'doc_number', 'issue_date', 'customer_id', 'modified',
-  'api_doc_id', 'cache_source', 'document_name', 'custom_doc_number',
-  'account_id', 'account_context_id', 'account_name', 'account_number',
-  'user_id', 'salesperson_name', 'customer_name', 'customer_number',
-  'supplier_name', 'supplier_number', 'status_id', 'status_name',
-  'total_price', 'total_cost', 'subtotal', 'associated_document_id',
-  'external_po_number', 'shipping_location', 'date_sent', 'shipped_percent',
-  'is_cancelled', 'archived', 'imported_at',
+  'doc_id',
+  'context_id',
+  'doc_number',
+  'issue_date',
+  'customer_id',
+  'modified',
+  'api_doc_id',
+  'cache_source',
+  'document_name',
+  'custom_doc_number',
+  'account_id',
+  'account_context_id',
+  'account_name',
+  'account_number',
+  'user_id',
+  'salesperson_name',
+  'customer_name',
+  'customer_number',
+  'supplier_name',
+  'supplier_number',
+  'status_id',
+  'status_name',
+  'total_price',
+  'total_cost',
+  'subtotal',
+  'associated_document_id',
+  'external_po_number',
+  'shipping_location',
+  'date_sent',
+  'shipped_percent',
+  'is_cancelled',
+  'archived',
+  'imported_at',
 ] as const;
 
 const ITEM_DOCUMENT_COLUMNS = [
-  'item_id', 'doc_id', 'quantity', 'price', 'document_item_id', 'item_name',
-  'item_number', 'item_sku', 'item_location', 'line_description',
-  'quantity_received', 'quantity_shipped', 'cost', 'total_amount', 'discounted_price', 'discount_percent',
+  'item_id',
+  'doc_id',
+  'quantity',
+  'price',
+  'document_item_id',
+  'item_name',
+  'item_number',
+  'item_sku',
+  'item_location',
+  'line_description',
+  'quantity_received',
+  'quantity_shipped',
+  'cost',
+  'total_amount',
+  'discounted_price',
+  'discount_percent',
 ] as const;
 
 const ACCOUNT_COLUMNS = [
-  'account_id', 'context_id', 'account_number', 'name', 'office_email', 'office_phone',
-  'office_fax', 'url', 'billing_address_1', 'billing_address_2', 'billing_city',
-  'billing_region', 'billing_postal_code', 'billing_country', 'shipping_address_1',
-  'shipping_address_2', 'shipping_city', 'shipping_region', 'shipping_postal_code',
-  'shipping_country', 'vat_number', 'account_manager', 'label_name', 'archived',
-  'last_invoiced', 'created', 'modified', 'cache_source', 'imported_at',
+  'account_id',
+  'context_id',
+  'account_number',
+  'name',
+  'office_email',
+  'office_phone',
+  'office_fax',
+  'url',
+  'billing_address_1',
+  'billing_address_2',
+  'billing_city',
+  'billing_region',
+  'billing_postal_code',
+  'billing_country',
+  'shipping_address_1',
+  'shipping_address_2',
+  'shipping_city',
+  'shipping_region',
+  'shipping_postal_code',
+  'shipping_country',
+  'vat_number',
+  'account_manager',
+  'label_name',
+  'archived',
+  'last_invoiced',
+  'created',
+  'modified',
+  'cache_source',
+  'imported_at',
 ] as const;
 
 const ITEM_COLUMNS = [
-  'item_id', 'item_number', 'name', 'description', 'sku', 'serial_number', 'barcode',
-  'category_id', 'category_name', 'quantity', 'quantity_reserved', 'quantity_available',
-  'quantity_incoming', 'in_transit', 'threshold', 'cost', 'price', 'valuation',
-  'published', 'archived', 'created', 'modified', 'cache_source', 'imported_at',
+  'item_id',
+  'item_number',
+  'name',
+  'description',
+  'sku',
+  'serial_number',
+  'barcode',
+  'category_id',
+  'category_name',
+  'quantity',
+  'quantity_reserved',
+  'quantity_available',
+  'quantity_incoming',
+  'in_transit',
+  'threshold',
+  'cost',
+  'price',
+  'valuation',
+  'published',
+  'archived',
+  'created',
+  'modified',
+  'cache_source',
+  'imported_at',
   'source_api_version',
 ] as const;
 
 const STOCK_COLUMNS = [
-  'stock_row_id', 'item_id', 'item_number', 'variation_id', 'variation_location_id',
-  'location_id', 'location_name', 'category_name', 'quantity_on_hand',
-  'quantity_reserved', 'quantity_available', 'quantity_incoming', 'in_transit',
-  'price', 'cost', 'valuation', 'barcode', 'cache_source', 'imported_at',
+  'stock_row_id',
+  'item_id',
+  'item_number',
+  'variation_id',
+  'variation_location_id',
+  'location_id',
+  'location_name',
+  'category_name',
+  'quantity_on_hand',
+  'quantity_reserved',
+  'quantity_available',
+  'quantity_incoming',
+  'in_transit',
+  'price',
+  'cost',
+  'valuation',
+  'barcode',
+  'cache_source',
+  'imported_at',
   'source_api_version',
 ] as const;
 
@@ -656,7 +769,9 @@ export class PostgresCacheService implements CacheService {
   async ensureAccountBinding(binding: CacheAccountBinding): Promise<void> {
     const canonical = createSalesBinderAccountBinding(binding.accountSubdomain);
     if (canonical.accountIdentity !== binding.accountIdentity) {
-      throw new Error('PostgreSQL cache account identity does not match its normalized SalesBinder subdomain.');
+      throw new Error(
+        'PostgreSQL cache account identity does not match its normalized SalesBinder subdomain.'
+      );
     }
 
     const createdAt = binding.createdAt ?? Math.floor(Date.now() / 1000);
@@ -667,8 +782,8 @@ export class PostgresCacheService implements CacheService {
       if (!existing) {
         if (await this.databaseContainsPayloadRows(client)) {
           throw new Error(
-            'PostgreSQL cache database is populated but has no account binding. '
-            + 'Use a matching empty database or rebuild this database before binding it.'
+            'PostgreSQL cache database is populated but has no account binding. ' +
+              'Use a matching empty database or rebuild this database before binding it.'
           );
         }
         await client.query(
@@ -676,7 +791,7 @@ export class PostgresCacheService implements CacheService {
              (id, account_identity, account_subdomain, created_at)
            VALUES (1, $1, $2, $3)
            ON CONFLICT (id) DO NOTHING`,
-          [canonical.accountIdentity, canonical.accountSubdomain, createdAt],
+          [canonical.accountIdentity, canonical.accountSubdomain, createdAt]
         );
       }
 
@@ -691,13 +806,15 @@ export class PostgresCacheService implements CacheService {
   async verifyAccountBinding(binding: CacheAccountBinding): Promise<void> {
     const canonical = createSalesBinderAccountBinding(binding.accountSubdomain);
     if (canonical.accountIdentity !== binding.accountIdentity) {
-      throw new Error('PostgreSQL cache account identity does not match its normalized SalesBinder subdomain.');
+      throw new Error(
+        'PostgreSQL cache account identity does not match its normalized SalesBinder subdomain.'
+      );
     }
     const persisted = await this.readBinding(this.pool, false);
     if (!persisted) {
       throw new Error(
-        `PostgreSQL cache database has no account binding for ${canonical.accountIdentity}. `
-        + 'Run cache sync for this SalesBinder account first, or use the correctly bound database.'
+        `PostgreSQL cache database has no account binding for ${canonical.accountIdentity}. ` +
+          'Run cache sync for this SalesBinder account first, or use the correctly bound database.'
       );
     }
     this.assertMatchingBinding(persisted, canonical);
@@ -709,11 +826,12 @@ export class PostgresCacheService implements CacheService {
     this.assertValidCategorySnapshot(snapshot, binding.accountIdentity);
 
     await this.withVerifiedWrite(async (client) => {
+      const inventorySnapshot = await this.readAuthoritativeInventorySnapshot(client);
       await client.query(`DELETE FROM categories`);
       for (const row of snapshot.rows) {
         await client.query(
           this.insertSql('categories', CATEGORY_COLUMNS),
-          this.valuesFor(CATEGORY_COLUMNS, row as unknown as Record<string, unknown>),
+          this.valuesFor(CATEGORY_COLUMNS, row as unknown as Record<string, unknown>)
         );
       }
 
@@ -721,7 +839,7 @@ export class PostgresCacheService implements CacheService {
       await client.query(
         `INSERT INTO category_cache_meta (key, value) VALUES ($1, $2)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [CATEGORY_SNAPSHOT_META_KEY, JSON.stringify(snapshot.meta)],
+        [CATEGORY_SNAPSHOT_META_KEY, JSON.stringify(snapshot.meta)]
       );
 
       await client.query(`
@@ -754,7 +872,46 @@ export class PostgresCacheService implements CacheService {
           );
       `);
 
-      const currentState = await this.invalidateInventoryAuthority(client, false);
+      let currentState: CacheState | null;
+      if (inventorySnapshot) {
+        const { meta: inventoryMeta } = inventorySnapshot;
+        const stateResult = await client.query<{ value: string }>(
+          `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`
+        );
+        currentState = this.parseCacheState(stateResult.rows[0]?.value);
+        const items = (
+          await client.query<ItemRow>(`
+          SELECT ${ITEM_COLUMNS.join(', ')} FROM items
+          WHERE cache_source = 'api' AND source_api_version = '3'
+          ORDER BY item_id
+        `)
+        ).rows.map((row) => this.coerceItem(row));
+        const stockRows = (
+          await client.query<ItemStockLocationRow>(`
+          SELECT ${STOCK_COLUMNS.join(', ')} FROM item_stock_locations
+          WHERE cache_source = 'api' AND source_api_version = '3'
+          ORDER BY stock_row_id
+        `)
+        ).rows.map((row) => this.coerceStock(row));
+        const generation = randomUUID();
+        const refreshedMeta: InventoryCacheMeta = {
+          ...inventoryMeta,
+          generation,
+          fingerprint: createInventorySnapshotFingerprint(
+            inventoryMeta.accountIdentity,
+            generation,
+            items,
+            stockRows
+          ),
+        };
+        await client.query(
+          `INSERT INTO cache_meta (key, value) VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+          [INVENTORY_SNAPSHOT_META_KEY, JSON.stringify(refreshedMeta)]
+        );
+      } else {
+        currentState = await this.invalidateInventoryAuthority(client, false);
+      }
 
       const nextState: CacheState = {
         lastSync: currentState?.lastSync ?? 0,
@@ -770,12 +927,12 @@ export class PostgresCacheService implements CacheService {
       await client.query(
         `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [JSON.stringify(nextState)],
+        [JSON.stringify(nextState)]
       );
       await client.query(
         `INSERT INTO cache_meta (key, value) VALUES ($1, $2)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [CATEGORY_GENERATION_META_KEY, snapshot.meta.generation],
+        [CATEGORY_GENERATION_META_KEY, snapshot.meta.generation]
       );
     });
   }
@@ -784,20 +941,9 @@ export class PostgresCacheService implements CacheService {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      const meta = await this.readAuthoritativeCategoryMeta(client);
-      if (!meta) {
-        await client.query('COMMIT');
-        return null;
-      }
-      const rows = (await client.query<CategoryCacheRow>(
-        `SELECT ${CATEGORY_COLUMNS.join(', ')} FROM categories ORDER BY category_id`,
-      )).rows.map((row) => this.coerceCategory(row));
-      if (rows.length !== meta.storedRowCount) {
-        await client.query('COMMIT');
-        return null;
-      }
+      const snapshot = await this.readAuthoritativeCategorySnapshot(client);
       await client.query('COMMIT');
-      return { rows, meta };
+      return snapshot;
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -810,14 +956,9 @@ export class PostgresCacheService implements CacheService {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      const meta = await this.readAuthoritativeCategoryMeta(client);
-      if (!meta) {
-        await client.query('COMMIT');
-        return null;
-      }
-      const countResult = await client.query<{ count: string }>(`SELECT COUNT(*) AS count FROM categories`);
+      const snapshot = await this.readAuthoritativeCategorySnapshot(client);
       await client.query('COMMIT');
-      return Number(countResult.rows[0]?.count) === meta.storedRowCount ? meta : null;
+      return snapshot?.meta ?? null;
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -842,32 +983,55 @@ export class PostgresCacheService implements CacheService {
     await this.withVerifiedWrite(async (client) => {
       await client.query(
         this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
-        this.valuesFor(DOCUMENT_COLUMNS, await this.normalizeDocumentForWrite(doc, client)),
+        this.valuesFor(DOCUMENT_COLUMNS, await this.normalizeDocumentForWrite(doc, client))
       );
     });
   }
 
   async getDocument(docId: string): Promise<DocumentRow | undefined> {
-    const row = (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE doc_id = $1`, [docId])).rows[0];
+    const row = (
+      await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE doc_id = $1`, [docId])
+    ).rows[0];
     return row ? this.coerceDocument(row) : undefined;
   }
 
   async getDocumentByApiId(apiDocId: string): Promise<DocumentRow | undefined> {
-    const row = (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE api_doc_id = $1`, [apiDocId])).rows[0];
+    const row = (
+      await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE api_doc_id = $1`, [
+        apiDocId,
+      ])
+    ).rows[0];
     return row ? this.coerceDocument(row) : undefined;
   }
 
-  async getDocumentByNumber(contextId: number, docNumber: number): Promise<DocumentRow | undefined> {
-    const row = (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE context_id = $1 AND doc_number = $2`, [contextId, docNumber])).rows[0];
+  async getDocumentByNumber(
+    contextId: number,
+    docNumber: number
+  ): Promise<DocumentRow | undefined> {
+    const row = (
+      await this.pool.query<DocumentRow>(
+        `SELECT * FROM documents WHERE context_id = $1 AND doc_number = $2`,
+        [contextId, docNumber]
+      )
+    ).rows[0];
     return row ? this.coerceDocument(row) : undefined;
   }
 
   async getDocumentsByContext(contextId: number): Promise<DocumentRow[]> {
-    return (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE context_id = $1`, [contextId])).rows.map(this.coerceDocument);
+    return (
+      await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE context_id = $1`, [
+        contextId,
+      ])
+    ).rows.map(this.coerceDocument);
   }
 
   async getDocumentsModifiedSince(timestamp: number): Promise<DocumentRow[]> {
-    return (await this.pool.query<DocumentRow>(`SELECT * FROM documents WHERE modified > $1 ORDER BY modified ASC`, [timestamp])).rows.map(this.coerceDocument);
+    return (
+      await this.pool.query<DocumentRow>(
+        `SELECT * FROM documents WHERE modified > $1 ORDER BY modified ASC`,
+        [timestamp]
+      )
+    ).rows.map(this.coerceDocument);
   }
 
   async getDocumentCountByContext(contextId: number): Promise<number> {
@@ -881,27 +1045,84 @@ export class PostgresCacheService implements CacheService {
   }
 
   async batchInsertDocuments(docs: DocumentRow[]): Promise<void> {
-    await this.batch(docs, (client, doc) => client.query(
-      this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
-      this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(doc)),
-    ));
+    await this.batch(docs, (client, doc) =>
+      client.query(
+        this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
+        this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(doc))
+      )
+    );
   }
 
   async batchDeleteDocuments(docIds: string[]): Promise<void> {
-    await this.batch(docIds, (client, id) => client.query(`DELETE FROM documents WHERE doc_id = $1`, [id]));
+    await this.batch(docIds, (client, id) =>
+      client.query(`DELETE FROM documents WHERE doc_id = $1`, [id])
+    );
+  }
+
+  async replaceDocumentBundle(
+    document: DocumentRow,
+    itemDocuments: Omit<ItemDocumentRow, 'id'>[],
+    paymentTransactions?: PaymentTransactionRow[]
+  ): Promise<void> {
+    if (itemDocuments.some((row) => row.doc_id !== document.doc_id)) {
+      throw new Error('Document bundle line items must match the document ID.');
+    }
+    if (paymentTransactions !== undefined) {
+      assertPaymentRowsMatchDocument(document.doc_id, paymentTransactions);
+      assertUniquePaymentTransactionIds(paymentTransactions);
+    }
+
+    await this.withVerifiedWrite(async (client) => {
+      const normalizedDocument = await this.normalizeDocumentForWrite(document, client);
+      const resolvedDocId = normalizedDocument['doc_id'];
+      if (typeof resolvedDocId !== 'string' || resolvedDocId.length === 0) {
+        throw new Error('Document bundle requires a valid document ID.');
+      }
+
+      await client.query(
+        this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
+        this.valuesFor(DOCUMENT_COLUMNS, normalizedDocument)
+      );
+      await client.query(`DELETE FROM item_documents WHERE doc_id = $1`, [resolvedDocId]);
+      for (const row of itemDocuments) {
+        await client.query(
+          this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
+          this.valuesFor(
+            ITEM_DOCUMENT_COLUMNS,
+            this.normalizeItemDocument({ ...row, doc_id: resolvedDocId })
+          )
+        );
+      }
+      if (paymentTransactions !== undefined) {
+        await client.query(`DELETE FROM payment_transactions WHERE doc_id = $1`, [resolvedDocId]);
+        for (const row of paymentTransactions) {
+          await client.query(
+            this.insertSql('payment_transactions', PAYMENT_TRANSACTION_COLUMNS),
+            this.valuesFor(
+              PAYMENT_TRANSACTION_COLUMNS,
+              this.normalizePaymentTransaction({ ...row, doc_id: resolvedDocId })
+            )
+          );
+        }
+      }
+    });
   }
 
   async insertItemDocument(item: Omit<ItemDocumentRow, 'id'>): Promise<void> {
     await this.withVerifiedWrite(async (client) => {
       await client.query(
         this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
-        this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)),
+        this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item))
       );
     });
   }
 
   async getItemDocuments(docId: string): Promise<ItemDocumentRow[]> {
-    return (await this.pool.query<ItemDocumentRow>(`SELECT * FROM item_documents WHERE doc_id = $1`, [docId])).rows.map(this.coerceItemDocument);
+    return (
+      await this.pool.query<ItemDocumentRow>(`SELECT * FROM item_documents WHERE doc_id = $1`, [
+        docId,
+      ])
+    ).rows.map(this.coerceItemDocument);
   }
 
   async deleteItemDocuments(docId: string): Promise<void> {
@@ -911,26 +1132,35 @@ export class PostgresCacheService implements CacheService {
   }
 
   async batchInsertItemDocuments(items: Omit<ItemDocumentRow, 'id'>[]): Promise<void> {
-    await this.batch(items, (client, item) => client.query(
-      this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
-      this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item)),
-    ));
+    await this.batch(items, (client, item) =>
+      client.query(
+        this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
+        this.valuesFor(ITEM_DOCUMENT_COLUMNS, this.normalizeItemDocument(item))
+      )
+    );
   }
 
   async getPaymentTransactions(docId: string): Promise<PaymentTransactionRow[]> {
-    return (await this.pool.query<PaymentTransactionRow>(
-      `SELECT * FROM payment_transactions WHERE doc_id = $1 ORDER BY transaction_date ASC, transaction_id ASC`,
-      [docId],
-    )).rows.map((row) => this.coercePaymentTransaction(row));
+    return (
+      await this.pool.query<PaymentTransactionRow>(
+        `SELECT * FROM payment_transactions WHERE doc_id = $1 ORDER BY transaction_date ASC, transaction_id ASC`,
+        [docId]
+      )
+    ).rows.map((row) => this.coercePaymentTransaction(row));
   }
 
   async getAllPaymentTransactions(): Promise<PaymentTransactionRow[]> {
-    return (await this.pool.query<PaymentTransactionRow>(
-      `SELECT * FROM payment_transactions ORDER BY transaction_date ASC, transaction_id ASC`,
-    )).rows.map((row) => this.coercePaymentTransaction(row));
+    return (
+      await this.pool.query<PaymentTransactionRow>(
+        `SELECT * FROM payment_transactions ORDER BY transaction_date ASC, transaction_id ASC`
+      )
+    ).rows.map((row) => this.coercePaymentTransaction(row));
   }
 
-  async replacePaymentTransactions(docId: string, transactions: PaymentTransactionRow[]): Promise<void> {
+  async replacePaymentTransactions(
+    docId: string,
+    transactions: PaymentTransactionRow[]
+  ): Promise<void> {
     assertPaymentRowsMatchDocument(docId, transactions);
     assertUniquePaymentTransactionIds(transactions);
     await this.withVerifiedWrite(async (client) => {
@@ -939,7 +1169,7 @@ export class PostgresCacheService implements CacheService {
       for (const transaction of transactions) {
         await client.query(
           this.insertSql('payment_transactions', PAYMENT_TRANSACTION_COLUMNS),
-          this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction)),
+          this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction))
         );
       }
     });
@@ -950,8 +1180,8 @@ export class PostgresCacheService implements CacheService {
     await this.batch(transactions, (client, transaction) =>
       client.query(
         this.insertSql('payment_transactions', PAYMENT_TRANSACTION_COLUMNS),
-        this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction)),
-      ),
+        this.valuesFor(PAYMENT_TRANSACTION_COLUMNS, this.normalizePaymentTransaction(transaction))
+      )
     );
   }
 
@@ -959,21 +1189,36 @@ export class PostgresCacheService implements CacheService {
     await this.withVerifiedWrite(async (client) => {
       await client.query(
         this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'),
-        this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account)),
+        this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account))
       );
     });
   }
 
   async getAccount(accountId: string): Promise<AccountRow | undefined> {
-    return (await this.pool.query<AccountRow>(`SELECT * FROM accounts WHERE account_id = $1`, [accountId])).rows[0];
+    return (
+      await this.pool.query<AccountRow>(`SELECT * FROM accounts WHERE account_id = $1`, [accountId])
+    ).rows[0];
   }
 
-  async getAccountByNumber(contextId: number, accountNumber: number): Promise<AccountRow | undefined> {
-    return (await this.pool.query<AccountRow>(`SELECT * FROM accounts WHERE context_id = $1 AND account_number = $2`, [contextId, accountNumber])).rows[0];
+  async getAccountByNumber(
+    contextId: number,
+    accountNumber: number
+  ): Promise<AccountRow | undefined> {
+    return (
+      await this.pool.query<AccountRow>(
+        `SELECT * FROM accounts WHERE context_id = $1 AND account_number = $2`,
+        [contextId, accountNumber]
+      )
+    ).rows[0];
   }
 
   async getAccountsByName(contextId: number, name: string): Promise<AccountRow[]> {
-    return (await this.pool.query<AccountRow>(`SELECT * FROM accounts WHERE context_id = $1 AND name = $2`, [contextId, name])).rows;
+    return (
+      await this.pool.query<AccountRow>(
+        `SELECT * FROM accounts WHERE context_id = $1 AND name = $2`,
+        [contextId, name]
+      )
+    ).rows;
   }
 
   async getAllAccounts(): Promise<AccountRow[]> {
@@ -981,14 +1226,21 @@ export class PostgresCacheService implements CacheService {
   }
 
   async getAccountsModifiedSince(timestamp: number): Promise<AccountRow[]> {
-    return (await this.pool.query<AccountRow>(`SELECT * FROM accounts WHERE COALESCE(modified, 0) > $1 ORDER BY modified ASC`, [timestamp])).rows;
+    return (
+      await this.pool.query<AccountRow>(
+        `SELECT * FROM accounts WHERE COALESCE(modified, 0) > $1 ORDER BY modified ASC`,
+        [timestamp]
+      )
+    ).rows;
   }
 
   async batchInsertAccounts(accounts: AccountRow[]): Promise<void> {
-    await this.batch(accounts, (client, account) => client.query(
-      this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'),
-      this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account)),
-    ));
+    await this.batch(accounts, (client, account) =>
+      client.query(
+        this.upsertSql('accounts', ACCOUNT_COLUMNS, 'account_id'),
+        this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account))
+      )
+    );
   }
 
   async deleteAccount(accountId: string): Promise<void> {
@@ -1001,14 +1253,15 @@ export class PostgresCacheService implements CacheService {
     await this.withVerifiedWrite(async (client) => {
       await client.query(
         this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
-        this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)),
+        this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item))
       );
       await this.invalidateInventoryAuthority(client);
     });
   }
 
   async getItem(itemId: string): Promise<ItemRow | undefined> {
-    const row = (await this.pool.query<ItemRow>(`SELECT * FROM items WHERE item_id = $1`, [itemId])).rows[0];
+    const row = (await this.pool.query<ItemRow>(`SELECT * FROM items WHERE item_id = $1`, [itemId]))
+      .rows[0];
     return row ? this.coerceItem(row) : undefined;
   }
 
@@ -1017,7 +1270,12 @@ export class PostgresCacheService implements CacheService {
   }
 
   async getItemsModifiedSince(timestamp: number): Promise<ItemRow[]> {
-    return (await this.pool.query<ItemRow>(`SELECT * FROM items WHERE COALESCE(modified, 0) > $1 ORDER BY modified ASC`, [timestamp])).rows.map(this.coerceItem);
+    return (
+      await this.pool.query<ItemRow>(
+        `SELECT * FROM items WHERE COALESCE(modified, 0) > $1 ORDER BY modified ASC`,
+        [timestamp]
+      )
+    ).rows.map(this.coerceItem);
   }
 
   async batchInsertItems(items: ItemRow[]): Promise<void> {
@@ -1026,7 +1284,7 @@ export class PostgresCacheService implements CacheService {
       for (const item of items) {
         await client.query(
           this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
-          this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)),
+          this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item))
         );
       }
       await this.invalidateInventoryAuthority(client);
@@ -1044,25 +1302,35 @@ export class PostgresCacheService implements CacheService {
     await this.withVerifiedWrite(async (client) => {
       await client.query(
         this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
-        this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)),
+        this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row))
       );
       await this.invalidateInventoryAuthority(client);
     });
   }
 
   async getItemStockLocations(itemId: string): Promise<ItemStockLocationRow[]> {
-    return (await this.pool.query<ItemStockLocationRow>(`SELECT * FROM item_stock_locations WHERE item_id = $1`, [itemId])).rows.map(this.coerceStock);
+    return (
+      await this.pool.query<ItemStockLocationRow>(
+        `SELECT * FROM item_stock_locations WHERE item_id = $1`,
+        [itemId]
+      )
+    ).rows.map(this.coerceStock);
   }
 
   async getAllItemStockLocations(): Promise<ItemStockLocationRow[]> {
-    return (await this.pool.query<ItemStockLocationRow>(`SELECT * FROM item_stock_locations`)).rows.map(this.coerceStock);
+    return (
+      await this.pool.query<ItemStockLocationRow>(`SELECT * FROM item_stock_locations`)
+    ).rows.map(this.coerceStock);
   }
 
   async replaceItemStockLocations(itemId: string, rows: ItemStockLocationRow[]): Promise<void> {
     await this.withVerifiedWrite(async (client) => {
       await client.query(`DELETE FROM item_stock_locations WHERE item_id = $1`, [itemId]);
       for (const row of rows) {
-        await client.query(this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'), this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
+        await client.query(
+          this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
+          this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row))
+        );
       }
       await this.invalidateInventoryAuthority(client);
     });
@@ -1074,7 +1342,7 @@ export class PostgresCacheService implements CacheService {
       for (const row of rows) {
         await client.query(
           this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
-          this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)),
+          this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row))
         );
       }
       await this.invalidateInventoryAuthority(client);
@@ -1094,7 +1362,7 @@ export class PostgresCacheService implements CacheService {
 
     await this.withVerifiedWrite(async (client) => {
       const stateResult = await client.query<{ value: string }>(
-        `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`,
+        `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`
       );
       const currentState = this.parseCacheState(stateResult.rows[0]?.value);
 
@@ -1112,20 +1380,20 @@ export class PostgresCacheService implements CacheService {
       for (const item of snapshot.items) {
         await client.query(
           this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
-          this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)),
+          this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item))
         );
       }
       for (const row of snapshot.stockRows) {
         await client.query(
           this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
-          this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)),
+          this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row))
         );
       }
 
       await client.query(
         `INSERT INTO cache_meta (key, value) VALUES ($1, $2)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [INVENTORY_SNAPSHOT_META_KEY, JSON.stringify(snapshot.meta)],
+        [INVENTORY_SNAPSHOT_META_KEY, JSON.stringify(snapshot.meta)]
       );
       const counts = await client.query<{ item_count: string; stock_row_count: string }>(`
         SELECT (SELECT COUNT(*) FROM items) AS item_count,
@@ -1143,12 +1411,13 @@ export class PostgresCacheService implements CacheService {
         stockLocationCount: Number(counts.rows[0]?.stock_row_count ?? snapshot.meta.stockRowCount),
         lastItemSync: snapshot.meta.completedAt,
         lastFullItemSync: snapshot.meta.completedAt,
+        lastSyncAttempt: snapshot.meta.completedAt,
         inventorySourceApiVersion: snapshot.meta.sourceApiVersion,
       };
       await client.query(
         `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [JSON.stringify(nextState)],
+        [JSON.stringify(nextState)]
       );
     });
   }
@@ -1157,9 +1426,9 @@ export class PostgresCacheService implements CacheService {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      const meta = await this.readAuthoritativeInventoryMeta(client);
+      const snapshot = await this.readAuthoritativeInventorySnapshot(client);
       await client.query('COMMIT');
-      return meta;
+      return snapshot?.meta ?? null;
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -1168,7 +1437,27 @@ export class PostgresCacheService implements CacheService {
     }
   }
 
-  async getItemDocumentsForPeriod(itemId: string, startDate: string, endDate: string, contextId: number): Promise<ItemDocumentRow[]> {
+  async getInventorySnapshot(): Promise<InventorySnapshot | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+      const snapshot = await this.readAuthoritativeInventorySnapshot(client);
+      await client.query('COMMIT');
+      return snapshot;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getItemDocumentsForPeriod(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): Promise<ItemDocumentRow[]> {
     const result = await this.pool.query<ItemDocumentRow>(
       `SELECT id.* FROM item_documents id
        JOIN documents d ON d.doc_id = id.doc_id
@@ -1188,7 +1477,12 @@ export class PostgresCacheService implements CacheService {
     return result.rows[0]?.latest_date || undefined;
   }
 
-  async getItemSalesByPeriod(itemId: string, startDate: string, endDate: string, contextId: number): Promise<ItemSalesByPeriodRow[]> {
+  async getItemSalesByPeriod(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): Promise<ItemSalesByPeriodRow[]> {
     const result = await this.pool.query<ItemSalesByPeriodRow>(
       `SELECT d.issue_date, id.quantity, id.price FROM item_documents id
        JOIN documents d ON d.doc_id = id.doc_id
@@ -1196,10 +1490,19 @@ export class PostgresCacheService implements CacheService {
        ORDER BY d.issue_date ASC`,
       [itemId, contextId, startDate, endDate]
     );
-    return result.rows.map((row) => ({ ...row, quantity: Number(row.quantity), price: Number(row.price) }));
+    return result.rows.map((row) => ({
+      ...row,
+      quantity: Number(row.quantity),
+      price: Number(row.price),
+    }));
   }
 
-  async getItemPriceDistribution(itemId: string, startDate: string, endDate: string, contextId: number): Promise<PriceDistributionRow[]> {
+  async getItemPriceDistribution(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): Promise<PriceDistributionRow[]> {
     const result = await this.pool.query<PriceDistributionRow>(
       `SELECT id.price, SUM(ABS(id.quantity)) as total_quantity, SUM(id.quantity * id.price) as total_revenue
        FROM item_documents id JOIN documents d ON d.doc_id = id.doc_id
@@ -1214,7 +1517,12 @@ export class PostgresCacheService implements CacheService {
     }));
   }
 
-  async getItemSalesByCustomer(itemId: string, startDate: string, endDate: string, contextId: number): Promise<CustomerSalesData[]> {
+  async getItemSalesByCustomer(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): Promise<CustomerSalesData[]> {
     const result = await this.pool.query<CustomerSalesData>(
       `SELECT d.customer_id, d.customer_name, SUM(ABS(id.quantity)) as quantity,
               SUM(id.quantity * id.price) as revenue, COUNT(DISTINCT id.doc_id) as order_count
@@ -1232,7 +1540,12 @@ export class PostgresCacheService implements CacheService {
     }));
   }
 
-  async getItemSalesByMonth(itemId: string, startDate: string, endDate: string, contextId: number): Promise<{ month: string; quantity: number; revenue: number }[]> {
+  async getItemSalesByMonth(
+    itemId: string,
+    startDate: string,
+    endDate: string,
+    contextId: number
+  ): Promise<{ month: string; quantity: number; revenue: number }[]> {
     const result = await this.pool.query<{ month: string; quantity: number; revenue: number }>(
       `SELECT to_char(d.issue_date::date, 'YYYY-MM') as month, SUM(ABS(id.quantity)) as quantity,
               SUM(id.quantity * id.price) as revenue
@@ -1241,12 +1554,28 @@ export class PostgresCacheService implements CacheService {
        GROUP BY month ORDER BY month ASC`,
       [itemId, contextId, startDate, endDate]
     );
-    return result.rows.map((row) => ({ month: row.month, quantity: Number(row.quantity), revenue: Number(row.revenue) }));
+    return result.rows.map((row) => ({
+      month: row.month,
+      quantity: Number(row.quantity),
+      revenue: Number(row.revenue),
+    }));
   }
 
-  async getItemOrderPatterns(itemId: string, startDate: string, endDate: string): Promise<{
-    doc_id: string; quantity: number; price: number; issue_date: string; customer_id: string; context_id: number; doc_number: number;
-  }[]> {
+  async getItemOrderPatterns(
+    itemId: string,
+    startDate: string,
+    endDate: string
+  ): Promise<
+    {
+      doc_id: string;
+      quantity: number;
+      price: number;
+      issue_date: string;
+      customer_id: string;
+      context_id: number;
+      doc_number: number;
+    }[]
+  > {
     const result = await this.pool.query<any>(
       `SELECT id.doc_id, id.quantity, id.price, d.issue_date, d.customer_id, d.context_id, d.doc_number
        FROM item_documents id JOIN documents d ON d.doc_id = id.doc_id
@@ -1264,31 +1593,38 @@ export class PostgresCacheService implements CacheService {
   }
 
   async getCacheState(): Promise<CacheState | null> {
-    const result = await this.pool.query<{ value: string }>(`SELECT value FROM cache_meta WHERE key = 'state'`);
-    return result.rows.length ? JSON.parse(result.rows[0].value) as CacheState : null;
+    const result = await this.pool.query<{ value: string }>(
+      `SELECT value FROM cache_meta WHERE key = 'state'`
+    );
+    return result.rows.length ? (JSON.parse(result.rows[0].value) as CacheState) : null;
   }
 
   async setCacheState(state: CacheState): Promise<void> {
     await this.withVerifiedWrite(async (client) => {
       const persistedResult = await client.query<{ value: string }>(
-        `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`,
+        `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`
       );
       const persisted = this.parseCacheState(persistedResult.rows[0]?.value);
-      if (state.schemaVersion === CACHE_SCHEMA_VERSION && persisted?.schemaVersion !== CACHE_SCHEMA_VERSION) {
+      if (
+        state.schemaVersion === CACHE_SCHEMA_VERSION &&
+        persisted?.schemaVersion !== CACHE_SCHEMA_VERSION
+      ) {
         await client.query(`DELETE FROM cache_meta WHERE key = $1`, [CATEGORY_GENERATION_META_KEY]);
         await client.query(`DELETE FROM cache_meta WHERE key = $1`, [INVENTORY_SNAPSHOT_META_KEY]);
       }
       await client.query(
         `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [JSON.stringify(state)],
+        [JSON.stringify(state)]
       );
     });
   }
 
   async getSyncStatus(): Promise<CacheSyncStatus | null> {
-    const result = await this.pool.query<{ value: string }>(`SELECT value FROM cache_meta WHERE key = 'sync_status'`);
-    return result.rows.length ? JSON.parse(result.rows[0].value) as CacheSyncStatus : null;
+    const result = await this.pool.query<{ value: string }>(
+      `SELECT value FROM cache_meta WHERE key = 'sync_status'`
+    );
+    return result.rows.length ? (JSON.parse(result.rows[0].value) as CacheSyncStatus) : null;
   }
 
   async setSyncStatus(status: CacheSyncStatus): Promise<void> {
@@ -1296,14 +1632,17 @@ export class PostgresCacheService implements CacheService {
       await client.query(
         `INSERT INTO cache_meta (key, value) VALUES ('sync_status', $1)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [JSON.stringify(status)],
+        [JSON.stringify(status)]
       );
     });
   }
 
   async getPaymentSyncStatus(): Promise<PaymentSyncStatus | null> {
-    const result = await this.pool.query<{ value: string }>(`SELECT value FROM cache_meta WHERE key = $1`, [PAYMENT_SYNC_STATUS_KEY]);
-    return result.rows.length ? JSON.parse(result.rows[0].value) as PaymentSyncStatus : null;
+    const result = await this.pool.query<{ value: string }>(
+      `SELECT value FROM cache_meta WHERE key = $1`,
+      [PAYMENT_SYNC_STATUS_KEY]
+    );
+    return result.rows.length ? (JSON.parse(result.rows[0].value) as PaymentSyncStatus) : null;
   }
 
   async setPaymentSyncStatus(status: PaymentSyncStatus): Promise<void> {
@@ -1311,7 +1650,7 @@ export class PostgresCacheService implements CacheService {
       await client.query(
         `INSERT INTO cache_meta (key, value) VALUES ($1, $2)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [PAYMENT_SYNC_STATUS_KEY, JSON.stringify(status)],
+        [PAYMENT_SYNC_STATUS_KEY, JSON.stringify(status)]
       );
     });
   }
@@ -1324,7 +1663,7 @@ export class PostgresCacheService implements CacheService {
     try {
       const result = await client.query<{ acquired: boolean }>(
         `SELECT pg_try_advisory_lock(hashtext($1)) AS acquired`,
-        [lockKey],
+        [lockKey]
       );
       if (result.rows[0]?.acquired !== true) {
         client.release();
@@ -1334,7 +1673,9 @@ export class PostgresCacheService implements CacheService {
       this.syncLockClients.set(lockKey, client);
       return true;
     } catch (error) {
-      await client.query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]).catch(() => undefined);
+      await client
+        .query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey])
+        .catch(() => undefined);
       client.release();
       throw error;
     }
@@ -1366,7 +1707,9 @@ export class PostgresCacheService implements CacheService {
   }
 
   async getAccountCount(contextId?: number): Promise<number> {
-    return contextId ? this.count(`SELECT COUNT(*) as count FROM accounts WHERE context_id = $1`, [contextId]) : this.count(`SELECT COUNT(*) as count FROM accounts`);
+    return contextId
+      ? this.count(`SELECT COUNT(*) as count FROM accounts WHERE context_id = $1`, [contextId])
+      : this.count(`SELECT COUNT(*) as count FROM accounts`);
   }
 
   async getItemCount(): Promise<number> {
@@ -1429,10 +1772,10 @@ export class PostgresCacheService implements CacheService {
 
   private async invalidateInventoryAuthority(
     client: PoolClient,
-    persistState = true,
+    persistState = true
   ): Promise<CacheState | null> {
     const stateResult = await client.query<{ value: string }>(
-      `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`,
+      `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`
     );
     const currentState = this.parseCacheState(stateResult.rows[0]?.value);
     await client.query(`DELETE FROM cache_meta WHERE key = $1`, [INVENTORY_SNAPSHOT_META_KEY]);
@@ -1444,21 +1787,23 @@ export class PostgresCacheService implements CacheService {
       await client.query(
         `INSERT INTO cache_meta (key, value) VALUES ('state', $1)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [JSON.stringify(nextState)],
+        [JSON.stringify(nextState)]
       );
     }
     return nextState;
   }
 
   private async acquireDatabaseWriteLock(client: PoolClient): Promise<void> {
-    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [DB_WRITE_LOCK_KEY]);
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [
+      DB_WRITE_LOCK_KEY,
+    ]);
   }
 
   private requireExpectedBinding(): CacheAccountBinding {
     if (!this.expectedBinding) {
       throw new Error(
-        'PostgreSQL cache writes require an explicit SalesBinder account binding. '
-        + 'Call ensureAccountBinding with the configured subdomain before writing.'
+        'PostgreSQL cache writes require an explicit SalesBinder account binding. ' +
+          'Call ensureAccountBinding with the configured subdomain before writing.'
       );
     }
     return this.expectedBinding;
@@ -1470,7 +1815,7 @@ export class PostgresCacheService implements CacheService {
 
   private async readBinding(
     executor: QueryExecutor,
-    forUpdate: boolean,
+    forUpdate: boolean
   ): Promise<CacheAccountBinding | null> {
     const result = await executor.query<{
       account_identity: string;
@@ -1482,26 +1827,35 @@ export class PostgresCacheService implements CacheService {
       WHERE id = 1${forUpdate ? ' FOR UPDATE' : ''}
     `);
     const row = result.rows[0];
-    return row ? {
-      accountIdentity: row.account_identity,
-      accountSubdomain: row.account_subdomain,
-      createdAt: Number(row.created_at),
-    } : null;
+    return row
+      ? {
+          accountIdentity: row.account_identity,
+          accountSubdomain: row.account_subdomain,
+          createdAt: Number(row.created_at),
+        }
+      : null;
   }
 
   private async databaseContainsPayloadRows(executor: QueryExecutor): Promise<boolean> {
     const payloadTables = [
-      'accounts', 'documents', 'item_documents', 'items', 'item_stock_locations',
-      'payment_transactions', 'categories', 'category_cache_meta', 'cache_meta',
+      'accounts',
+      'documents',
+      'item_documents',
+      'items',
+      'item_stock_locations',
+      'payment_transactions',
+      'categories',
+      'category_cache_meta',
+      'cache_meta',
     ] as const;
     for (const table of payloadTables) {
       const relation = await executor.query<{ relation: string | null }>(
         `SELECT to_regclass($1)::TEXT AS relation`,
-        [table],
+        [table]
       );
       if (!relation.rows[0]?.relation) continue;
       const populated = await executor.query<{ populated: boolean }>(
-        `SELECT EXISTS (SELECT 1 FROM ${table} LIMIT 1) AS populated`,
+        `SELECT EXISTS (SELECT 1 FROM ${table} LIMIT 1) AS populated`
       );
       if (populated.rows[0]?.populated === true) return true;
     }
@@ -1510,22 +1864,22 @@ export class PostgresCacheService implements CacheService {
 
   private assertMatchingBinding(
     persisted: CacheAccountBinding | null,
-    expected: CacheAccountBinding,
+    expected: CacheAccountBinding
   ): void {
     if (
-      !persisted
-      || persisted.accountIdentity !== expected.accountIdentity
-      || persisted.accountSubdomain !== expected.accountSubdomain
+      !persisted ||
+      persisted.accountIdentity !== expected.accountIdentity ||
+      persisted.accountSubdomain !== expected.accountSubdomain
     ) {
       throw new Error(
-        `PostgreSQL cache database is not bound to ${expected.accountIdentity}. `
-        + 'Use the matching database or rebuild a fresh database for this SalesBinder account.'
+        `PostgreSQL cache database is not bound to ${expected.accountIdentity}. ` +
+          'Use the matching database or rebuild a fresh database for this SalesBinder account.'
       );
     }
   }
 
   private async readAuthoritativeCategoryMeta(
-    executor: QueryExecutor,
+    executor: QueryExecutor
   ): Promise<CategoryCacheMeta | null> {
     const result = await executor.query<{
       snapshot_value: string;
@@ -1533,7 +1887,8 @@ export class PostgresCacheService implements CacheService {
       state_value: string | null;
       account_identity: string;
       account_subdomain: string;
-    }>(`
+    }>(
+      `
       SELECT snapshot.value AS snapshot_value,
              marker.value AS marker_value,
              state.value AS state_value,
@@ -1544,26 +1899,45 @@ export class PostgresCacheService implements CacheService {
       LEFT JOIN cache_meta AS marker ON marker.key = $2
       LEFT JOIN cache_meta AS state ON state.key = 'state'
       WHERE snapshot.key = $1
-    `, [CATEGORY_SNAPSHOT_META_KEY, CATEGORY_GENERATION_META_KEY]);
+    `,
+      [CATEGORY_SNAPSHOT_META_KEY, CATEGORY_GENERATION_META_KEY]
+    );
     const row = result.rows[0];
     if (!row) return null;
 
     const meta = this.parseCategoryMeta(row.snapshot_value);
     const state = this.parseCacheState(row.state_value);
     if (
-      !meta
-      || state?.schemaVersion !== CACHE_SCHEMA_VERSION
-      || row.marker_value !== meta.generation
-      || row.account_identity !== meta.accountIdentity
-      || (this.expectedBinding && row.account_identity !== this.expectedBinding.accountIdentity)
+      !meta ||
+      state?.schemaVersion !== CACHE_SCHEMA_VERSION ||
+      row.marker_value !== meta.generation ||
+      row.account_identity !== meta.accountIdentity ||
+      (this.expectedBinding && row.account_identity !== this.expectedBinding.accountIdentity)
     ) {
       return null;
     }
     return meta;
   }
 
+  private async readAuthoritativeCategorySnapshot(
+    executor: QueryExecutor
+  ): Promise<CategorySnapshot | null> {
+    const meta = await this.readAuthoritativeCategoryMeta(executor);
+    if (!meta) return null;
+    const rows = (
+      await executor.query<CategoryCacheRow>(
+        `SELECT ${CATEGORY_COLUMNS.join(', ')} FROM categories ORDER BY category_id`
+      )
+    ).rows.map((row) => this.coerceCategory(row));
+    return rows.length === meta.storedRowCount &&
+      this.categorySnapshotRowsIssue(rows, meta.sourceApiVersion) === null &&
+      createCategoryFingerprint(meta, rows, CACHE_SCHEMA_VERSION) === meta.fingerprint
+      ? { rows, meta }
+      : null;
+  }
+
   private async readAuthoritativeInventoryMeta(
-    executor: QueryExecutor,
+    executor: QueryExecutor
   ): Promise<InventoryCacheMeta | null> {
     const result = await executor.query<{
       snapshot_value: string;
@@ -1571,36 +1945,82 @@ export class PostgresCacheService implements CacheService {
       account_identity: string;
       item_count: string;
       stock_row_count: string;
-    }>(`
+      api_item_count: string;
+      api_stock_row_count: string;
+    }>(
+      `
       SELECT snapshot.value AS snapshot_value,
              state.value AS state_value,
              binding.account_identity,
              (SELECT COUNT(*) FROM items
                WHERE cache_source = 'api' AND source_api_version = '3') AS item_count,
              (SELECT COUNT(*) FROM item_stock_locations
-               WHERE cache_source = 'api' AND source_api_version = '3') AS stock_row_count
+               WHERE cache_source = 'api' AND source_api_version = '3') AS stock_row_count,
+             (SELECT COUNT(*) FROM items
+               WHERE cache_source = 'api') AS api_item_count,
+             (SELECT COUNT(*) FROM item_stock_locations
+               WHERE cache_source = 'api') AS api_stock_row_count
       FROM cache_meta AS snapshot
       JOIN cache_account_binding AS binding ON binding.id = 1
       LEFT JOIN cache_meta AS state ON state.key = 'state'
       WHERE snapshot.key = $1
-    `, [INVENTORY_SNAPSHOT_META_KEY]);
+    `,
+      [INVENTORY_SNAPSHOT_META_KEY]
+    );
     const row = result.rows[0];
     if (!row) return null;
 
     const meta = this.parseInventoryMeta(row.snapshot_value);
     const state = this.parseCacheState(row.state_value);
     if (
-      !meta
-      || state?.schemaVersion !== CACHE_SCHEMA_VERSION
-      || state.inventorySourceApiVersion !== '3'
-      || row.account_identity !== meta.accountIdentity
-      || (this.expectedBinding && row.account_identity !== this.expectedBinding.accountIdentity)
-      || Number(row.item_count) !== meta.itemCount
-      || Number(row.stock_row_count) !== meta.stockRowCount
+      !meta ||
+      state?.schemaVersion !== CACHE_SCHEMA_VERSION ||
+      state.inventorySourceApiVersion !== '3' ||
+      row.account_identity !== meta.accountIdentity ||
+      (this.expectedBinding && row.account_identity !== this.expectedBinding.accountIdentity) ||
+      Number(row.item_count) !== meta.itemCount ||
+      Number(row.stock_row_count) !== meta.stockRowCount ||
+      Number(row.api_item_count) !== meta.itemCount ||
+      Number(row.api_stock_row_count) !== meta.stockRowCount
     ) {
       return null;
     }
     return meta;
+  }
+
+  private async readAuthoritativeInventorySnapshot(
+    executor: QueryExecutor
+  ): Promise<InventorySnapshot | null> {
+    const meta = await this.readAuthoritativeInventoryMeta(executor);
+    if (!meta) return null;
+    const items = (
+      await executor.query<ItemRow>(`
+      SELECT ${ITEM_COLUMNS.join(', ')} FROM items
+      WHERE cache_source = 'api' AND source_api_version = '3'
+      ORDER BY item_id
+    `)
+    ).rows.map((row) => this.coerceItem(row));
+    const stockRows = (
+      await executor.query<ItemStockLocationRow>(`
+      SELECT ${STOCK_COLUMNS.join(', ')} FROM item_stock_locations
+      WHERE cache_source = 'api' AND source_api_version = '3'
+      ORDER BY stock_row_id
+    `)
+    ).rows.map((row) => this.coerceStock(row));
+    if (
+      items.length !== meta.itemCount ||
+      stockRows.length !== meta.stockRowCount ||
+      inventorySnapshotRowsIssue(items, stockRows) !== null
+    ) {
+      return null;
+    }
+    try {
+      return inventorySnapshotFingerprintMatches(meta, items, stockRows)
+        ? { items, stockRows, meta }
+        : null;
+    } catch {
+      return null;
+    }
   }
 
   private parseCacheState(value: string | null | undefined): CacheState | null {
@@ -1609,7 +2029,7 @@ export class PostgresCacheService implements CacheService {
       const parsed = JSON.parse(value) as unknown;
       if (!parsed || typeof parsed !== 'object') return null;
       const state = parsed as Partial<CacheState>;
-      return Number.isSafeInteger(state.schemaVersion) ? state as CacheState : null;
+      return Number.isSafeInteger(state.schemaVersion) ? (state as CacheState) : null;
     } catch {
       return null;
     }
@@ -1619,26 +2039,43 @@ export class PostgresCacheService implements CacheService {
     try {
       const parsed = JSON.parse(value) as Partial<CategoryCacheMeta>;
       const exactKeys = [
-        'accountIdentity', 'completedAt', 'count', 'fingerprint', 'generation', 'page',
-        'pages', 'schemaVersion', 'sourceApiVersion', 'sourceRowCount', 'startedAt', 'status',
-        'storedRowCount', 'version',
+        'accountIdentity',
+        'completedAt',
+        'count',
+        'fingerprint',
+        'generation',
+        'page',
+        'pages',
+        'schemaVersion',
+        'sourceApiVersion',
+        'sourceRowCount',
+        'startedAt',
+        'status',
+        'storedRowCount',
+        'version',
       ];
       const integerFields = [
-        parsed.startedAt, parsed.completedAt, parsed.count, parsed.page, parsed.pages,
-        parsed.sourceRowCount, parsed.storedRowCount,
+        parsed.startedAt,
+        parsed.completedAt,
+        parsed.count,
+        parsed.page,
+        parsed.pages,
+        parsed.sourceRowCount,
+        parsed.storedRowCount,
       ];
       if (
-        !parsed || typeof parsed !== 'object'
-        || !this.hasExactKeys(parsed, exactKeys)
-        || parsed.version !== 1
-        || parsed.status !== 'complete'
-        || parsed.schemaVersion !== CACHE_SCHEMA_VERSION
-        || (parsed.sourceApiVersion !== '2.0' && parsed.sourceApiVersion !== '3')
-        || typeof parsed.accountIdentity !== 'string'
-        || typeof parsed.generation !== 'string' || parsed.generation.length === 0
-        || typeof parsed.fingerprint !== 'string' || parsed.fingerprint.length === 0
-        || integerFields.some((number) => !Number.isSafeInteger(number) || (number as number) < 0)
-        || (parsed.completedAt as number) < (parsed.startedAt as number)
+        !parsed ||
+        typeof parsed !== 'object' ||
+        !this.hasExactKeys(parsed, exactKeys) ||
+        parsed.version !== 1 ||
+        parsed.status !== 'complete' ||
+        parsed.schemaVersion !== CACHE_SCHEMA_VERSION ||
+        (parsed.sourceApiVersion !== '2.0' && parsed.sourceApiVersion !== '3') ||
+        !isNonEmptyText(parsed.accountIdentity) ||
+        !isNonEmptyText(parsed.generation) ||
+        !isNonEmptyText(parsed.fingerprint) ||
+        integerFields.some((number) => !Number.isSafeInteger(number) || (number as number) < 0) ||
+        (parsed.completedAt as number) < (parsed.startedAt as number)
       ) {
         return null;
       }
@@ -1650,30 +2087,13 @@ export class PostgresCacheService implements CacheService {
 
   private parseInventoryMeta(value: string): InventoryCacheMeta | null {
     try {
-      const parsed = JSON.parse(value) as Partial<InventoryCacheMeta>;
-      const exactKeys = [
-        'accountIdentity', 'completedAt', 'fingerprint', 'generation', 'itemCount',
-        'schemaVersion', 'sourceApiVersion', 'startedAt', 'status', 'stockRowCount', 'version',
-      ];
-      if (
-        !parsed || typeof parsed !== 'object'
-        || !this.hasExactKeys(parsed, exactKeys)
-        || parsed.version !== 1
-        || parsed.status !== 'complete'
-        || parsed.schemaVersion !== CACHE_SCHEMA_VERSION
-        || parsed.sourceApiVersion !== '3'
-        || typeof parsed.accountIdentity !== 'string' || parsed.accountIdentity.length === 0
-        || typeof parsed.generation !== 'string' || parsed.generation.length === 0
-        || typeof parsed.fingerprint !== 'string' || parsed.fingerprint.length === 0
-        || !Number.isSafeInteger(parsed.startedAt) || (parsed.startedAt as number) < 0
-        || !Number.isSafeInteger(parsed.completedAt) || (parsed.completedAt as number) < 0
-        || !Number.isSafeInteger(parsed.itemCount) || (parsed.itemCount as number) < 0
-        || !Number.isSafeInteger(parsed.stockRowCount) || (parsed.stockRowCount as number) < 0
-        || (parsed.completedAt as number) < (parsed.startedAt as number)
-      ) {
-        return null;
-      }
-      return parsed as InventoryCacheMeta;
+      const parsed = parseInventoryCacheMeta(JSON.parse(value));
+      return parsed &&
+        isNonEmptyText(parsed.accountIdentity) &&
+        isNonEmptyText(parsed.generation) &&
+        isNonEmptyText(parsed.fingerprint)
+        ? parsed
+        : null;
     } catch {
       return null;
     }
@@ -1682,125 +2102,106 @@ export class PostgresCacheService implements CacheService {
   private assertValidCategorySnapshot(snapshot: CategorySnapshot, accountIdentity: string): void {
     const meta = this.parseCategoryMeta(JSON.stringify(snapshot.meta));
     if (
-      !meta
-      || meta.accountIdentity !== accountIdentity
-      || meta.sourceRowCount !== snapshot.rows.length
-      || meta.storedRowCount !== snapshot.rows.length
-      || meta.count !== snapshot.rows.length
+      !meta ||
+      meta.accountIdentity !== accountIdentity ||
+      meta.sourceRowCount !== snapshot.rows.length ||
+      meta.storedRowCount !== snapshot.rows.length ||
+      meta.count !== snapshot.rows.length
     ) {
-      throw new Error('Category snapshot metadata does not match the bound account or validated rows.');
+      throw new Error(
+        'Category snapshot metadata does not match the bound account or validated rows.'
+      );
     }
-    const expectedRowKeys = [
-      'cache_source', 'category_id', 'created', 'custom_fields_json', 'imported_at',
-      'inventory_type', 'item_count', 'modified', 'name', 'parent_id',
-      'parent_name', 'source_api_version',
-    ];
+    const rowIssue = this.categorySnapshotRowsIssue(snapshot.rows, snapshot.meta.sourceApiVersion);
+    if (rowIssue === 'row') {
+      throw new Error('Category snapshot contains an invalid or duplicate category row.');
+    }
+    if (rowIssue === 'parent') {
+      throw new Error(
+        'Category snapshot parent names must be derived from the same validated snapshot.'
+      );
+    }
+    if (createCategoryFingerprint(meta, snapshot.rows, CACHE_SCHEMA_VERSION) !== meta.fingerprint) {
+      throw new Error('Category snapshot fingerprint does not match its validated rows.');
+    }
+  }
+
+  private categorySnapshotRowsIssue(
+    rows: CategoryCacheRow[],
+    sourceApiVersion: CategoryCacheMeta['sourceApiVersion']
+  ): 'row' | 'parent' | null {
     const ids = new Set<string>();
     const names = new Map<string, string>();
-    for (const row of snapshot.rows) {
+    for (const row of rows) {
       if (
-        !row || typeof row !== 'object'
-        || !this.hasExactKeys(row, expectedRowKeys)
-        || typeof row.category_id !== 'string'
-        || typeof row.name !== 'string'
-        || !row.category_id.trim()
-        || !row.name.trim()
-        || row.category_id.includes('\0')
-        || row.name.includes('\0')
-        || ids.has(row.category_id)
-        || row.cache_source !== 'api'
-        || (row.source_api_version !== '2.0' && row.source_api_version !== '3')
-        || (row.inventory_type !== null
-          && row.inventory_type !== 'quantity' && row.inventory_type !== 'unique')
-        || (row.custom_fields_json !== null
-          && (typeof row.custom_fields_json !== 'string'
-            || row.custom_fields_json.includes('\0')))
-        || !Number.isSafeInteger(row.imported_at) || row.imported_at < 0
-        || (row.item_count !== null
-          && (!Number.isSafeInteger(row.item_count) || row.item_count < 0))
-        || (row.parent_id !== null
-          && (typeof row.parent_id !== 'string' || row.parent_id.trim().length === 0
-            || row.parent_id.includes('\0')))
-        || (row.parent_name !== null
-          && (typeof row.parent_name !== 'string' || row.parent_name.trim().length === 0
-            || row.parent_name.includes('\0')))
-        || (row.created !== null
-          && (typeof row.created !== 'string' || row.created.includes('\0')))
-        || (row.modified !== null
-          && (!Number.isSafeInteger(row.modified) || row.modified < 0))
+        !row ||
+        typeof row !== 'object' ||
+        !this.hasExactKeys(row, CATEGORY_COLUMNS) ||
+        !isCanonicalV3SourceId(row.category_id) ||
+        !isNonEmptyText(row.name) ||
+        !row.name.trim() ||
+        ids.has(row.category_id) ||
+        row.cache_source !== 'api' ||
+        row.source_api_version !== sourceApiVersion ||
+        (row.inventory_type !== null &&
+          row.inventory_type !== 'quantity' &&
+          row.inventory_type !== 'unique') ||
+        (row.custom_fields_json !== null && !isTextWithoutNullByte(row.custom_fields_json)) ||
+        !Number.isSafeInteger(row.imported_at) ||
+        row.imported_at < 0 ||
+        (row.item_count !== null && !isNonNegativePostgresInteger(row.item_count)) ||
+        (row.parent_id !== null && !isCanonicalV3SourceId(row.parent_id)) ||
+        (row.parent_name !== null &&
+          (!isNonEmptyText(row.parent_name) || row.parent_name.trim().length === 0)) ||
+        (row.created !== null && !isTextWithoutNullByte(row.created)) ||
+        (row.modified !== null && (!Number.isSafeInteger(row.modified) || row.modified < 0))
       ) {
-        throw new Error('Category snapshot contains an invalid or duplicate category row.');
+        return 'row';
       }
       ids.add(row.category_id);
       names.set(row.category_id, row.name);
     }
-    for (const row of snapshot.rows) {
-      const expectedParentName = row.parent_id ? names.get(row.parent_id) ?? null : null;
-      if (row.parent_name !== expectedParentName) {
-        throw new Error('Category snapshot parent names must be derived from the same validated snapshot.');
-      }
+    for (const row of rows) {
+      const expectedParentName = row.parent_id ? (names.get(row.parent_id) ?? null) : null;
+      if (row.parent_name !== expectedParentName) return 'parent';
     }
+    return null;
   }
 
   private assertValidInventorySnapshot(snapshot: InventorySnapshot, accountIdentity: string): void {
     const meta = this.parseInventoryMeta(JSON.stringify(snapshot.meta));
     if (
-      !meta
-      || meta.accountIdentity !== accountIdentity
-      || meta.itemCount !== snapshot.items.length
-      || meta.stockRowCount !== snapshot.stockRows.length
+      !meta ||
+      meta.accountIdentity !== accountIdentity ||
+      meta.itemCount !== snapshot.items.length ||
+      meta.stockRowCount !== snapshot.stockRows.length
     ) {
-      throw new Error('Inventory snapshot metadata does not match the bound account or validated rows.');
+      throw new Error(
+        'Inventory snapshot metadata does not match the bound account or validated rows.'
+      );
     }
 
-    const itemIds = new Set<string>();
-    for (const item of snapshot.items) {
-      if (
-        !item || typeof item !== 'object'
-        || typeof item.item_id !== 'string' || item.item_id.length === 0 || item.item_id.includes('\0')
-        || typeof item.name !== 'string' || item.name.length === 0 || item.name.includes('\0')
-        || itemIds.has(item.item_id)
-        || item.cache_source !== 'api'
-        || item.source_api_version !== '3'
-        || !this.isFiniteNumber(item.quantity)
-      ) {
-        throw new Error('Inventory snapshot contains an invalid or duplicate item row.');
-      }
-      itemIds.add(item.item_id);
+    const rowIssue = inventorySnapshotRowsIssue(snapshot.items, snapshot.stockRows);
+    if (rowIssue === 'item') {
+      throw new Error('Inventory snapshot contains an invalid or duplicate item row.');
     }
-
-    const stockIds = new Set<string>();
-    for (const row of snapshot.stockRows) {
-      if (
-        !row || typeof row !== 'object'
-        || typeof row.stock_row_id !== 'string' || row.stock_row_id.length === 0
-        || row.stock_row_id.includes('\0') || stockIds.has(row.stock_row_id)
-        || typeof row.item_id !== 'string' || !itemIds.has(row.item_id)
-        || row.cache_source !== 'api'
-        || row.source_api_version !== '3'
-        || !this.isFiniteNumber(row.quantity_on_hand)
-        || !this.isNullableFiniteNumber(row.quantity_reserved)
-        || !this.isNullableFiniteNumber(row.quantity_available)
-        || !this.isNullableFiniteNumber(row.quantity_incoming)
-        || !this.isNullableFiniteNumber(row.in_transit)
-      ) {
-        throw new Error('Inventory snapshot contains an invalid or duplicate stock row.');
-      }
-      stockIds.add(row.stock_row_id);
+    if (rowIssue === 'stock') {
+      throw new Error('Inventory snapshot contains an invalid or duplicate stock row.');
+    }
+    if (rowIssue === 'coverage') {
+      throw new Error('Inventory snapshot must include at least one stock row for every item.');
+    }
+    if (!inventorySnapshotFingerprintMatches(meta, snapshot.items, snapshot.stockRows)) {
+      throw new Error('Inventory snapshot fingerprint does not match its validated rows.');
     }
   }
 
-  private isFiniteNumber(value: unknown): value is number {
-    return typeof value === 'number' && Number.isFinite(value);
-  }
-
-  private isNullableFiniteNumber(value: unknown): value is number | null {
-    return value === null || this.isFiniteNumber(value);
-  }
-
-  private hasExactKeys(value: object, keys: string[]): boolean {
+  private hasExactKeys(value: object, keys: readonly string[]): boolean {
     const actual = Object.keys(value).sort();
-    return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
+    const expected = [...keys].sort();
+    return (
+      actual.length === expected.length && actual.every((key, index) => key === expected[index])
+    );
   }
 
   private async count(sql: string, params: unknown[] = []): Promise<number> {
@@ -1815,9 +2216,11 @@ export class PostgresCacheService implements CacheService {
   private upsertSql(table: string, columns: readonly string[], conflictColumn: string): string {
     const updates = columns
       .filter((column) => column !== conflictColumn)
-      .map((column) => column === 'archived' && (table === 'documents' || table === 'items')
-        ? `${column} = COALESCE(EXCLUDED.${column}, ${table}.${column})`
-        : `${column} = EXCLUDED.${column}`)
+      .map((column) =>
+        column === 'archived' && (table === 'documents' || table === 'items')
+          ? `${column} = COALESCE(EXCLUDED.${column}, ${table}.${column})`
+          : `${column} = EXCLUDED.${column}`
+      )
       .join(', ');
     return `${this.insertSql(table, columns)} ON CONFLICT (${conflictColumn}) DO UPDATE SET ${updates}`;
   }
@@ -1838,7 +2241,7 @@ export class PostgresCacheService implements CacheService {
 
   private async batch<T>(
     rows: T[],
-    run: (client: PoolClient, row: T) => Promise<unknown>,
+    run: (client: PoolClient, row: T) => Promise<unknown>
   ): Promise<void> {
     if (rows.length === 0) return;
     await this.withVerifiedWrite(async (client) => {
@@ -1862,21 +2265,33 @@ export class PostgresCacheService implements CacheService {
 
   private async normalizeDocumentForWrite(
     doc: DocumentRow,
-    executor: QueryExecutor,
+    executor: QueryExecutor
   ): Promise<Record<string, unknown>> {
-    let existing: { doc_id: string } | undefined;
-    if (doc.api_doc_id) {
-      existing = (await executor.query<{ doc_id: string }>(
-        `SELECT doc_id FROM documents WHERE api_doc_id = $1`,
-        [doc.api_doc_id]
-      )).rows[0];
-    }
-    if (!existing) {
-      existing = (await executor.query<{ doc_id: string }>(
-        `SELECT doc_id FROM documents WHERE context_id = $1 AND doc_number = $2`,
+    assertWellFormedDocumentApiId(doc.api_doc_id);
+    const existingByApiId = doc.api_doc_id
+      ? (
+          await executor.query<DocumentIdentityRow>(
+            `SELECT doc_id, api_doc_id FROM documents WHERE api_doc_id = $1`,
+            [doc.api_doc_id]
+          )
+        ).rows[0]
+      : undefined;
+    const existingByNumber = (
+      await executor.query<DocumentIdentityRow>(
+        `SELECT doc_id, api_doc_id FROM documents WHERE context_id = $1 AND doc_number = $2`,
         [doc.context_id, doc.doc_number]
-      )).rows[0];
+      )
+    ).rows[0];
+    assertWellFormedStoredDocumentIdentity(existingByApiId);
+    assertWellFormedStoredDocumentIdentity(existingByNumber);
+    if (
+      (existingByApiId && existingByNumber && existingByApiId.doc_id !== existingByNumber.doc_id) ||
+      (existingByApiId && existingByApiId.api_doc_id !== doc.api_doc_id) ||
+      (existingByNumber?.api_doc_id != null && existingByNumber.api_doc_id !== doc.api_doc_id)
+    ) {
+      throw new Error('Cache document identity conflict.');
     }
+    const existing = existingByApiId ?? existingByNumber;
     return this.normalizeDocument(existing ? { ...doc, doc_id: existing.doc_id } : doc);
   }
 
@@ -1885,7 +2300,11 @@ export class PostgresCacheService implements CacheService {
   }
 
   private normalizeAccount(account: AccountRow): Record<string, unknown> {
-    return { ...account, archived: account.archived ?? 0, cache_source: account.cache_source ?? 'api' };
+    return {
+      ...account,
+      archived: account.archived ?? 0,
+      cache_source: account.cache_source ?? 'api',
+    };
   }
 
   private normalizeItem(item: ItemRow): Record<string, unknown> {
@@ -1935,6 +2354,8 @@ export class PostgresCacheService implements CacheService {
   private coerceItem(row: ItemRow): ItemRow {
     return {
       ...row,
+      modified: row.modified == null ? null : Number(row.modified),
+      imported_at: row.imported_at == null ? null : Number(row.imported_at),
       quantity: row.quantity == null ? null : Number(row.quantity),
       quantity_reserved: row.quantity_reserved == null ? null : Number(row.quantity_reserved),
       quantity_available: row.quantity_available == null ? null : Number(row.quantity_available),
@@ -1950,6 +2371,7 @@ export class PostgresCacheService implements CacheService {
   private coerceStock(row: ItemStockLocationRow): ItemStockLocationRow {
     return {
       ...row,
+      imported_at: row.imported_at == null ? null : Number(row.imported_at),
       quantity_on_hand: Number(row.quantity_on_hand),
       quantity_reserved: row.quantity_reserved == null ? null : Number(row.quantity_reserved),
       quantity_available: row.quantity_available == null ? null : Number(row.quantity_available),
@@ -1979,3 +2401,262 @@ export class PostgresCacheService implements CacheService {
     };
   }
 }
+
+interface DocumentIdentityRow {
+  doc_id: string;
+  api_doc_id: string | null;
+}
+
+const assertWellFormedDocumentApiId = (value: unknown): void => {
+  if (value != null && (typeof value !== 'string' || hasUnpairedUtf16Surrogate(value))) {
+    throw new Error('Document API identity is invalid.');
+  }
+};
+
+const assertWellFormedStoredDocumentIdentity = (value: DocumentIdentityRow | undefined): void => {
+  if (
+    value &&
+    (typeof value.doc_id !== 'string' ||
+      value.doc_id.length === 0 ||
+      (value.api_doc_id !== null &&
+        (typeof value.api_doc_id !== 'string' || hasUnpairedUtf16Surrogate(value.api_doc_id))))
+  ) {
+    throw new Error('Cached document identity is invalid.');
+  }
+};
+
+type InventorySnapshotRowsIssue = 'item' | 'stock' | 'coverage';
+
+const inventorySnapshotRowsIssue = (
+  items: ItemRow[],
+  stockRows: ItemStockLocationRow[]
+): InventorySnapshotRowsIssue | null => {
+  const itemsById = new Map<string, ItemRow>();
+  for (const item of items) {
+    if (!isInventoryItemRow(item) || itemsById.has(item.item_id)) return 'item';
+    itemsById.set(item.item_id, item);
+  }
+
+  const stockIds = new Set<string>();
+  const coveredItemIds = new Set<string>();
+  const rowKindsByItem = new Map<string, { parent: number; variation: number }>();
+  const rowKindsByVariation = new Map<string, { aggregate: number; detail: number }>();
+  for (const row of stockRows) {
+    const parent = itemsById.get(row.item_id);
+    if (
+      !isInventoryStockRow(row) ||
+      stockIds.has(row.stock_row_id) ||
+      !parent ||
+      !stockRowMatchesParent(row, parent)
+    ) {
+      return 'stock';
+    }
+    stockIds.add(row.stock_row_id);
+    coveredItemIds.add(row.item_id);
+    const rowKinds = rowKindsByItem.get(row.item_id) ?? { parent: 0, variation: 0 };
+    if (row.variation_id == null) {
+      rowKinds.parent += 1;
+    } else {
+      rowKinds.variation += 1;
+      const variationKey = `${row.item_id}\0${row.variation_id}`;
+      const variationKinds = rowKindsByVariation.get(variationKey) ?? {
+        aggregate: 0,
+        detail: 0,
+      };
+      if (row.variation_location_id == null) variationKinds.aggregate += 1;
+      else variationKinds.detail += 1;
+      rowKindsByVariation.set(variationKey, variationKinds);
+    }
+    rowKindsByItem.set(row.item_id, rowKinds);
+  }
+  if (![...itemsById.keys()].every((itemId) => coveredItemIds.has(itemId))) return 'coverage';
+  const hasValidItemTopology = [...rowKindsByItem.values()].every(
+    ({ parent, variation }) => (parent === 1 && variation === 0) || (parent === 0 && variation > 0)
+  );
+  const hasValidVariationTopology = [...rowKindsByVariation.values()].every(
+    ({ aggregate, detail }) => (aggregate === 1 && detail === 0) || (aggregate === 0 && detail > 0)
+  );
+  return hasValidItemTopology && hasValidVariationTopology ? null : 'stock';
+};
+
+const stockRowMatchesParent = (row: ItemStockLocationRow, parent: ItemRow): boolean =>
+  nullableValuesEqual(row.item_number, parent.item_number) &&
+  nullableValuesEqual(row.category_name, parent.category_name) &&
+  nullableValuesEqual(row.price, parent.price) &&
+  nullableValuesEqual(row.cost, parent.cost) &&
+  (row.variation_id != null ||
+    (nullableValuesEqual(row.quantity_on_hand, parent.quantity) &&
+      nullableValuesEqual(row.quantity_reserved, parent.quantity_reserved) &&
+      nullableValuesEqual(row.quantity_available, parent.quantity_available) &&
+      nullableValuesEqual(row.quantity_incoming, parent.quantity_incoming) &&
+      nullableValuesEqual(row.in_transit, parent.in_transit) &&
+      nullableValuesEqual(row.barcode, parent.barcode)));
+
+const nullableValuesEqual = (left: unknown, right: unknown): boolean =>
+  (left ?? null) === (right ?? null);
+
+const isInventoryItemRow = (value: unknown): value is ItemRow => {
+  if (!isRecord(value)) return false;
+  return (
+    isCanonicalV3SourceId(value.item_id) &&
+    isNonEmptyText(value.name) &&
+    hasOnlyNullableTextWithoutNullBytes(value, INVENTORY_ITEM_TEXT_FIELDS) &&
+    isNullableCanonicalV3SourceId(value.category_id) &&
+    isFiniteNumber(value.quantity) &&
+    hasOnlyFiniteNullableNumbers(value, INVENTORY_ITEM_NUMERIC_FIELDS) &&
+    isNullableNonNegativePostgresInteger(value.item_number) &&
+    isNullableBinaryFlag(value.published) &&
+    isNullableBinaryFlag(value.archived) &&
+    isNullableNonNegativeInteger(value.modified) &&
+    isNullableNonNegativeInteger(value.imported_at) &&
+    value.cache_source === 'api' &&
+    value.source_api_version === '3'
+  );
+};
+
+const isInventoryStockRow = (value: unknown): value is ItemStockLocationRow => {
+  if (!isRecord(value)) return false;
+  return (
+    isCanonicalV3SourceId(value.stock_row_id) &&
+    isCanonicalV3SourceId(value.item_id) &&
+    hasOnlyNullableTextWithoutNullBytes(value, INVENTORY_STOCK_TEXT_FIELDS) &&
+    isNullableCanonicalV3SourceId(value.variation_id) &&
+    isNullableCanonicalV3SourceId(value.variation_location_id) &&
+    isNullableCanonicalV3SourceId(value.location_id) &&
+    hasValidStockTopology(value) &&
+    isFiniteNumber(value.quantity_on_hand) &&
+    isNullableFiniteNumber(value.quantity_reserved) &&
+    isNullableFiniteNumber(value.quantity_available) &&
+    isNullableFiniteNumber(value.quantity_incoming) &&
+    isNullableFiniteNumber(value.in_transit) &&
+    hasOnlyFiniteNullableNumbers(value, INVENTORY_STOCK_NUMERIC_FIELDS) &&
+    isNullableNonNegativePostgresInteger(value.item_number) &&
+    isNullableNonNegativeInteger(value.imported_at) &&
+    value.cache_source === 'api' &&
+    value.source_api_version === '3'
+  );
+};
+
+const INVENTORY_ITEM_NUMERIC_FIELDS = [
+  'item_number',
+  'quantity',
+  'quantity_reserved',
+  'quantity_available',
+  'quantity_incoming',
+  'in_transit',
+  'threshold',
+  'cost',
+  'price',
+  'valuation',
+  'published',
+  'archived',
+  'modified',
+  'imported_at',
+] as const;
+
+const INVENTORY_ITEM_TEXT_FIELDS = [
+  'description',
+  'sku',
+  'serial_number',
+  'barcode',
+  'category_id',
+  'category_name',
+  'created',
+] as const;
+
+const INVENTORY_STOCK_NUMERIC_FIELDS = [
+  'item_number',
+  'quantity_on_hand',
+  'quantity_reserved',
+  'quantity_available',
+  'quantity_incoming',
+  'in_transit',
+  'price',
+  'cost',
+  'valuation',
+  'imported_at',
+] as const;
+
+const INVENTORY_STOCK_TEXT_FIELDS = [
+  'variation_id',
+  'variation_location_id',
+  'location_id',
+  'location_name',
+  'category_name',
+  'barcode',
+] as const;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const isNonEmptyText = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length > 0 &&
+  !value.includes('\0') &&
+  !hasUnpairedUtf16Surrogate(value);
+
+const isTextWithoutNullByte = (value: unknown): value is string =>
+  typeof value === 'string' && !value.includes('\0') && !hasUnpairedUtf16Surrogate(value);
+
+const isCanonicalV3SourceId = (value: unknown): value is string => {
+  if (typeof value !== 'string' || hasUnpairedUtf16Surrogate(value)) return false;
+  try {
+    assertCanonicalV3SourceId(value, 'cache row');
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const isNullableCanonicalV3SourceId = (value: unknown): value is string | null | undefined =>
+  value == null || isCanonicalV3SourceId(value);
+
+const hasValidStockTopology = (value: Record<string, unknown>): boolean => {
+  const hasVariation = value.variation_id != null;
+  const hasVariationLocation = value.variation_location_id != null;
+  const hasLocation = value.location_id != null;
+  return (
+    (!hasVariationLocation ||
+      (hasVariation &&
+        hasLocation &&
+        isCanonicalVariationLocationId(value.variation_location_id) &&
+        value.variation_location_id === value.stock_row_id)) &&
+    (!(hasVariation && hasLocation) || hasVariationLocation)
+  );
+};
+
+const isCanonicalVariationLocationId = (value: unknown): value is string => {
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) return false;
+  const numericId = Number(value);
+  return Number.isSafeInteger(numericId) && String(numericId) === value;
+};
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
+const isNullableFiniteNumber = (value: unknown): value is number | null =>
+  value === null || isFiniteNumber(value);
+
+const hasOnlyFiniteNullableNumbers = (
+  value: Record<string, unknown>,
+  fields: readonly string[]
+): boolean => fields.every((field) => value[field] == null || isFiniteNumber(value[field]));
+
+const hasOnlyNullableTextWithoutNullBytes = (
+  value: Record<string, unknown>,
+  fields: readonly string[]
+): boolean => fields.every((field) => value[field] == null || isTextWithoutNullByte(value[field]));
+
+const isNullableNonNegativeInteger = (value: unknown): value is number | null | undefined =>
+  value == null || (Number.isSafeInteger(value) && (value as number) >= 0);
+
+const isNonNegativePostgresInteger = (value: unknown): value is number =>
+  Number.isSafeInteger(value) &&
+  (value as number) >= 0 &&
+  (value as number) <= POSTGRES_INTEGER_MAX;
+
+const isNullableNonNegativePostgresInteger = (value: unknown): value is number | null | undefined =>
+  value == null || isNonNegativePostgresInteger(value);
+
+const isNullableBinaryFlag = (value: unknown): value is 0 | 1 | null | undefined =>
+  value == null || value === 0 || value === 1;

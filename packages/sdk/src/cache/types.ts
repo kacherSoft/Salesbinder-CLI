@@ -2,6 +2,14 @@
  * Cache types for SQLite document caching
  */
 
+import { createHash } from 'node:crypto';
+import type {
+  CacheSyncPhase,
+  CacheSyncProgress,
+  CacheSyncProgressCallback,
+} from './cache-sync-progress.types.js';
+import type { SyncRecordIssue } from './sync-record-issue.types.js';
+
 /** Database schema row for documents table */
 export interface DocumentRow {
   doc_id: string;
@@ -213,9 +221,27 @@ export interface InventorySnapshot {
   meta: InventoryCacheMeta;
 }
 
-export interface InventoryCacheMeta {
-  version: 1;
-  status: 'complete';
+/** Deterministic fingerprint for the exact authoritative inventory rows. */
+export function createInventorySnapshotFingerprint(
+  accountIdentity: string,
+  generation: string,
+  items: ItemRow[],
+  stockRows: ItemStockLocationRow[]
+): string {
+  const canonical = {
+    accountIdentity,
+    generation,
+    items: [...items]
+      .sort((left, right) => compareCodeUnitStrings(left.item_id, right.item_id))
+      .map(canonicalInventoryItem),
+    stockRows: [...stockRows]
+      .sort((left, right) => compareCodeUnitStrings(left.stock_row_id, right.stock_row_id))
+      .map(canonicalInventoryStockRow),
+  };
+  return hashInventorySnapshot(canonical);
+}
+
+interface InventoryCacheMetaBase {
   accountIdentity: string;
   startedAt: number;
   completedAt: number;
@@ -227,6 +253,365 @@ export interface InventoryCacheMeta {
   fingerprint: string;
 }
 
+/** Legacy clean-snapshot metadata; kept readable across the metadata-format upgrade. */
+export interface InventoryCacheMetaV1 extends InventoryCacheMetaBase {
+  version: 1;
+  status: 'complete';
+}
+
+/** Snapshot metadata with explicit recovery and last-known-good outcomes. */
+export interface InventoryCacheMetaV2 extends InventoryCacheMetaBase {
+  version: 2;
+  status: 'complete' | 'complete_with_warnings';
+  freshItemCount: number;
+  preservedItemCount: number;
+  omittedItemCount: number;
+  warningCount: number;
+  /** Most recent clean completion, or null if no clean inventory has completed. */
+  lastCompleteAt: number | null;
+}
+
+export type InventoryCacheMeta = InventoryCacheMetaV1 | InventoryCacheMetaV2;
+
+/** Verify metadata against its rows while retaining compatibility with legacy v1 fingerprints. */
+export function inventorySnapshotFingerprintMatches(
+  meta: InventoryCacheMeta,
+  items: ItemRow[],
+  stockRows: ItemStockLocationRow[]
+): boolean {
+  const current = createInventorySnapshotFingerprint(
+    meta.accountIdentity,
+    meta.generation,
+    items,
+    stockRows
+  );
+  if (meta.fingerprint === current) return true;
+  if (meta.version !== 1 || !hasLegacyInventoryDefaults(items, stockRows)) return false;
+  return legacyInventorySnapshotFingerprintMatches(
+    meta.fingerprint,
+    meta.accountIdentity,
+    meta.generation,
+    items,
+    stockRows
+  );
+}
+
+const INVENTORY_META_COMMON_KEYS = [
+  'accountIdentity',
+  'completedAt',
+  'fingerprint',
+  'generation',
+  'itemCount',
+  'schemaVersion',
+  'sourceApiVersion',
+  'startedAt',
+  'status',
+  'stockRowCount',
+  'version',
+];
+
+const INVENTORY_META_V2_KEYS = [
+  ...INVENTORY_META_COMMON_KEYS,
+  'freshItemCount',
+  'lastCompleteAt',
+  'omittedItemCount',
+  'preservedItemCount',
+  'warningCount',
+];
+
+/** Parse only supported authoritative inventory metadata formats. */
+export function parseInventoryCacheMeta(value: unknown): InventoryCacheMeta | null {
+  if (!isRecord(value)) return null;
+  const {
+    accountIdentity,
+    completedAt,
+    fingerprint,
+    freshItemCount,
+    generation,
+    itemCount,
+    lastCompleteAt,
+    omittedItemCount,
+    preservedItemCount,
+    schemaVersion,
+    sourceApiVersion,
+    startedAt,
+    status,
+    stockRowCount,
+    version,
+    warningCount,
+  } = value;
+
+  const commonIsValid =
+    isNonEmptyString(accountIdentity) &&
+    isNonNegativeInteger(startedAt) &&
+    isNonNegativeInteger(completedAt) &&
+    completedAt >= startedAt &&
+    isNonNegativeInteger(itemCount) &&
+    isNonNegativeInteger(stockRowCount) &&
+    schemaVersion === CACHE_SCHEMA_VERSION &&
+    sourceApiVersion === '3' &&
+    isNonEmptyString(generation) &&
+    isNonEmptyString(fingerprint);
+  if (!commonIsValid) return null;
+
+  if (version === 1) {
+    return hasExactKeys(value, INVENTORY_META_COMMON_KEYS) && status === 'complete'
+      ? (value as unknown as InventoryCacheMetaV1)
+      : null;
+  }
+  if (version !== 2) return null;
+
+  if (
+    !hasExactKeys(value, INVENTORY_META_V2_KEYS) ||
+    (status !== 'complete' && status !== 'complete_with_warnings') ||
+    !isNonNegativeInteger(freshItemCount) ||
+    !isNonNegativeInteger(preservedItemCount) ||
+    !isNonNegativeInteger(omittedItemCount) ||
+    !isNonNegativeInteger(warningCount) ||
+    (lastCompleteAt !== null && !isNonNegativeInteger(lastCompleteAt)) ||
+    (typeof lastCompleteAt === 'number' && lastCompleteAt > completedAt) ||
+    freshItemCount + preservedItemCount !== itemCount ||
+    warningCount !== preservedItemCount + omittedItemCount
+  ) {
+    return null;
+  }
+
+  return status === 'complete'
+    ? warningCount === 0 &&
+      preservedItemCount === 0 &&
+      omittedItemCount === 0 &&
+      lastCompleteAt === completedAt
+      ? (value as unknown as InventoryCacheMetaV2)
+      : null
+    : warningCount > 0
+      ? (value as unknown as InventoryCacheMetaV2)
+      : null;
+}
+
+export function isInventoryCacheMeta(value: unknown): value is InventoryCacheMeta {
+  return parseInventoryCacheMeta(value) !== null;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean => {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+};
+
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === 'string' && value.trim().length > 0 && !value.includes('\0');
+
+const isNonNegativeInteger = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && (value as number) >= 0;
+
+function compareCodeUnitStrings(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+function canonicalInventoryItem(item: ItemRow): Record<string, unknown> {
+  return {
+    item_id: item.item_id,
+    item_number: finiteInventoryNumber(item.item_number, 'item_number'),
+    name: item.name,
+    description: item.description ?? null,
+    sku: item.sku ?? null,
+    serial_number: item.serial_number ?? null,
+    barcode: item.barcode ?? null,
+    category_id: item.category_id ?? null,
+    category_name: item.category_name ?? null,
+    quantity: finiteInventoryNumber(item.quantity, 'quantity'),
+    quantity_reserved: finiteInventoryNumber(item.quantity_reserved, 'quantity_reserved'),
+    quantity_available: finiteInventoryNumber(item.quantity_available, 'quantity_available'),
+    quantity_incoming: finiteInventoryNumber(item.quantity_incoming, 'quantity_incoming'),
+    in_transit: finiteInventoryNumber(item.in_transit, 'in_transit'),
+    threshold: finiteInventoryNumber(item.threshold, 'threshold'),
+    cost: finiteInventoryNumber(item.cost, 'cost'),
+    price: finiteInventoryNumber(item.price, 'price'),
+    valuation: finiteInventoryNumber(item.valuation, 'valuation'),
+    published: finiteInventoryNumber(item.published, 'published'),
+    archived: finiteInventoryNumber(item.archived, 'archived'),
+    created: item.created ?? null,
+    modified: finiteInventoryNumber(item.modified, 'modified'),
+    cache_source: item.cache_source ?? null,
+    source_api_version: item.source_api_version ?? null,
+    imported_at: finiteInventoryNumber(item.imported_at, 'imported_at'),
+  };
+}
+
+function canonicalInventoryStockRow(row: ItemStockLocationRow): Record<string, unknown> {
+  return {
+    stock_row_id: row.stock_row_id,
+    item_id: row.item_id,
+    item_number: finiteInventoryNumber(row.item_number, 'item_number'),
+    variation_id: row.variation_id ?? null,
+    variation_location_id: row.variation_location_id ?? null,
+    location_id: row.location_id ?? null,
+    location_name: row.location_name ?? null,
+    category_name: row.category_name ?? null,
+    quantity_on_hand: requiredFiniteInventoryNumber(row.quantity_on_hand, 'quantity_on_hand'),
+    quantity_reserved: finiteInventoryNumber(row.quantity_reserved, 'quantity_reserved'),
+    quantity_available: finiteInventoryNumber(row.quantity_available, 'quantity_available'),
+    quantity_incoming: finiteInventoryNumber(row.quantity_incoming, 'quantity_incoming'),
+    in_transit: finiteInventoryNumber(row.in_transit, 'in_transit'),
+    price: finiteInventoryNumber(row.price, 'price'),
+    cost: finiteInventoryNumber(row.cost, 'cost'),
+    valuation: finiteInventoryNumber(row.valuation, 'valuation'),
+    barcode: row.barcode ?? null,
+    cache_source: row.cache_source ?? null,
+    source_api_version: row.source_api_version ?? null,
+    imported_at: finiteInventoryNumber(row.imported_at, 'imported_at'),
+  };
+}
+
+function finiteInventoryNumber(value: number | null | undefined, field: string): number | null {
+  if (value === null || value === undefined) return null;
+  return requiredFiniteInventoryNumber(value, field);
+}
+
+function requiredFiniteInventoryNumber(value: number, field: string): number {
+  if (!Number.isFinite(value)) {
+    throw new Error(`Invalid inventory fingerprint field ${field}: value must be finite.`);
+  }
+  return value;
+}
+
+function legacyInventorySnapshotFingerprintMatches(
+  expected: string,
+  accountIdentity: string,
+  generation: string,
+  items: ItemRow[],
+  stockRows: ItemStockLocationRow[]
+): boolean {
+  const seenOrders = new Set<string>();
+  const seenFingerprints = new Set<string>();
+  // V1 did not persist its host locale. Cover known deployment families; unknown collations fail closed.
+  const comparators = [
+    (left: string, right: string) => left.localeCompare(right),
+    ...['en-US', 'sv-SE', 'da-DK'].map(
+      (locale) => new Intl.Collator(locale).compare as (left: string, right: string) => number
+    ),
+    compareCodeUnitStrings,
+  ];
+
+  for (const compare of comparators) {
+    const sortedItems = [...items].sort((left, right) => compare(left.item_id, right.item_id));
+    const sortedStockRows = [...stockRows].sort((left, right) =>
+      compare(left.stock_row_id, right.stock_row_id)
+    );
+    const order = JSON.stringify([
+      sortedItems.map((item) => item.item_id),
+      sortedStockRows.map((row) => row.stock_row_id),
+    ]);
+    if (seenOrders.has(order)) continue;
+    seenOrders.add(order);
+
+    for (const omitNullParentLocationId of [false, true]) {
+      const fingerprint = hashInventorySnapshot({
+        accountIdentity,
+        generation,
+        items: sortedItems.map(legacyInventoryItem),
+        stockRows: sortedStockRows.map((row) =>
+          legacyInventoryStockRow(row, omitNullParentLocationId)
+        ),
+      });
+      if (seenFingerprints.has(fingerprint)) continue;
+      if (fingerprint === expected) return true;
+      seenFingerprints.add(fingerprint);
+    }
+  }
+  return false;
+}
+
+function hasLegacyInventoryDefaults(items: ItemRow[], stockRows: ItemStockLocationRow[]): boolean {
+  return (
+    items.every((item) => isNullish(item.valuation) && isNullish(item.imported_at)) &&
+    stockRows.every(
+      (row) =>
+        isNullish(row.valuation) &&
+        isNullish(row.imported_at) &&
+        (!isNullish(row.variation_id) || isNullish(row.variation_location_id))
+    )
+  );
+}
+
+const isNullish = (value: unknown): boolean => value === null || value === undefined;
+
+function legacyInventoryItem(item: ItemRow): Record<string, unknown> {
+  const canonical = canonicalInventoryItem(item);
+  return {
+    item_id: canonical.item_id,
+    item_number: canonical.item_number,
+    name: canonical.name,
+    description: canonical.description,
+    sku: canonical.sku,
+    serial_number: canonical.serial_number,
+    barcode: canonical.barcode,
+    category_id: canonical.category_id,
+    category_name: canonical.category_name,
+    quantity: canonical.quantity,
+    quantity_reserved: canonical.quantity_reserved,
+    quantity_available: canonical.quantity_available,
+    quantity_incoming: canonical.quantity_incoming,
+    in_transit: canonical.in_transit,
+    threshold: canonical.threshold,
+    cost: canonical.cost,
+    price: canonical.price,
+    published: canonical.published,
+    archived: canonical.archived,
+    created: canonical.created,
+    modified: canonical.modified,
+    cache_source: canonical.cache_source,
+    source_api_version: canonical.source_api_version,
+  };
+}
+
+function legacyInventoryStockRow(
+  row: ItemStockLocationRow,
+  omitNullParentLocationId: boolean
+): Record<string, unknown> {
+  const canonical = canonicalInventoryStockRow(row);
+  const identity = {
+    stock_row_id: canonical.stock_row_id,
+    item_id: canonical.item_id,
+    item_number: canonical.item_number,
+  };
+  const values = {
+    ...(omitNullParentLocationId &&
+    canonical.variation_id === null &&
+    canonical.location_id === null
+      ? {}
+      : { location_id: canonical.location_id }),
+    location_name: canonical.location_name,
+    category_name: canonical.category_name,
+    quantity_on_hand: canonical.quantity_on_hand,
+    quantity_reserved: canonical.quantity_reserved,
+    quantity_available: canonical.quantity_available,
+    quantity_incoming: canonical.quantity_incoming,
+    in_transit: canonical.in_transit,
+    price: canonical.price,
+    cost: canonical.cost,
+    barcode: canonical.barcode,
+    cache_source: canonical.cache_source,
+    source_api_version: canonical.source_api_version,
+  };
+  return canonical.variation_id === null
+    ? { ...identity, ...values }
+    : {
+        ...identity,
+        variation_id: canonical.variation_id,
+        variation_location_id: canonical.variation_location_id,
+        ...values,
+      };
+}
+
+function hashInventorySnapshot(value: unknown): string {
+  return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`;
+}
+
 /** Immutable identity assigned to a one-account PostgreSQL cache database. */
 export interface CacheAccountBinding {
   accountIdentity: string;
@@ -236,9 +621,14 @@ export interface CacheAccountBinding {
 
 /** Normalize the configured SalesBinder subdomain into a stable cache owner identity. */
 export function createSalesBinderAccountBinding(subdomain: string): CacheAccountBinding {
-  const normalized = subdomain.trim().toLowerCase().replace(/\.salesbinder\.com\.?$/, '');
+  const normalized = subdomain
+    .trim()
+    .toLowerCase()
+    .replace(/\.salesbinder\.com\.?$/, '');
   if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(normalized)) {
-    throw new Error('SalesBinder subdomain is invalid and cannot identify a cache database safely.');
+    throw new Error(
+      'SalesBinder subdomain is invalid and cannot identify a cache database safely.'
+    );
   }
   return {
     accountIdentity: `salesbinder:${normalized}`,
@@ -268,11 +658,13 @@ export interface CacheState {
   lastFullItemSync?: number;
   inventorySourceApiVersion?: ApiSourceVersion;
   lastDeletedSync?: number;
+  /** Timestamp of the latest attempted global sync, including warning completion. */
+  lastSyncAttempt?: number;
 }
 
 /** Writer sync status stored in cache_meta. */
 export interface CacheSyncStatus {
-  status: 'running' | 'success' | 'failed';
+  status: 'running' | 'success' | 'success_with_warnings' | 'failed';
   runId: string;
   accountName: string;
   syncTarget: 'sqlite' | 'postgresql';
@@ -287,6 +679,10 @@ export interface CacheSyncStatus {
   categoriesProcessed?: number;
   stockRowsProcessed?: number;
   deletedRecordsProcessed?: number;
+  phase?: CacheSyncPhase;
+  progress?: CacheSyncProgress;
+  progressUpdatedAt?: number;
+  recordIssues?: SyncRecordIssue[];
   error?: string;
 }
 
@@ -294,9 +690,14 @@ export interface CacheSyncStatus {
 export interface SyncOptions {
   full?: boolean; // Force full sync
   onProgress?: (current: number, total: number) => void; // Progress callback
+  onProgressEvent?: CacheSyncProgressCallback;
   resume?: {
     documents?: { contextId?: number; page?: number; docIndex?: number };
-    onDocumentCheckpoint?: (checkpoint: { contextId: number; page: number; docIndex: number }) => void;
+    onDocumentCheckpoint?: (checkpoint: {
+      contextId: number;
+      page: number;
+      docIndex: number;
+    }) => void;
   };
 }
 
@@ -316,6 +717,7 @@ export interface SyncResult {
   stockRowsProcessed?: number;
   deletedRecordsProcessed?: number;
   syncLookbackSeconds?: number;
+  recordIssues?: SyncRecordIssue[];
 }
 
 /** Sales analytics result for a single item */

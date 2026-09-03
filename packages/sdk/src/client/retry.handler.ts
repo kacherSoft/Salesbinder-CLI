@@ -1,105 +1,162 @@
-/**
- * Retry handler for rate limiting (429) and transient errors
- * Implements exponential backoff with jitter
- */
+import axios, {
+  type AxiosError,
+  type AxiosInstance,
+  type AxiosRequestConfig,
+  type InternalAxiosRequestConfig,
+} from 'axios';
+import type {
+  RateLimitApiVersion,
+  RateLimitObserver,
+  RateLimitReason,
+} from './salesbinder-rate-limiter.js';
+import {
+  calculateRetryDelay,
+  emitRetryEvent,
+  logRetry,
+  MAX_RETRIES,
+  sleepForRetry,
+} from './retry-runtime.js';
 
-import type { AxiosError, AxiosRequestConfig, InternalAxiosRequestConfig } from 'axios';
-
-/** Maximum retry attempts */
-const MAX_RETRIES = 5;
-
-/** Initial retry delay in ms */
-const INITIAL_DELAY = 1000;
-
-/** Jitter percentage (0-50% random addition) */
-const JITTER_PERCENT = 0.5;
-
-/** Status codes that trigger retry */
-const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
-
-/**
- * Calculate delay with exponential backoff and jitter
- * @param attempt - Retry attempt number (0-based)
- * @returns Delay in milliseconds
- */
-export function calculateRetryDelay(attempt: number): number {
-  const exponentialDelay = INITIAL_DELAY * Math.pow(2, attempt);
-  const jitter = exponentialDelay * JITTER_PERCENT * Math.random();
-  return exponentialDelay + jitter;
-}
-
-/**
- * Check if error is retryable
- */
-export function isRetryableError(error: AxiosError): boolean {
-  if (!error.response) {
-    // Network errors are retryable
-    return true;
-  }
-
-  const status = error.response.status;
-  return RETRYABLE_STATUS_CODES.includes(status);
-}
-
-/**
- * Retry configuration for axios
- */
 export interface RetryConfig {
-  /** Current retry attempt */
   attempt: number;
-  /** Request ID for logging */
   requestId: string;
+  method: string;
+  hasIdempotencyKey: boolean;
 }
 
-/**
- * Extended Axios config with retry metadata
- */
 export interface AxiosConfigWithRetry extends AxiosRequestConfig {
   _retry?: RetryConfig;
+  __isRetry?: boolean;
 }
 
-/**
- * Sleep for specified milliseconds
- */
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+type InternalRetryConfig = InternalAxiosRequestConfig & AxiosConfigWithRetry;
+
+export function installRetryMetadataInterceptor(
+  client: AxiosInstance,
+  generateRequestId: () => string
+): void {
+  client.interceptors.request.use((config) => {
+    const retryConfig = config as InternalRetryConfig;
+    if (retryConfig.__isRetry) {
+      delete retryConfig.__isRetry;
+      return config;
+    }
+    retryConfig._retry = {
+      attempt: 0,
+      requestId: generateRequestId(),
+      method: normalizeMethod(config.method),
+      hasIdempotencyKey: hasIdempotencyKey(config.headers),
+    };
+    return config;
+  });
 }
 
-/**
- * Retry handler for axios interceptor
- * @param error - Axios error
- * @returns Retry the request or throw error
- */
-export async function retryHandler(error: AxiosError): Promise<AxiosRequestConfig> {
-  const config = error.config as AxiosConfigWithRetry;
+export function installRetryResponseInterceptor(
+  client: AxiosInstance,
+  apiVersion: RateLimitApiVersion,
+  observer?: RateLimitObserver
+): void {
+  client.interceptors.response.use(
+    (response) => response,
+    async (error: unknown) => {
+      const axiosError = error as AxiosError;
+      const config = axiosError.config as InternalRetryConfig | undefined;
+      if (!config?._retry || !shouldRetry(axiosError, config._retry, apiVersion)) {
+        return Promise.reject(error);
+      }
 
-  if (!config || !config._retry) {
-    return Promise.reject(error);
-  }
+      const retry = config._retry;
+      const status = axiosError.response?.status;
+      const delay = nextRetryDelayMs(status, retry.attempt);
+      const reason = retryReason(status);
 
-  // Check if we should retry
-  if (!isRetryableError(error) || config._retry.attempt >= MAX_RETRIES) {
-    return Promise.reject(error);
-  }
+      emitRetryEvent(observer, apiVersion, retry.attempt, delay, reason);
+      if (!observer) logRetry(retry.requestId, retry.attempt, status, delay, status === 429);
+      if (delay > 0) await sleepForRetry(delay, config.signal);
 
-  const { attempt, requestId } = config._retry;
-
-  // Calculate delay
-  const delay = calculateRetryDelay(attempt);
-
-  // Log retry (would use proper logger in production)
-  const reason = error.response?.status || 'network';
-  console.warn(
-    `[${requestId}] Retry ${attempt + 1}/${MAX_RETRIES} after ${delay.toFixed(0)}ms ` +
-      `(reason: ${reason})`
+      retry.attempt++;
+      config.__isRetry = true;
+      return client.request(config);
+    }
   );
-
-  // Wait before retry
-  await sleep(delay);
-
-  // Increment attempt counter
-  config._retry.attempt++;
-
-  // Return config to retry
-  return config as InternalAxiosRequestConfig;
 }
+
+export function isRetryableError(error: AxiosError): boolean {
+  if (isCancellation(error)) return false;
+  return !error.response || error.response.status === 429 || isServerError(error.response.status);
+}
+
+/** Legacy helper kept compatible for any direct internal imports. */
+export async function retryHandler(error: AxiosError): Promise<AxiosRequestConfig> {
+  const config = error.config as InternalRetryConfig | undefined;
+  if (!config?._retry || config._retry.attempt >= MAX_RETRIES || !isRetryableError(error)) {
+    return Promise.reject(error);
+  }
+  const delay = nextRetryDelayMs(error.response?.status, config._retry.attempt);
+  if (delay > 0) await sleepForRetry(delay, config.signal);
+  config._retry.attempt++;
+  return config;
+}
+
+function shouldRetry(
+  error: AxiosError,
+  retry: RetryConfig,
+  apiVersion: RateLimitApiVersion
+): boolean {
+  if (retry.attempt >= MAX_RETRIES || !isRetryableError(error)) return false;
+  const status = error.response?.status;
+  if (isSafeRetryMethod(retry.method)) return true;
+  return apiVersion === 'v3' && canRetryV3Mutation(status, retry.hasIdempotencyKey);
+}
+
+function normalizeMethod(method: string | undefined): string {
+  return (method ?? 'get').trim().toLowerCase();
+}
+
+function nextRetryDelayMs(status: number | undefined, attempt: number): number {
+  return status === 429 ? 0 : calculateRetryDelay(attempt);
+}
+
+function isSafeRetryMethod(method: string): boolean {
+  return method === 'get' || method === 'head';
+}
+
+function canRetryV3Mutation(status: number | undefined, hasIdempotencyKey: boolean): boolean {
+  if (status === 429) return true;
+  return hasIdempotencyKey && (status === undefined || isServerError(status));
+}
+
+function hasIdempotencyKey(headers: unknown): boolean {
+  if (!headers || typeof headers !== 'object') return false;
+  const getter = (headers as { get?: unknown }).get;
+  if (typeof getter === 'function') {
+    const value = getter.call(headers, 'Idempotency-Key');
+    return typeof value === 'string' && value.trim().length > 0;
+  }
+  return Object.entries(headers as Record<string, unknown>).some(
+    ([name, value]) =>
+      name.toLowerCase() === 'idempotency-key' &&
+      typeof value === 'string' &&
+      value.trim().length > 0
+  );
+}
+
+function isCancellation(error: AxiosError): boolean {
+  return (
+    axios.isCancel(error) ||
+    error.code === 'ERR_CANCELED' ||
+    error.name === 'AbortError' ||
+    error.name === 'RateLimitWaitExceededError'
+  );
+}
+
+function isServerError(status: number): boolean {
+  return status >= 500 && status <= 599;
+}
+
+function retryReason(status: number | undefined): RateLimitReason {
+  if (status === 429) return 'rate_limit';
+  return status === undefined ? 'network' : 'server_error';
+}
+
+export { calculateRetryDelay } from './retry-runtime.js';

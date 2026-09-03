@@ -13,6 +13,7 @@ import { DeletedLogResource } from './deleted-log.resource.js';
 import { createV3AxiosClient } from '../client/v3-axios.factory.js';
 import { V3ItemsResource } from './v3-items.resource.js';
 import { V3CategoriesResource } from './v3-categories.resource.js';
+import type { ClientRuntimeOptions } from '../client/salesbinder-rate-limiter.js';
 
 /**
  * SalesBinder SDK client
@@ -32,9 +33,9 @@ export class SalesBinderClient {
   /** Deleted log resource */
   readonly deletedLog: DeletedLogResource;
 
-  constructor(accountName?: string) {
+  constructor(accountName?: string, runtimeOptions: ClientRuntimeOptions = {}) {
     const account = loadConfig(accountName);
-    const client = createAxiosClient(account);
+    const client = createAxiosClient(account, runtimeOptions);
 
     this.items = new ItemsResource(client);
     this.customers = new CustomersResource(client);
@@ -50,12 +51,12 @@ export class SalesBinderV3Client {
   readonly items: V3ItemsResource;
   readonly categories: V3CategoriesResource;
 
-  constructor(accountName?: string) {
+  constructor(accountName?: string, runtimeOptions: ClientRuntimeOptions = {}) {
     const account = loadConfig(accountName);
     if (!account.v3ApiKey) {
       throw new Error('SalesBinder API v3 key is not configured for this account');
     }
-    const client = createV3AxiosClient(account);
+    const client = createV3AxiosClient(account, runtimeOptions);
     this.items = new V3ItemsResource(client);
     this.categories = new V3CategoriesResource(client);
   }

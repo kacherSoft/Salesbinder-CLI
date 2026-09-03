@@ -9,16 +9,25 @@
 import type {
   AccountRow,
   CacheAccountBinding,
+  CacheSyncStatus,
   DocumentRow,
   ItemDocumentRow,
   ItemRow,
   ItemStockLocationRow,
 } from './types.js';
+import type {
+  CacheSyncPhase,
+  CacheSyncProgress,
+  CacheSyncProgressEventType,
+  CacheSyncRateLimitProgress,
+} from './cache-sync-progress.types.js';
+import type { SyncRecordIssue, SyncRecordIssueCode } from './sync-record-issue.types.js';
 import type { PaymentTransactionRow } from './payment-sync.types.js';
 import { PostgresCacheService } from './postgres-cache.service.js';
 import { SQLiteCacheService } from './sqlite-cache.service.js';
 import { loadConfig } from '../config/config.loader.js';
-import { createSalesBinderAccountBinding } from './types.js';
+import { createSalesBinderAccountBinding, DocumentContextId } from './types.js';
+import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
 
 /** Result of a PG → SQLite pull */
 export interface PgPullResult {
@@ -35,6 +44,18 @@ export interface PgPullResult {
   skipReason?: string;
 }
 
+/** Pull outcome reported while the required PostgreSQL and SQLite writer locks remain held. */
+export type PgPullSettlement =
+  | { status: 'success'; result: Readonly<PgPullResult> }
+  | { status: 'failed'; error: unknown };
+
+export interface PgPullLifecycleOptions {
+  /** Set only while the caller owns this account's PG lock through settlement; skips inner PG locking. */
+  pgLockAlreadyHeld?: boolean;
+  /** Awaited exactly once after required locks are held and the pull settles. */
+  onSettledWhileLocked?: (settlement: PgPullSettlement) => void | Promise<void>;
+}
+
 /**
  * Pull all data from PostgreSQL into the local SQLite cache.
  *
@@ -46,83 +67,520 @@ export async function pullFromPostgres(
   sqliteAccountName: string,
   sqliteCustomPath?: string,
   accountBinding?: CacheAccountBinding,
+  lifecycle: PgPullLifecycleOptions = {}
 ): Promise<PgPullResult> {
   const start = Date.now();
-  const resolvedBinding = accountBinding
-    ?? createSalesBinderAccountBinding(loadConfig(sqliteAccountName).subdomain);
+  const resolvedBinding =
+    accountBinding ?? createSalesBinderAccountBinding(loadConfig(sqliteAccountName).subdomain);
+  let lifecycleHookInvoked = false;
   let pg: PostgresCacheService | null = null;
   let sqlite: SQLiteCacheService | null = null;
   let pgLockAcquired = false;
   let sqliteLockAcquired = false;
   const lockKey = `salesbinder-cache-sync:${resolvedBinding.accountIdentity}`;
+  const notifySettlementWhileLocked = async (
+    settlement: PgPullSettlement,
+    suppressHookFailure = false
+  ): Promise<void> => {
+    if (lifecycleHookInvoked || !lifecycle.onSettledWhileLocked) return;
+    lifecycleHookInvoked = true;
+    if (!suppressHookFailure) {
+      await lifecycle.onSettledWhileLocked(settlement);
+      return;
+    }
+    try {
+      await lifecycle.onSettledWhileLocked(settlement);
+    } catch {
+      // Preserve the primary pull failure; cleanup still runs in the outer finally.
+    }
+  };
 
   try {
     // Open both connections
     pg = new PostgresCacheService(pgConnectionString);
     await pg.ensureSchema();
     await pg.verifyAccountBinding(resolvedBinding);
-    await pg.ensureSchema();
-    pgLockAcquired = await pg.tryAcquireSyncLock(lockKey);
-    if (!pgLockAcquired) throw new Error('Another cache sync is already running for this account.');
+    if (!lifecycle.pgLockAlreadyHeld) {
+      pgLockAcquired = await pg.tryAcquireSyncLock(lockKey);
+      if (!pgLockAcquired)
+        throw new Error('Another cache sync is already running for this account.');
+    }
     sqlite = new SQLiteCacheService(sqliteAccountName, sqliteCustomPath);
     await sqlite.verifyAccountBinding(resolvedBinding);
     sqliteLockAcquired = await sqlite.tryAcquireSyncLock(lockKey);
-    if (!sqliteLockAcquired) throw new Error('Another local cache writer is already running for this account.');
+    if (!sqliteLockAcquired)
+      throw new Error('Another local cache writer is already running for this account.');
 
-    // 1. Pull all documents from PG
-    const allDocs = await getAllDocuments(pg);
-    const allItems = await getAllItemDocuments(pg, allDocs);
-    const allPayments = await getAllPaymentTransactions(pg);
-    const allAccounts = await getAllAccounts(pg);
-    const categorySnapshot = await pg.getCategorySnapshot();
-    const inventoryCacheMeta = await pg.getInventoryCacheMeta();
-    const allMasterItems = await getAllItems(pg);
-    const allStockRows = await getAllStockRows(pg);
-    const pgState = await pg.getCacheState();
-    const pgPaymentSyncStatus = await pg.getPaymentSyncStatus();
+    try {
+      // 1. Pull all documents from PG
+      const allDocs = await getAllDocuments(pg);
+      const allItems = await getAllItemDocuments(pg, allDocs);
+      const allPayments = await getAllPaymentTransactions(pg);
+      const allAccounts = await getAllAccounts(pg);
+      const categorySnapshot = await pg.getCategorySnapshot();
+      const inventoryCacheMeta = await pg.getInventoryCacheMeta();
+      const allMasterItems = await getAllItems(pg);
+      const allStockRows = await getAllStockRows(pg);
+      const pgState = await pg.getCacheState();
+      const pgPaymentSyncStatus = await pg.getPaymentSyncStatus();
 
-    // Replace data and metadata together so readers see either the old or new mirror.
-    await sqlite.replaceMirror({
-      accounts: allAccounts,
-      categorySnapshot,
-      inventoryCacheMeta,
-      items: allMasterItems,
-      itemStockLocations: allStockRows,
-      documents: allDocs,
-      itemDocuments: allItems,
-      paymentTransactions: allPayments,
-      cacheState: pgState,
-      paymentSyncStatus: pgPaymentSyncStatus,
-      pulledAt: Date.now(),
-    });
+      // Replace data and metadata together so readers see either the old or new mirror.
+      await sqlite.replaceMirror({
+        accounts: allAccounts,
+        categorySnapshot,
+        inventoryCacheMeta,
+        items: allMasterItems,
+        itemStockLocations: allStockRows,
+        documents: allDocs,
+        itemDocuments: allItems,
+        paymentTransactions: allPayments,
+        cacheState: pgState,
+        paymentSyncStatus: pgPaymentSyncStatus,
+        pulledAt: Date.now(),
+      });
 
-    const duration = ((Date.now() - start) / 1000).toFixed(1);
-
-    return {
-      success: true,
-      accountsPulled: allAccounts.length,
-      categoriesPulled: categorySnapshot?.rows.length ?? 0,
-      documentsPulled: allDocs.length,
-      itemDocumentsPulled: allItems.length,
-      paymentTransactionsPulled: allPayments.length,
-      itemsPulled: allMasterItems.length,
-      stockRowsPulled: allStockRows.length,
-      duration: `${duration}s`,
-    };
+      const duration = ((Date.now() - start) / 1000).toFixed(1);
+      const result: PgPullResult = {
+        success: true,
+        accountsPulled: allAccounts.length,
+        categoriesPulled: categorySnapshot?.rows.length ?? 0,
+        documentsPulled: allDocs.length,
+        itemDocumentsPulled: allItems.length,
+        paymentTransactionsPulled: allPayments.length,
+        itemsPulled: allMasterItems.length,
+        stockRowsPulled: allStockRows.length,
+        duration: `${duration}s`,
+      };
+      const requireTerminalStatus = lifecycle.onSettledWhileLocked !== undefined;
+      const preSettlementStatus = requireTerminalStatus
+        ? projectSyncStatusForMirror(await pg.getSyncStatus(), false)
+        : undefined;
+      if (requireTerminalStatus && !preSettlementStatus) {
+        throw new Error('PostgreSQL sync status is missing before pull settlement.');
+      }
+      await notifySettlementWhileLocked({ status: 'success', result });
+      await mirrorPostgresSyncStatus(
+        pg,
+        sqlite,
+        requireTerminalStatus,
+        preSettlementStatus ?? undefined
+      );
+      return result;
+    } catch (error) {
+      await notifySettlementWhileLocked({ status: 'failed', error }, true);
+      throw error;
+    }
   } finally {
-    try { if (sqlite && sqliteLockAcquired) await sqlite.releaseSyncLock(lockKey); } catch { /* ignore */ }
-    try { if (pg && pgLockAcquired) await pg.releaseSyncLock(lockKey); } catch { /* ignore */ }
-    try { if (pg) await pg.close(); } catch { /* ignore */ }
-    try { if (sqlite) await sqlite.close(); } catch { /* ignore */ }
+    try {
+      if (sqlite && sqliteLockAcquired) await sqlite.releaseSyncLock(lockKey);
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (pg && pgLockAcquired) await pg.releaseSyncLock(lockKey);
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (pg) await pg.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (sqlite) await sqlite.close();
+    } catch {
+      /* ignore */
+    }
   }
+}
+
+async function mirrorPostgresSyncStatus(
+  pg: PostgresCacheService,
+  sqlite: SQLiteCacheService,
+  requireTerminal: boolean,
+  compensationBase?: CacheSyncStatus
+): Promise<void> {
+  let safeStatus = compensationBase;
+  try {
+    const status = projectSyncStatusForMirror(await pg.getSyncStatus(), requireTerminal);
+    if (!status) return;
+    safeStatus = status;
+    await sqlite.setSyncStatus(status);
+  } catch (error) {
+    if (requireTerminal && safeStatus) {
+      const failedStatus = createCompensatingFailureStatus(safeStatus);
+      await compensateTerminalStatus(pg, sqlite, failedStatus);
+    }
+    throw error;
+  }
+}
+
+function createCompensatingFailureStatus(terminalStatus: CacheSyncStatus): CacheSyncStatus {
+  const timestamp = Math.max(Math.floor(Date.now() / 1_000), terminalStatus.updatedAt);
+  const failedStatus: CacheSyncStatus = {
+    ...terminalStatus,
+    status: 'failed',
+    updatedAt: timestamp,
+    finishedAt: timestamp,
+    message: 'Sync failed',
+    error: 'Cache sync failed.',
+  };
+  delete failedStatus.recordIssues;
+  return failedStatus;
+}
+
+async function compensateTerminalStatus(
+  pg: PostgresCacheService,
+  sqlite: SQLiteCacheService,
+  failedStatus: CacheSyncStatus
+): Promise<void> {
+  try {
+    await sqlite.setSyncStatus(failedStatus);
+  } catch {
+    // Continue to the PostgreSQL compensation while both locks remain held.
+  }
+  try {
+    await pg.setSyncStatus(failedStatus);
+  } catch {
+    // Preserve the local mirror failure; lock cleanup must still run.
+  }
+}
+
+const SYNC_STATUS_MESSAGES: Record<CacheSyncStatus['status'], string> = {
+  running: 'Sync running',
+  success: 'Sync completed',
+  success_with_warnings: 'Sync completed with warnings',
+  failed: 'Sync failed',
+};
+
+const SYNC_PHASES = new Set<CacheSyncPhase>([
+  'initializing',
+  'accounts',
+  'categories',
+  'documents',
+  'inventory',
+  'deleted-log',
+  'pg-to-sqlite-pull',
+  'finalizing',
+]);
+
+const SYNC_PROGRESS_EVENTS = new Set<CacheSyncProgressEventType>([
+  'phase_started',
+  'pass_started',
+  'page_started',
+  'record_processed',
+  'record_failed_collected',
+  'page_completed',
+  'pass_completed',
+  'retry_pass_started',
+  'record_retry_succeeded',
+  'record_retry_failed',
+  'waiting_rate_limit',
+  'phase_completed',
+]);
+
+function projectSyncStatusForMirror(
+  value: unknown,
+  requireTerminal: boolean
+): CacheSyncStatus | null {
+  if (value == null) {
+    if (requireTerminal) throw new Error('PostgreSQL terminal sync status is missing.');
+    return null;
+  }
+  if (!isRecord(value) || !isSyncStatus(value.status)) {
+    throw new Error('PostgreSQL sync status is invalid.');
+  }
+  if (requireTerminal && value.status === 'running') {
+    throw new Error('PostgreSQL sync status was not terminal after pull settlement.');
+  }
+
+  const projected: CacheSyncStatus = {
+    status: value.status,
+    runId: requireSafeText(value.runId),
+    accountName: requireSafeText(value.accountName),
+    syncTarget: requireSyncTarget(value.syncTarget),
+    startedAt: requireNonNegativeInteger(value.startedAt),
+    updatedAt: requireNonNegativeInteger(value.updatedAt),
+    message: SYNC_STATUS_MESSAGES[value.status],
+  };
+  copyOptionalInteger(value, projected, 'finishedAt');
+  copyOptionalInteger(value, projected, 'progressUpdatedAt');
+  for (const key of [
+    'documentsProcessed',
+    'lineItemsProcessed',
+    'itemsProcessed',
+    'categoriesProcessed',
+    'stockRowsProcessed',
+    'deletedRecordsProcessed',
+  ] as const) {
+    copyOptionalInteger(value, projected, key);
+  }
+  if (value.syncType === 'full' || value.syncType === 'delta') projected.syncType = value.syncType;
+
+  const progress = projectSyncProgress(value.progress);
+  if (progress) {
+    projected.progress = progress;
+    projected.phase = progress.phase;
+  } else if (isSyncPhase(value.phase)) {
+    projected.phase = value.phase;
+  }
+
+  const recordIssues = projectSyncRecordIssues(value.recordIssues);
+  if (value.status === 'success_with_warnings' && recordIssues.length === 0) {
+    throw new Error('PostgreSQL warning sync status has no valid record issues.');
+  }
+  if (recordIssues.length > 0) projected.recordIssues = recordIssues;
+  if (value.status === 'failed') projected.error = 'Cache sync failed.';
+  return projected;
+}
+
+function projectSyncRecordIssues(value: unknown): SyncRecordIssue[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error('PostgreSQL sync record issues are invalid.');
+  const issues = new Map<string, SyncRecordIssue>();
+  for (const candidate of value) {
+    const issue = projectSyncRecordIssue(candidate);
+    const key = `${issue.resource}:${issue.id}`;
+    if (issues.has(key))
+      throw new Error('PostgreSQL sync record issues contain duplicate identities.');
+    issues.set(key, issue);
+  }
+  return [...issues.values()].sort(
+    (left, right) =>
+      compareCodeUnits(left.resource, right.resource) ||
+      (left.context_id ?? -1) - (right.context_id ?? -1) ||
+      compareCodeUnits(left.id, right.id)
+  );
+}
+
+function projectSyncRecordIssue(value: unknown): SyncRecordIssue {
+  if (
+    !isRecord(value) ||
+    (value.resource !== 'document' && value.resource !== 'item') ||
+    !isIssueCode(value.code) ||
+    value.attempts !== 2 ||
+    (value.outcome !== 'preserved_last_known_good' && value.outcome !== 'omitted_new')
+  ) {
+    throw new Error('PostgreSQL sync record issue is invalid.');
+  }
+  const contextId = value.context_id;
+  if (
+    contextId !== undefined &&
+    (value.resource !== 'document' ||
+      !Number.isSafeInteger(contextId) ||
+      ![4, 5, 11].includes(Number(contextId)))
+  ) {
+    throw new Error('PostgreSQL sync record issue context is invalid.');
+  }
+  const id = requireSafeSourceId(value.id);
+  if (value.resource === 'document') {
+    if (!isDocumentIssueCode(value.code)) {
+      throw new Error('PostgreSQL document sync record issue is invalid.');
+    }
+    return {
+      resource: 'document',
+      id,
+      ...(contextId === undefined ? {} : { context_id: Number(contextId) }),
+      code: value.code,
+      message: canonicalIssueMessage('document', value.code),
+      attempts: value.attempts,
+      outcome: value.outcome,
+    };
+  }
+  return {
+    resource: 'item',
+    id,
+    code: value.code,
+    message: canonicalIssueMessage('item', value.code),
+    attempts: value.attempts,
+    outcome: value.outcome,
+  };
+}
+
+function canonicalIssueMessage(
+  resource: SyncRecordIssue['resource'],
+  code: SyncRecordIssueCode
+): string {
+  if (resource === 'document') {
+    return code === 'not_found'
+      ? 'Document unavailable during refresh'
+      : 'Document failed source validation';
+  }
+  if (code === 'not_found') return 'Item unavailable during refresh';
+  if (code === 'invalid_record') return 'Item failed source validation';
+  if (code === 'invalid_variations') return 'Item variations failed source validation';
+  return 'Item changed during snapshot verification';
+}
+
+function projectSyncProgress(value: unknown): CacheSyncProgress | undefined {
+  if (
+    !isRecord(value) ||
+    !isSyncPhase(value.phase) ||
+    !isSyncProgressEvent(value.event) ||
+    !isNonNegativeInteger(value.recordsProcessed) ||
+    !(value.recordsTotal === null || isNonNegativeInteger(value.recordsTotal)) ||
+    typeof value.indeterminate !== 'boolean'
+  ) {
+    return undefined;
+  }
+  const projected: CacheSyncProgress = {
+    phase: value.phase,
+    event: value.event,
+    recordsProcessed: value.recordsProcessed,
+    recordsTotal: value.recordsTotal,
+    indeterminate: value.indeterminate,
+  };
+  for (const key of ['pass', 'page', 'timestamp'] as const) {
+    if (isNonNegativeInteger(value[key])) projected[key] = value[key];
+  }
+  if (value.pagesTotal === null || isNonNegativeInteger(value.pagesTotal)) {
+    projected.pagesTotal = value.pagesTotal;
+  }
+  if (value.apiVersion === '2.0' || value.apiVersion === '3') {
+    projected.apiVersion = value.apiVersion;
+  }
+  const rateLimit = projectRateLimit(value.rateLimit);
+  if (rateLimit) projected.rateLimit = rateLimit;
+  return projected;
+}
+
+function projectRateLimit(value: unknown): CacheSyncRateLimitProgress | undefined {
+  if (!isRecord(value)) return undefined;
+  const projected: CacheSyncRateLimitProgress = {};
+  for (const key of [
+    'waitMs',
+    'waitUntil',
+    'retryAfterSeconds',
+    'limit',
+    'remaining',
+    'resetSeconds',
+  ] as const) {
+    const candidate = value[key];
+    if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) {
+      projected[key] = candidate;
+    }
+  }
+  return projected;
+}
+
+function copyOptionalInteger<
+  Key extends keyof Pick<
+    CacheSyncStatus,
+    | 'finishedAt'
+    | 'progressUpdatedAt'
+    | 'documentsProcessed'
+    | 'lineItemsProcessed'
+    | 'itemsProcessed'
+    | 'categoriesProcessed'
+    | 'stockRowsProcessed'
+    | 'deletedRecordsProcessed'
+  >,
+>(source: Record<string, unknown>, target: CacheSyncStatus, key: Key): void {
+  const value = source[key];
+  if (isNonNegativeInteger(value)) target[key] = value;
+}
+
+function requireSafeText(value: unknown): string {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > 256 ||
+    value !== value.trim() ||
+    hasControlCharacter(value) ||
+    hasUnpairedUtf16Surrogate(value)
+  ) {
+    throw new Error('PostgreSQL sync status identifier is invalid.');
+  }
+  return value;
+}
+
+function requireSafeSourceId(value: unknown): string {
+  return requireSafeText(value);
+}
+
+function requireNonNegativeInteger(value: unknown): number {
+  if (!isNonNegativeInteger(value)) throw new Error('PostgreSQL sync status timestamp is invalid.');
+  return value;
+}
+
+function requireSyncTarget(value: unknown): CacheSyncStatus['syncTarget'] {
+  if (value !== 'sqlite' && value !== 'postgresql') {
+    throw new Error('PostgreSQL sync status target is invalid.');
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isSyncStatus(value: unknown): value is CacheSyncStatus['status'] {
+  return (
+    value === 'running' ||
+    value === 'success' ||
+    value === 'success_with_warnings' ||
+    value === 'failed'
+  );
+}
+
+function isSyncPhase(value: unknown): value is CacheSyncPhase {
+  return typeof value === 'string' && SYNC_PHASES.has(value as CacheSyncPhase);
+}
+
+function isSyncProgressEvent(value: unknown): value is CacheSyncProgressEventType {
+  return typeof value === 'string' && SYNC_PROGRESS_EVENTS.has(value as CacheSyncProgressEventType);
+}
+
+function isIssueCode(value: unknown): value is SyncRecordIssueCode {
+  return (
+    value === 'not_found' ||
+    value === 'invalid_record' ||
+    value === 'invalid_variations' ||
+    value === 'content_changed'
+  );
+}
+
+function isDocumentIssueCode(
+  value: SyncRecordIssueCode
+): value is Extract<SyncRecordIssueCode, 'not_found' | 'invalid_record'> {
+  return value === 'not_found' || value === 'invalid_record';
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code <= 31 || code === 127) return true;
+  }
+  return false;
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 // ============ Internal helpers ============
 
-/** Fetch all documents from PG (batched to avoid memory issues) */
+/** Fetch every supported document context, including legacy rows with no modification watermark. */
 async function getAllDocuments(pg: PostgresCacheService): Promise<DocumentRow[]> {
-  // Use getDocumentsModifiedSince(0) to get everything
-  return pg.getDocumentsModifiedSince(0);
+  const documentsByContext = await Promise.all(
+    [DocumentContextId.Estimate, DocumentContextId.Invoice, DocumentContextId.PurchaseOrder].map(
+      (contextId) => pg.getDocumentsByContext(contextId)
+    )
+  );
+  return (
+    documentsByContext
+      .flat()
+      // SQLite's document schema requires a numeric watermark; zero preserves the legacy unknown state.
+      .map((document) => (document.modified == null ? { ...document, modified: 0 } : document))
+      .sort(
+        (left, right) =>
+          left.context_id - right.context_id || compareCodeUnits(left.doc_id, right.doc_id)
+      )
+  );
 }
 
 async function getAllAccounts(pg: PostgresCacheService): Promise<AccountRow[]> {
@@ -137,14 +595,16 @@ async function getAllStockRows(pg: PostgresCacheService): Promise<ItemStockLocat
   return pg.getAllItemStockLocations();
 }
 
-async function getAllPaymentTransactions(pg: PostgresCacheService): Promise<PaymentTransactionRow[]> {
+async function getAllPaymentTransactions(
+  pg: PostgresCacheService
+): Promise<PaymentTransactionRow[]> {
   return pg.getAllPaymentTransactions();
 }
 
 /** Fetch all item_documents from PG */
 async function getAllItemDocuments(
   pg: PostgresCacheService,
-  docs: DocumentRow[],
+  docs: DocumentRow[]
 ): Promise<Omit<ItemDocumentRow, 'id'>[]> {
   const allItems: Omit<ItemDocumentRow, 'id'>[] = [];
 
@@ -152,7 +612,7 @@ async function getAllItemDocuments(
   const batchSize = 100;
   for (let i = 0; i < docs.length; i += batchSize) {
     const batch = docs.slice(i, i + batchSize);
-    const promises = batch.map(doc => pg.getItemDocuments(doc.doc_id));
+    const promises = batch.map((doc) => pg.getItemDocuments(doc.doc_id));
     const results = await Promise.all(promises);
     for (const items of results) {
       for (const item of items) {
