@@ -6,7 +6,7 @@ Command-line interface for [SalesBinder API](https://www.salesbinder.com/api/) -
 
 - Full CRUD operations for Items, Customers, Documents, Locations, Categories
 - **Sales Analytics** with pluggable cache backend (SQLite local or PostgreSQL shared)
-- **Cache Management** with incremental sync, explicit PostgreSQL writes, and optional SQLite mirror pulls
+- **Cache Management** with incremental sync, live stderr progress, record-recovery warnings, explicit PostgreSQL writes, and optional SQLite mirror pulls
 - **Resumable invoice payment backfill** with cache-level payment sync status tracking
 - Secure credential storage (0600 permissions)
 - Multiple account support
@@ -57,6 +57,7 @@ export PATH="$PATH:/path/to/salesbinder-cli/packages/cli/dist"
 ```
 
 Then use directly:
+
 ```bash
 salesbinder items list
 ```
@@ -68,6 +69,7 @@ salesbinder items list
 Configure when the cache is considered stale (default: 3600 seconds = 1 hour).
 
 **Via config file** (`~/.salesbinder/config.json`):
+
 ```json
 {
   "defaultAccount": "default",
@@ -89,6 +91,7 @@ Configure when the cache is considered stale (default: 3600 seconds = 1 hour).
 `apiKey` remains the v2 credential used for accounts, documents, delta sync, and the deleted log. `v3ApiKey` is required by `cache sync` for inventory and category snapshots; there is no v2 fallback for those cache resources. New configurations can set both with `salesbinder config:init --subdomain acme --api-key <v2-key> --v3-api-key <v3-key>`; for an existing configuration, add `v3ApiKey` to that account entry manually. The v3 key must have read access to items and categories, and the cache can only contain records visible to that key. If it is missing, `cache sync` exits before opening or mutating the cache backend.
 
 **Via environment variable** (overrides config):
+
 ```bash
 export SALESBINDER_CACHE_STALE_SECONDS=7200  # 2 hours
 ```
@@ -103,13 +106,16 @@ Set `preferences.syncLookbackSeconds` in `~/.salesbinder/config.json` to tune th
 
 ### Retry Backoff
 
-Transient HTTP retries start at `SALESBINDER_RETRY_INITIAL_DELAY_MS` milliseconds. The value must be a positive integer; invalid, zero, or negative values fall back to `1000`, and values above `60000` are capped at `60000`. The retry set includes 429, 500, 502, 503, 504, and 522.
+SalesBinder requests are paced by a process-local governor, not a distributed lock. v2 uses FIFO rolling windows of `12 requests/10s` and `45 requests/60s`; v3 starts with a conservative `100 requests/60s` fallback and then adapts from server rate-limit headers for the current process and key. Transient HTTP retries still start at `SALESBINDER_RETRY_INITIAL_DELAY_MS` milliseconds, with invalid, zero, or negative values falling back to `1000` and values above `60000` capped at `60000`.
+
+Automatic retries stay conservative: GET and HEAD requests retry automatically, v2 mutations do not retry automatically, and v3 mutations retry 429 responses because the server rejected the request before applying it. A v3 mutation retries a network/5xx failure only when the original request carried an `Idempotency-Key`. If the server asks for a wait longer than 15 minutes, the command fails clearly instead of shortening the wait.
 
 ### Cache Backend
 
 By default, the CLI uses a **local SQLite** database for reads and analytics. For shared/multi-machine setups, you can add a **shared PostgreSQL upstream** via `SALESBINDER_DB_URL`.
 
 **Via environment variable:**
+
 ```bash
 export SALESBINDER_DB_URL=postgres://user:pass@host:5432/salesbinder
 ```
@@ -122,7 +128,7 @@ When `SALESBINDER_DB_URL` is set, PostgreSQL is the shared source of truth.
 - **Reader path:** set `SALESBINDER_READ_BACKEND=postgresql` so analytics read PostgreSQL directly
 - **Optional local mirror:** `cache pull` copies PostgreSQL → SQLite when offline/local reads are needed
 - **Optional sync-and-pull:** `cache sync --pull` writes PostgreSQL, then refreshes local SQLite
-- **Sync status:** `cache_meta.sync_status` records `running`, `success`, or `failed` so readers can detect an active writer
+- **Sync status:** `cache_meta.sync_status` records `running`, `success`, `success_with_warnings`, or `failed` so readers can detect an active writer and partial record recovery
 
 PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `cache sync` do not start a background pull.
 
@@ -132,15 +138,15 @@ Cache schema v4 keeps archive and payment safety intact. Accounts preserve their
 
 Cache schema v6 makes categories a first-class cache feature in SQLite and PostgreSQL. A successful snapshot atomically replaces `categories`, stores typed completion metadata in `category_cache_meta`, writes a matching generation marker, and reconciles category names on items and stock-location rows. Invalid pagination or an interrupted fetch performs no category writes. Rolling back to v5 may leave v6 columns or rows physically present; after re-upgrade they remain non-authoritative until a new v6 category snapshot completes.
 
-Cache schema v7 records the source API version for inventory and category rows. Items, variation-location details, and categories are fetched as complete validated v3 snapshots and published atomically; archive coverage uses `archived=all`. `cache sync` requires `v3ApiKey` and does not fall back to v2 for these resources. Embedded variation locations retain their names, while a parent item's direct `location_id` has no location name unless the item payload supplies one. CSV-derived stock rows and their numeric values remain unchanged; when a CSV and API item share an ID, the v3 row is the canonical item master. For direct SQL, treat `NULL` as unknown—not as zero—and check the snapshot metadata before treating a cache as authoritative.
+Cache schema v7 records the source API version for inventory and category rows. Items, variation-location details, and categories are fetched as complete validated v3 snapshots and published atomically; archive coverage uses `archived=all`. `cache sync` requires `v3ApiKey` and does not fall back to v2 for these resources. Inventory snapshot metadata format v2 is an internal cache contract for clean and warning outcomes, not SalesBinder API v2. Embedded variation locations retain their names, while a parent item's direct `location_id` has no location name unless the item payload supplies one. CSV-derived stock rows and their numeric values remain unchanged; when a CSV and API item share an ID, the v3 row is the canonical item master. For direct SQL, treat `NULL` as unknown—not as zero—and check the snapshot metadata before treating a cache as authoritative.
 
-| Feature | SQLite (local mirror) | PostgreSQL (shared upstream) |
-|---------|------------------------|-------------------------------|
-| Role | Local read cache for analytics | Shared source of truth |
-| Setup | Zero config | Requires connection URL |
-| Storage | `~/.salesbinder/cache/` | Remote database |
-| Sharing | Single machine | Multi-machine / shared, one SalesBinder account per database |
-| Performance | Fast local reads | Shared state across machines |
+| Feature     | SQLite (local mirror)          | PostgreSQL (shared upstream)                                 |
+| ----------- | ------------------------------ | ------------------------------------------------------------ |
+| Role        | Local read cache for analytics | Shared source of truth                                       |
+| Setup       | Zero config                    | Requires connection URL                                      |
+| Storage     | `~/.salesbinder/cache/`        | Remote database                                              |
+| Sharing     | Single machine                 | Multi-machine / shared, one SalesBinder account per database |
+| Performance | Fast local reads               | Shared state across machines                                 |
 
 For reader agents:
 
@@ -309,6 +315,7 @@ node packages/cli/dist/cli.js analytics trends <item-id>
 ```
 
 **Example output:**
+
 ```json
 {
   "item_id": "abc123",
@@ -344,6 +351,7 @@ node packages/cli/dist/cli.js analytics inventory <item-id>
 ```
 
 **Example output:**
+
 ```json
 {
   "item_id": "abc123",
@@ -389,22 +397,23 @@ node packages/cli/dist/cli.js analytics pricing <item-id>
 ```
 
 **Example output:**
+
 ```json
 {
   "item_id": "abc123",
   "item_name": "Product Name",
   "period": "12 months",
   "price_stats": {
-    "min": 20.00,
-    "max": 25.00,
+    "min": 20.0,
+    "max": 25.0,
     "avg": 23.33,
-    "median": 22.50,
-    "std_dev": 2.50,
+    "median": 22.5,
+    "std_dev": 2.5,
     "variance_pct": 10.7
   },
   "price_distribution": [
-    { "price": 20.00, "quantity": 10, "revenue": 200.00, "frequency_pct": 16.7 },
-    { "price": 25.00, "quantity": 50, "revenue": 1250.00, "frequency_pct": 83.3 }
+    { "price": 20.0, "quantity": 10, "revenue": 200.0, "frequency_pct": 16.7 },
+    { "price": 25.0, "quantity": 50, "revenue": 1250.0, "frequency_pct": 83.3 }
   ],
   "discounts": {
     "has_discounts": true,
@@ -432,6 +441,7 @@ node packages/cli/dist/cli.js analytics customers <item-id> --resolve-names
 ```
 
 **Example output:**
+
 ```json
 {
   "item_id": "abc123",
@@ -439,13 +449,13 @@ node packages/cli/dist/cli.js analytics customers <item-id> --resolve-names
   "period": "12 months",
   "total_customers": 2,
   "total_quantity": 70,
-  "total_revenue": 1750.00,
+  "total_revenue": 1750.0,
   "top_customers": [
     {
       "customer_id": "cust-1",
       "customer_name": "Acme Corporation",
       "quantity": 30,
-      "revenue": 750.00,
+      "revenue": 750.0,
       "share_pct": 42.9,
       "order_count": 2,
       "avg_order_size": 15
@@ -454,7 +464,7 @@ node packages/cli/dist/cli.js analytics customers <item-id> --resolve-names
       "customer_id": "cust-2",
       "customer_name": "Beta Industries",
       "quantity": 40,
-      "revenue": 1000.00,
+      "revenue": 1000.0,
       "share_pct": 57.1,
       "order_count": 3,
       "avg_order_size": 13.33
@@ -488,6 +498,7 @@ node packages/cli/dist/cli.js analytics forecast <item-id>
 ```
 
 **Example output:**
+
 ```json
 {
   "item_id": "abc123",
@@ -495,9 +506,24 @@ node packages/cli/dist/cli.js analytics forecast <item-id>
   "method": "moving_average",
   "historical_period": "6 months",
   "forecast": [
-    { "month": "2026-02", "predicted_quantity": 13, "predicted_revenue": 325, "confidence": "medium" },
-    { "month": "2026-03", "predicted_quantity": 14, "predicted_revenue": 350, "confidence": "medium" },
-    { "month": "2026-04", "predicted_quantity": 15, "predicted_revenue": 375, "confidence": "medium" }
+    {
+      "month": "2026-02",
+      "predicted_quantity": 13,
+      "predicted_revenue": 325,
+      "confidence": "medium"
+    },
+    {
+      "month": "2026-03",
+      "predicted_quantity": 14,
+      "predicted_revenue": 350,
+      "confidence": "medium"
+    },
+    {
+      "month": "2026-04",
+      "predicted_quantity": 15,
+      "predicted_revenue": 375,
+      "confidence": "medium"
+    }
   ],
   "summary": {
     "avg_monthly_sales": 12.33,
@@ -521,6 +547,7 @@ node packages/cli/dist/cli.js analytics patterns <item-id>
 ```
 
 **Example output:**
+
 ```json
 {
   "item_id": "abc123",
@@ -616,7 +643,7 @@ node packages/cli/dist/cli.js cache sync --full
 # Backfill invoice payment transactions (resumable)
 node packages/cli/dist/cli.js cache sync-payments
 
-# Check cache status (includes authoritative category and inventory snapshot metadata)
+# Check cache status (includes authoritative category and inventory snapshot metadata, latest progress, and sync health)
 node packages/cli/dist/cli.js cache status
 
 # Clear cache data
@@ -625,9 +652,11 @@ node packages/cli/dist/cli.js cache clear
 
 `cache sync --pull` is the only sync path that refreshes the local SQLite mirror. If the requested mirror refresh fails, the command exits non-zero and reports the pull error.
 
-Every normal, delta, full, and full-resume sync requires `v3ApiKey` and fetches categories and inventory as complete validated v3 snapshots. There is no v2 fallback for either cache resource. Pagination metadata must remain coherent across every page, and two consecutive v3 membership reads must agree before publication. The previous category or inventory snapshot remains unchanged if fetch or validation fails.
+Every normal, delta, full, and full-resume sync requires `v3ApiKey` and fetches categories and inventory as complete validated v3 snapshots. There is no v2 fallback for either cache resource. Pagination metadata must remain coherent across every page, and two consecutive v3 membership reads must agree before publication. The previous category or inventory snapshot remains unchanged if fetch or validation fails. Item membership and deletion come only from that v3 snapshot; v2 deleted-log item tombstones are excluded, so `deleted_records_processed` covers the remaining deleted-log resources. An item deleted after the snapshot boundary disappears on the next sync.
 
-`cache sync --full-resume` writes a private checkpoint under the per-account cache directory with restrictive permissions and resumes completed phases in this order: accounts, categories, documents, items, deleted log. Category and inventory generations and content fingerprints are checkpoint evidence, so a same-count content change invalidates stale evidence. The checkpoint is bound to the account, sync target, schema, and cache identity; checkpoints from older schemas, malformed files, and cross-account checkpoints fail closed and ask for `--reset-checkpoint`. A resumed v3 item phase always reruns the entire atomic inventory snapshot rather than resuming midway through it.
+While cache sync runs, live progress is written to stderr. Clean runs exit `0` and write one final JSON object to stdout. Runs with identifiable record-local warnings also exit `0` and return `status: success_with_warnings` with deterministic, sanitized `failed_documents` and `failed_items` lists. Each unresolved document or item gets exactly one application recovery attempt after the primary pass; recovered records disappear from the warning list, unresolved existing rows keep their last-known-good data, and unresolved new rows are omitted. A later deleted-log tombstone removes only the exact matching document context and API ID from that warning list; if this resolves every invoice warning, the corresponding document-refresh payment status completes without overwriting unrelated payment failures. Warning runs keep the last clean `lastSync`/`lastFullSync` values and set `lastSyncAttempt`, and systemic/auth/transport/storage failures still exit `1`.
+
+`cache sync --full-resume` writes a private v5 checkpoint under the per-account cache directory with restrictive permissions and resumes completed phases in this order: accounts, categories, documents, items, deleted log. Category and inventory generations and content fingerprints are checkpoint evidence, so a same-count content change invalidates stale evidence. The checkpoint is bound to the account, sync target, schema, and cache identity; checkpoints from older schemas, malformed files, and cross-account checkpoints fail closed and ask for `--reset-checkpoint`. Warning-phase results are stored too, so a resumed run can restore unresolved lists after a completed warning phase. For source integrity, an incomplete document phase replays from its first page; its stored document position is progress/diagnostic evidence, not a safe write cursor. Completed phases remain skippable. A resumed v3 item phase always reruns the entire atomic inventory snapshot rather than resuming midway through it.
 
 `cache clear` deletes category rows, category snapshot metadata, and the generation marker. PostgreSQL deliberately preserves its immutable SalesBinder account binding; use a separate database when changing accounts. SQLite also verifies its durable account binding before deleting the local file. For a legacy SQLite file created before binding markers existed, `cache clear --force-unbound` is the explicit recovery path; it works only when both markers are absent and never overrides a mismatched or partial binding.
 
@@ -637,22 +666,23 @@ The CSV import expects these local export files under the import directory: cust
 
 Expected PhuthaiTech seed counts:
 
-| Dataset | Count |
-|---|---:|
-| Customers | 4,626 |
-| Suppliers | 822 |
-| Invoice documents | 28,925 |
-| Invoice line rows | 68,618 |
-| Purchase order documents | 5,535 |
-| Purchase order line rows | 13,010 |
-| Item master rows | 33,912 |
-| Stock location rows | 218,613 |
+| Dataset                  |   Count |
+| ------------------------ | ------: |
+| Customers                |   4,626 |
+| Suppliers                |     822 |
+| Invoice documents        |  28,925 |
+| Invoice line rows        |  68,618 |
+| Purchase order documents |   5,535 |
+| Purchase order line rows |  13,010 |
+| Item master rows         |  33,912 |
+| Stock location rows      | 218,613 |
 
-Forward sync after the CSV seed caches modified customers/suppliers, invoices/POs/estimates, items, item stock locations from full item detail, and deleted-log removals by stable `record_id`.
+Forward sync after the CSV seed caches modified customers/suppliers, invoices/POs/estimates, items, and item stock locations from full v3 item detail. V2 deleted-log removals apply only to non-item resources by stable `record_id`; the complete v3 inventory snapshot owns item removal while preserving CSV fallback rows.
 
-Archive state is metadata, not a deletion signal: missing list results and 404 responses do not remove rows. Deleted-log records remain the hard-delete authority. The current official v3 documents contract is active-only and does not expose an `archived` field, so document archive coverage must not be treated as complete. Existing analytics continue to include cached historical records regardless of archive state.
+Archive state is metadata, not a deletion signal: missing list results and 404 responses do not remove rows. Deleted-log records remain the hard-delete authority for non-item resources; validated complete v3 inventory membership owns item removal. The current official v3 documents contract is active-only and does not expose an `archived` field, so document archive coverage must not be treated as complete. Existing analytics continue to include cached historical records regardless of archive state.
 
 **Performance:**
+
 - CSV import: local only, no historical API fetch
 - First API full sync: 5-10 minutes or more depending on account size
 - Delta sync to PostgreSQL: <1 minute for small change sets
@@ -666,6 +696,7 @@ Archive state is metadata, not a deletion signal: missing list results and 404 r
 For daily operations involving item sales analytics with PostgreSQL as the source of truth:
 
 1. **Initial Setup** (one-time):
+
    ```bash
    # Seed historical data from local exports
    node packages/cli/dist/cli.js --account phuthaitech cache import-export data/ --dry-run
@@ -676,12 +707,14 @@ For daily operations involving item sales analytics with PostgreSQL as the sourc
    ```
 
 2. **Writer Agent**:
+
    ```bash
    # Fast incremental write: SalesBinder API -> PostgreSQL
    node packages/cli/dist/cli.js --account phuthaitech cache sync
    ```
 
 3. **Reader Agents**:
+
    ```bash
    # Read directly from PostgreSQL source of truth
    export SALESBINDER_READ_BACKEND=postgresql
@@ -689,12 +722,14 @@ For daily operations involving item sales analytics with PostgreSQL as the sourc
    ```
 
 4. **Optional Local Mirror**:
+
    ```bash
    # Refresh local SQLite only when offline/local reads are needed
    node packages/cli/dist/cli.js --account phuthaitech cache pull
    ```
 
 5. **Status Check**:
+
    ```bash
    # Shows backend counts, freshness, and sync_status
    node packages/cli/dist/cli.js --account phuthaitech cache status
@@ -706,11 +741,13 @@ For daily operations involving item sales analytics with PostgreSQL as the sourc
    - Use `SALESBINDER_CACHE_STALE_SECONDS` environment variable for per-session override
 
 **Why this workflow?**
+
 - CSV import avoids historical API fetches.
-- Delta sync only requests recent modified accounts/documents/items and deleted-log entries.
+- Delta sync requests recent modified accounts/documents and deleted-log entries; its item phase
+  validates and atomically publishes a complete v3 inventory snapshot.
 - Cached queries are instant (<100ms).
 - Writer sync is explicit, so reader agents do not unexpectedly wait for PostgreSQL → SQLite pulls.
-- `cache status` shows `sync_status` when a strict report should wait for the writer to finish.
+- `cache status` shows `sync_status` and `sync_health` when a strict report should wait for the writer to finish.
 - `--cached` flag skips sync check for fastest queries.
 - `--refresh` flag forces fresh data when needed
 
@@ -750,40 +787,44 @@ When using this CLI via AI agents (Claude, ChatGPT, etc.), the CLI provides comp
 
 ### Key Commands for Agents
 
-| Command | Purpose |
-|---------|---------|
-| `salesbinder config:init` | Setup credentials |
-| `salesbinder items list` | Browse inventory |
-| `salesbinder items get <id>` | Get item details |
-| `salesbinder customers list` | Browse customers |
-| `salesbinder documents list` | Browse invoices/estimates |
-| `salesbinder analytics item-sales <id>` | Get item sales analytics |
-| `salesbinder cache sync` | Sync SalesBinder API deltas to the configured cache backend |
-| `salesbinder cache sync --pull` | Sync to PostgreSQL, then refresh local SQLite mirror |
-| `salesbinder cache status` | Check cache status |
-| `salesbinder --help` | Show all commands |
-| `salesbinder <command> --help` | Command-specific help |
+| Command                                 | Purpose                                                     |
+| --------------------------------------- | ----------------------------------------------------------- |
+| `salesbinder config:init`               | Setup credentials                                           |
+| `salesbinder items list`                | Browse inventory                                            |
+| `salesbinder items get <id>`            | Get item details                                            |
+| `salesbinder customers list`            | Browse customers                                            |
+| `salesbinder documents list`            | Browse invoices/estimates                                   |
+| `salesbinder analytics item-sales <id>` | Get item sales analytics                                    |
+| `salesbinder cache sync`                | Sync SalesBinder API deltas to the configured cache backend |
+| `salesbinder cache sync --pull`         | Sync to PostgreSQL, then refresh local SQLite mirror        |
+| `salesbinder cache status`              | Check cache status                                          |
+| `salesbinder --help`                    | Show all commands                                           |
+| `salesbinder <command> --help`          | Command-specific help                                       |
 
 ### Common Patterns
 
 **Find item by name:**
+
 ```bash
 # Search, then get full details
 salesbinder items list --search "cutter" | jq -r '.items[0].id' | xargs salesbinder items get
 ```
 
 **Check stock at location:**
+
 ```bash
 # Item response includes quantities per location
 salesbinder items get <id> | jq '.item_variations[].item_variations_locations'
 ```
 
 **Find customer invoices:**
+
 ```bash
 salesbinder documents list --context 5 --customer <customer-id>
 ```
 
 **Get item sales analytics:**
+
 ```bash
 # Quick analytics from cache
 salesbinder analytics item-sales <item-id> --cached
@@ -794,14 +835,14 @@ salesbinder analytics item-sales <item-id> --refresh
 
 ### Context ID Reference
 
-| Type | Context ID |
-|------|------------|
-| Customer | 2 |
-| Prospect | 8 |
-| Supplier | 10 |
-| Estimate | 4 |
-| Invoice | 5 |
-| Purchase Order | 11 |
+| Type           | Context ID |
+| -------------- | ---------- |
+| Customer       | 2          |
+| Prospect       | 8          |
+| Supplier       | 10         |
+| Estimate       | 4          |
+| Invoice        | 5          |
+| Purchase Order | 11         |
 
 ## Development
 
@@ -881,7 +922,7 @@ chmod 0600 ~/.salesbinder/config.json
 
 ### Rate limit errors
 
-The CLI handles rate limiting automatically with exponential backoff. Wait and retry.
+The CLI uses the same process-local rate governor described above. It applies the v2 `12/10s` and `45/60s` windows, adapts v3 pacing from server headers with a `100/60s` fallback, and keeps the wait owner inside the governor so retry handling does not sleep twice. Safe GET/HEAD retries continue automatically, v2 mutations do not retry automatically, and v3 mutations retry 429 responses because the server rejected the request before applying it. A v3 mutation retries a network/5xx failure only when the original request included an `Idempotency-Key`. If the server asks for more than 15 minutes of wait time, the command fails clearly instead of shortening it.
 
 ### Cache sync issues
 
