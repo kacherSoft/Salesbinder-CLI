@@ -215,6 +215,12 @@ export class PostgresCacheService implements CacheService {
   constructor(connectionString: string) {
     this.connectionString = connectionString;
     this.pool = new Pool({ connectionString });
+    // node-postgres emits pool-level errors when an idle connection drops.
+    // Handle them here so a transient idle-client failure does not become an
+    // uncaught EventEmitter error. Never include the connection string.
+    this.pool.on('error', (error) => {
+      console.error(`PostgreSQL idle client error: ${error.message}`);
+    });
   }
 
   async ensureSchema(): Promise<void> {

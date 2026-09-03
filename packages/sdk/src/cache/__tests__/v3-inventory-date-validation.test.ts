@@ -96,7 +96,7 @@ describe('v3 inventory source dates', () => {
         items: {
           list: jest.fn(async () => page([preserved, omitted])),
           get,
-          listVariations: jest.fn(),
+          listVariations: jest.fn(async () => variationPage([])),
         },
       },
       cache,
@@ -169,6 +169,16 @@ function page(data: V3Item[]): V3ListResponse<V3Item> {
   return {
     object: 'list',
     url: '/api/v3/items',
+    has_more: false,
+    data,
+    pagination: { page: 1, per_page: 100, total_pages: 1, total_records: data.length },
+  };
+}
+
+function variationPage(data: import('../../types/items.types.js').V3ItemVariation[]): import('../../types/items.types.js').V3ListResponse<import('../../types/items.types.js').V3ItemVariation> {
+  return {
+    object: 'list',
+    url: '/api/v3/items/item-1/variations',
     has_more: false,
     data,
     pagination: { page: 1, per_page: 100, total_pages: 1, total_records: data.length },

@@ -146,6 +146,15 @@ const inventorySnapshot = (): InventorySnapshot => {
   };
 };
 
+describe('PostgresCacheService connection lifecycle', () => {
+  it('installs a pool error listener so idle network errors are handled', () => {
+    const service = new PostgresCacheService('postgres://example/cache');
+    const pool = (service as unknown as { pool: { listenerCount(event: string): number } }).pool;
+
+    expect(pool.listenerCount('error')).toBeGreaterThan(0);
+  });
+});
+
 const refreshInventoryFingerprint = (snapshot: InventorySnapshot): void => {
   snapshot.meta.fingerprint = createInventorySnapshotFingerprint(
     snapshot.meta.accountIdentity,

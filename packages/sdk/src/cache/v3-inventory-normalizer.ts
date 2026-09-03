@@ -39,6 +39,7 @@ export function normalizeV3InventoryItem(
   const price = optionalDecimalNumber(item.price, 'item price');
   const cost = optionalDecimalNumber(item.cost, 'item cost');
   const categoryName = canonicalCategoryName(item, categoryId, categoryNames);
+  const archived = requiredBoolean(item.archived, 'item archived');
   const inTransit = variations.length === 0 ? null : sumVariationInTransit(variations);
   const stockRows =
     variations.length === 0
@@ -65,7 +66,7 @@ export function normalizeV3InventoryItem(
     item: {
       item_id: requiredText(item.id, 'item id'),
       item_number: itemNumber,
-      name: requiredText(item.name, 'item name'),
+      name: itemDisplayName(item, itemNumber, archived),
       description: nullableText(item.description),
       sku: nullableText(item.sku),
       serial_number: nullableText(item.serial_number),
@@ -81,7 +82,7 @@ export function normalizeV3InventoryItem(
       cost,
       price,
       published: requiredBoolean(item.published, 'item published') ? 1 : 0,
-      archived: requiredBoolean(item.archived, 'item archived') ? 1 : 0,
+      archived: archived ? 1 : 0,
       created: requiredSalesBinderTimestamp(item.created_at, 'created_at'),
       modified: toUnix(item.updated_at),
       cache_source: 'api',
@@ -450,6 +451,20 @@ function requiredText(
   return value.trim();
 }
 
+function itemDisplayName(item: V3Item, itemNumber: number, archived: boolean): string {
+  try {
+    return requiredText(item.name, 'item name');
+  } catch (error) {
+    if (!archived || !(error instanceof ApiResponseValidationError)) throw error;
+    for (const candidate of [item.sku, item.barcode, item.serial_number]) {
+      if (typeof candidate === 'string' && candidate.trim() && !candidate.includes('\0')) {
+        return requiredText(candidate, 'archived item fallback name');
+      }
+    }
+    return `Unnamed archived item ${itemNumber || item.id}`;
+  }
+}
+
 function requiredCanonicalText(
   value: unknown,
   field: string,
@@ -469,10 +484,14 @@ function nullableCanonicalText(value: unknown, field: string): string | null {
 
 function nullableText(value: unknown, scope: 'record' | 'variations' = 'record'): string | null {
   if (value == null || value === '') return null;
-  if (typeof value !== 'string' || value.includes('\0') || hasUnpairedUtf16Surrogate(value)) {
+  if (typeof value !== 'string' || hasUnpairedUtf16Surrogate(value)) {
     throw new ApiResponseValidationError('Invalid v3 text value', scope);
   }
-  return value;
+  // PostgreSQL text cannot contain U+0000. The legacy API has returned it in
+  // optional display/free-text fields, so remove only that code point here;
+  // canonical IDs still go through strict validation above.
+  const sanitized = value.replace(/\0/g, '');
+  return sanitized === '' ? null : sanitized;
 }
 
 function requiredJsonNumber(

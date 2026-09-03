@@ -22,7 +22,6 @@ import {
   contentChangedReason,
   createInventorySnapshot,
   invalidRecordReason,
-  invalidVariationsReason,
   type LocalIssueReason,
 } from './v3-inventory-recovery.js';
 import {
@@ -33,6 +32,8 @@ import {
 } from './v3-inventory-source-validation.js';
 
 const PAGE_LIMIT = 100;
+const SNAPSHOT_MAX_ATTEMPTS = 3;
+const SNAPSHOT_RETRY_DELAY_MS = 2_000;
 const INVENTORY_SNAPSHOT_READ_CAPABILITY_ERROR =
   'V3 inventory sync requires inventory snapshot read support.';
 
@@ -102,16 +103,10 @@ export class V3InventoryIndexerService {
       ? new Map(categorySnapshot.rows.map((row) => [row.category_id, row.name]))
       : null;
 
-    const firstPass = await this.readPass(1, categoryNames, options.onProgressEvent);
-    const secondPass = await this.readPass(
-      2,
+    const { firstPass, secondPass } = await this.readStablePassPair(
       categoryNames,
-      options.onProgressEvent,
-      firstPass.ids
+      options.onProgressEvent
     );
-    if (!sameV3PaginationSignature(firstPass.paginationSignature, secondPass.paginationSignature)) {
-      throw new Error('V3 item root pagination changed during stability verification');
-    }
     const fresh = new Map<string, NormalizedV3InventoryItem>();
     const recovery = new Map<string, LocalIssueReason>();
 
@@ -222,6 +217,35 @@ export class V3InventoryIndexerService {
     };
   }
 
+  private async readStablePassPair(
+    categoryNames: Map<string, string> | null,
+    onProgressEvent?: CacheSyncProgressCallback
+  ): Promise<{ firstPass: SourcePass; secondPass: SourcePass }> {
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= SNAPSHOT_MAX_ATTEMPTS; attempt++) {
+      try {
+        const firstPass = await this.readPass(1, categoryNames, onProgressEvent);
+        const secondPass = await this.readPass(2, categoryNames, onProgressEvent, firstPass.ids);
+        if (
+          !sameV3PaginationSignature(
+            firstPass.paginationSignature,
+            secondPass.paginationSignature
+          )
+        ) {
+          throw new Error('V3 item root pagination changed during stability verification');
+        }
+        return { firstPass, secondPass };
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (!isRetryableRootSnapshotDrift(lastError) || attempt === SNAPSHOT_MAX_ATTEMPTS) {
+          throw lastError;
+        }
+        await sleep(SNAPSHOT_RETRY_DELAY_MS * attempt);
+      }
+    }
+    throw lastError ?? new Error('Unable to verify a stable v3 item root snapshot');
+  }
+
   private async readPass(
     pass: number,
     categoryNames: Map<string, string> | null,
@@ -281,14 +305,14 @@ export class V3InventoryIndexerService {
 
     let variations: V3ItemVariation[];
     try {
-      variations = item.variation_count > 0 ? await this.fetchAllVariations(item) : [];
+      // The live v3 root item's variation_count is advisory and can lag behind
+      // the authoritative paginated variations endpoint (including reporting
+      // zero while rows exist). Always read and validate the endpoint snapshot.
+      variations = await this.fetchAllVariations(item);
     } catch (error) {
       const failure = classifyInventoryLocalFailure(error, 'variations');
       if (failure) return { item, failure };
       throw error;
-    }
-    if (variations.length !== item.variation_count) {
-      return { item, failure: invalidVariationsReason() };
     }
 
     try {
@@ -375,6 +399,17 @@ export class V3InventoryIndexerService {
   ): void {
     onProgressEvent?.({ phase: 'inventory', apiVersion: '3', ...progress });
   }
+}
+
+function isRetryableRootSnapshotDrift(error: Error): boolean {
+  return (
+    /V3 items pagination changed during snapshot$/.test(error.message) ||
+    error.message === 'V3 item root pagination changed during stability verification'
+  );
+}
+
+function sleep(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function nowSeconds(): number {

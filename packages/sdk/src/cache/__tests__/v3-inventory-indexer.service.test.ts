@@ -86,6 +86,98 @@ describe('V3InventoryIndexerService', () => {
     expect(get).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [1, 2],
+    [0, 1],
+  ])(
+    'treats variation_count=%i as advisory when the endpoint returns %i rows',
+    async (declaredCount, fetchedCount) => {
+      const item = v3Item({ variation_count: declaredCount });
+      const variations = Array.from({ length: fetchedCount }, (_, index) =>
+        v3Variation({
+          id: `variation-${index + 1}`,
+          locations: [
+            {
+              ...v3Variation().locations![0],
+              item_variation_location_id: 42 + index,
+            },
+          ],
+        })
+      );
+      const replaceInventorySnapshot = jest.fn(async () => undefined);
+      const listVariations = jest.fn(async () => page(variations));
+      const service = new V3InventoryIndexerService(
+        { items: { list: jest.fn(async () => page([item])), get: jest.fn(), listVariations } },
+        fakeCache({ replaceInventorySnapshot }),
+        'default',
+        'salesbinder:acme'
+      );
+
+      await expect(service.sync()).resolves.toMatchObject({ stockRowsProcessed: fetchedCount });
+      expect(listVariations).toHaveBeenCalledTimes(2);
+      expect(replaceInventorySnapshot).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('keeps archived legacy records with blank names and PostgreSQL-invalid optional NUL text', async () => {
+    const item = v3Item({
+      item_number: 22066,
+      name: '\n',
+      serial_number: 'Holex',
+      description: 'Stereoscopic Zoom Microscope\0( Kính hiển vi soi nổi )',
+      archived: true,
+    });
+    const replaceInventorySnapshot = jest.fn(async () => undefined);
+    const service = new V3InventoryIndexerService(
+      {
+        items: {
+          list: jest.fn(async () => page([item])),
+          get: jest.fn(),
+          listVariations: jest.fn(async () => page([])),
+        },
+      },
+      fakeCache({ replaceInventorySnapshot }),
+      'default',
+      'salesbinder:acme'
+    );
+
+    await expect(service.sync()).resolves.toMatchObject({ itemsProcessed: 1 });
+    expect(replaceInventorySnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({
+        items: [
+          expect.objectContaining({
+            name: 'Holex',
+            description: 'Stereoscopic Zoom Microscope( Kính hiển vi soi nổi )',
+            archived: 1,
+          }),
+        ],
+      })
+    );
+  });
+
+  it('keeps blank names invalid for active items', async () => {
+    const item = v3Item({ name: '\n', archived: false });
+    const replaceInventorySnapshot = jest.fn(async () => undefined);
+    const get = jest.fn(async () => item);
+    const service = new V3InventoryIndexerService(
+      {
+        items: {
+          list: jest.fn(async () => page([item])),
+          get,
+          listVariations: jest.fn(async () => page([])),
+        },
+      },
+      fakeCache({ replaceInventorySnapshot }),
+      'default',
+      'salesbinder:acme'
+    );
+
+    const result = await service.sync();
+    expect(result.recordIssues).toEqual([
+      expect.objectContaining({ id: item.id, code: 'invalid_record', outcome: 'omitted_new' }),
+    ]);
+  });
+
   it('completes after atomic snapshot replacement without post-commit cache state calls', async () => {
     const item = v3Item();
     const terminalOrder: string[] = [];
@@ -107,7 +199,7 @@ describe('V3InventoryIndexerService', () => {
         items: {
           list: jest.fn(async () => page([item])),
           get: jest.fn(),
-          listVariations: jest.fn(),
+          listVariations: jest.fn(async () => page([])),
         },
       },
       fakeCache({
@@ -147,7 +239,7 @@ describe('V3InventoryIndexerService', () => {
       );
     const replaceInventorySnapshot = jest.fn();
     const service = new V3InventoryIndexerService(
-      { items: { list, get: jest.fn(async () => recovered), listVariations: jest.fn() } },
+      { items: { list, get: jest.fn(async () => recovered), listVariations: jest.fn(async () => page([])) } },
       fakeCache({ replaceInventorySnapshot }),
       'default',
       'salesbinder:acme'
@@ -269,9 +361,9 @@ describe('V3InventoryIndexerService', () => {
         locations: undefined,
       }),
     ];
-    const get = jest.fn(async (id: string) => (id === preserved.id ? preserved : omitted));
+    const get = jest.fn(async (id: string) => id === preserved.id ? preserved : id === omitted.id ? omitted : valid);
     const listVariations = jest.fn(async (id: string) =>
-      page(overflowVariations(id === preserved.id ? preserved : omitted))
+      page(id === valid.id ? [] : overflowVariations(id === preserved.id ? preserved : omitted))
     );
     const replaceInventorySnapshot = jest.fn();
     const priorItem = {
@@ -330,7 +422,7 @@ describe('V3InventoryIndexerService', () => {
     const result = await service.sync();
 
     expect(get.mock.calls.map(([id]) => id)).toEqual(['item-omit', 'item-preserve']);
-    expect(listVariations).toHaveBeenCalledTimes(6);
+    expect(listVariations).toHaveBeenCalledTimes(8);
     expect(result.recordIssues).toEqual([
       expect.objectContaining({
         id: omitted.id,
@@ -363,8 +455,8 @@ describe('V3InventoryIndexerService', () => {
       item_id: malformed.id,
       locations: [null] as unknown as V3ItemVariation['locations'],
     });
-    const get = jest.fn(async () => malformed);
-    const listVariations = jest.fn(async () => page([malformedVariation]));
+    const get = jest.fn(async (id: string) => id === malformed.id ? malformed : valid);
+    const listVariations = jest.fn(async (id: string) => page(id === malformed.id ? [malformedVariation] : []));
     const replaceInventorySnapshot = jest.fn();
     const service = new V3InventoryIndexerService(
       {
@@ -382,7 +474,7 @@ describe('V3InventoryIndexerService', () => {
     const result = await service.sync();
 
     expect(get).toHaveBeenCalledTimes(1);
-    expect(listVariations).toHaveBeenCalledTimes(3);
+    expect(listVariations).toHaveBeenCalledTimes(5);
     expect(result.recordIssues).toEqual([
       expect.objectContaining({
         id: malformed.id,
@@ -533,8 +625,9 @@ describe('V3InventoryIndexerService', () => {
           },
         ],
       });
-    const get = jest.fn(async (id: string) => (id === preserved.id ? preserved : omitted));
+    const get = jest.fn(async (id: string) => id === preserved.id ? preserved : id === omitted.id ? omitted : valid);
     const listVariations = jest.fn(async (itemId: string) => {
+      if (itemId === valid.id) return page([]);
       const item = itemId === preserved.id ? preserved : omitted;
       return page([duplicateRows(item)]);
     });
@@ -597,7 +690,7 @@ describe('V3InventoryIndexerService', () => {
     const result = await service.sync();
 
     expect(get.mock.calls.map(([id]) => id)).toEqual(['item-omit', 'item-preserve']);
-    expect(listVariations).toHaveBeenCalledTimes(6);
+    expect(listVariations).toHaveBeenCalledTimes(8);
     expect(result.recordIssues).toEqual([
       expect.objectContaining({
         id: omitted.id,
@@ -728,7 +821,7 @@ describe('V3InventoryIndexerService', () => {
             has_more: true,
           })),
           get: jest.fn(),
-          listVariations: jest.fn(),
+          listVariations: jest.fn(async () => page([])),
         },
       },
       fakeCache({ replaceInventorySnapshot }),
@@ -747,7 +840,7 @@ describe('V3InventoryIndexerService', () => {
       .mockResolvedValueOnce(page([v3Item({ id: 'item-first' })]))
       .mockResolvedValueOnce(page([v3Item({ id: 'item-second' })]));
     const service = new V3InventoryIndexerService(
-      { items: { list, get: jest.fn(), listVariations: jest.fn() } },
+      { items: { list, get: jest.fn(), listVariations: jest.fn(async () => page([])) } },
       fakeCache({ replaceInventorySnapshot }),
       'default',
       'salesbinder:acme'
@@ -759,39 +852,78 @@ describe('V3InventoryIndexerService', () => {
   });
 
   it('keeps cross-pass root pagination layout changes fatal when item IDs and content match', async () => {
+    jest.useFakeTimers();
     const first = v3Item({ id: 'item-first', item_number: 1 });
     const second = v3Item({ id: 'item-second', item_number: 2 });
-    const list = jest
-      .fn()
-      .mockResolvedValueOnce(
-        page([first, second], { per_page: 2, total_pages: 1, total_records: 2 })
-      )
-      .mockResolvedValueOnce({
-        ...page([first], { page: 1, per_page: 1, total_pages: 2, total_records: 2 }),
-        has_more: true,
-      })
-      .mockResolvedValueOnce(
-        page([second], { page: 2, per_page: 1, total_pages: 2, total_records: 2 })
-      );
+    const list = jest.fn(async ({ page: requestedPage }: { page: number }) => {
+      const callInAttempt = (list.mock.calls.length - 1) % 3;
+      if (callInAttempt === 0) {
+        return page([first, second], { per_page: 2, total_pages: 1, total_records: 2 });
+      }
+      return requestedPage === 1
+        ? { ...page([first], { page: 1, per_page: 1, total_pages: 2, total_records: 2 }), has_more: true }
+        : page([second], { page: 2, per_page: 1, total_pages: 2, total_records: 2 });
+    });
     const get = jest.fn();
     const replaceInventorySnapshot = jest.fn();
     const events: CacheSyncProgress[] = [];
     const service = new V3InventoryIndexerService(
-      { items: { list, get, listVariations: jest.fn() } },
+      { items: { list, get, listVariations: jest.fn(async () => page([])) } },
       fakeCache({ replaceInventorySnapshot }),
       'default',
       'salesbinder:acme'
     );
 
-    await expect(service.sync({ onProgressEvent: (event) => events.push(event) })).rejects.toThrow(
+    const sync = service.sync({ onProgressEvent: (event) => events.push(event) });
+    const rejection = expect(sync).rejects.toThrow(
       /root pagination changed during stability verification/i
     );
+    await jest.runAllTimersAsync();
+    await rejection;
 
-    expect(list).toHaveBeenCalledTimes(3);
+    expect(list).toHaveBeenCalledTimes(9);
     expect(get).not.toHaveBeenCalled();
     expect(replaceInventorySnapshot).not.toHaveBeenCalled();
     expect(events.map(({ event }) => event)).not.toContain('retry_pass_started');
     expect(events.map(({ event }) => event)).not.toContain('record_failed_collected');
+    jest.useRealTimers();
+  });
+
+  it('retries a transient root pagination layout drift and publishes only the stable attempt', async () => {
+    jest.useFakeTimers();
+    const first = v3Item({ id: 'item-first', item_number: 1 });
+    const second = v3Item({ id: 'item-second', item_number: 2 });
+    const list = jest.fn(async ({ page: requestedPage }: { page: number }) => {
+      const call = list.mock.calls.length;
+      if (call === 1) {
+        return page([first, second], { per_page: 2, total_pages: 1, total_records: 2 });
+      }
+      if (call === 2) {
+        return {
+          ...page([first], { page: 1, per_page: 1, total_pages: 2, total_records: 2 }),
+          has_more: true,
+        };
+      }
+      if (call === 3 && requestedPage === 2) {
+        return page([second], { page: 2, per_page: 1, total_pages: 2, total_records: 2 });
+      }
+      return page([first, second], { per_page: 2, total_pages: 1, total_records: 2 });
+    });
+    const replaceInventorySnapshot = jest.fn(async () => undefined);
+    const service = new V3InventoryIndexerService(
+      { items: { list, get: jest.fn(), listVariations: jest.fn(async () => page([])) } },
+      fakeCache({ replaceInventorySnapshot }),
+      'default',
+      'salesbinder:acme'
+    );
+
+    const sync = service.sync();
+    await jest.runAllTimersAsync();
+    await expect(sync).resolves.toMatchObject({ itemsProcessed: 2 });
+
+    expect(list).toHaveBeenCalledTimes(5);
+    expect(replaceInventorySnapshot).toHaveBeenCalledTimes(1);
+    jest.useRealTimers();
   });
 
   it('recovers when equal-count variation membership changes between stability passes', async () => {
@@ -864,7 +996,7 @@ describe('V3InventoryIndexerService', () => {
       source_api_version: '3',
     };
     const service = new V3InventoryIndexerService(
-      { items: { list: jest.fn(async () => page(listed)), get, listVariations: jest.fn() } },
+      { items: { list: jest.fn(async () => page(listed)), get, listVariations: jest.fn(async () => page([])) } },
       fakeCache({
         getInventorySnapshot: jest.fn(async () => ({
           items: [priorItem],
@@ -975,7 +1107,7 @@ describe('V3InventoryIndexerService', () => {
     const replaceInventorySnapshot = jest.fn();
     const get = jest.fn(async () => recovered);
     const service = new V3InventoryIndexerService(
-      { items: { list: jest.fn(async () => page([malformed])), get, listVariations: jest.fn() } },
+      { items: { list: jest.fn(async () => page([malformed])), get, listVariations: jest.fn(async () => page([])) } },
       fakeCache({ replaceInventorySnapshot }),
       'default',
       'salesbinder:acme'
@@ -1018,7 +1150,7 @@ describe('V3InventoryIndexerService', () => {
     const replaceInventorySnapshot = jest.fn();
     const get = jest.fn(async () => recovered);
     const service = new V3InventoryIndexerService(
-      { items: { list: jest.fn(async () => page([malformed])), get, listVariations: jest.fn() } },
+      { items: { list: jest.fn(async () => page([malformed])), get, listVariations: jest.fn(async () => page([])) } },
       fakeCache({ replaceInventorySnapshot }),
       'default',
       'salesbinder:acme'
@@ -1059,7 +1191,7 @@ describe('V3InventoryIndexerService', () => {
         items: {
           list: jest.fn(async () => page([malformed])),
           get: jest.fn(async () => malformed),
-          listVariations: jest.fn(),
+          listVariations: jest.fn(async () => page([])),
         },
       },
       fakeCache({ replaceInventorySnapshot }),
@@ -1120,7 +1252,7 @@ describe('V3InventoryIndexerService', () => {
             .mockResolvedValueOnce(page([first]))
             .mockResolvedValueOnce(page([second])),
           get: jest.fn(async () => v3Item({ id: 'different-item' })),
-          listVariations: jest.fn(),
+          listVariations: jest.fn(async () => page([])),
         },
       },
       fakeCache({ replaceInventorySnapshot }),
@@ -1144,7 +1276,7 @@ describe('V3InventoryIndexerService', () => {
           get: jest.fn(async () => {
             throw new ApiResponseValidationError('Missing item identity', 'identity');
           }),
-          listVariations: jest.fn(),
+          listVariations: jest.fn(async () => page([])),
         },
       },
       fakeCache({ replaceInventorySnapshot }),
@@ -1168,7 +1300,7 @@ describe('V3InventoryIndexerService', () => {
           get: jest.fn(async () => {
             throw axiosNotFound();
           }),
-          listVariations: jest.fn(),
+          listVariations: jest.fn(async () => page([])),
         },
       },
       fakeCache({ replaceInventorySnapshot }),
@@ -1205,7 +1337,7 @@ describe('V3InventoryIndexerService', () => {
         items: {
           list: jest.fn(async () => page([v3Item()])),
           get: jest.fn(),
-          listVariations: jest.fn(),
+          listVariations: jest.fn(async () => page([])),
         },
       },
       fakeCache({
@@ -1238,7 +1370,7 @@ describe('V3InventoryIndexerService', () => {
         items: {
           list: jest.fn(async () => page(rows)),
           get: jest.fn(),
-          listVariations: jest.fn(),
+          listVariations: jest.fn(async () => page([])),
         },
       },
       fakeCache({ replaceInventorySnapshot }),
