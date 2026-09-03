@@ -125,6 +125,42 @@ describe('CacheSyncProgressController', () => {
     expect(allOutput).not.toMatch(/secret|Bearer|requestId|items/);
   });
 
+  it('touches running status without output or changing the current semantic phase', () => {
+    const writes: string[] = [];
+    const emitted: CacheSyncProgress[] = [];
+    const touchRunning = jest.fn();
+    const controller = new CacheSyncProgressController({
+      reporter: { emit: (event) => emitted.push(event), touchRunning },
+      stderr: { write: (line) => writes.push(line) },
+      isTTY: false,
+      now: () => 2_000_000,
+    });
+    controller.onProgressEvent(progress({ phase: 'inventory', recordsProcessed: 4 }));
+    const writesBeforeHeartbeat = writes.length;
+    const eventsBeforeHeartbeat = emitted.length;
+
+    controller.onProgressHeartbeat();
+
+    expect(touchRunning).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveLength(writesBeforeHeartbeat);
+    expect(emitted).toHaveLength(eventsBeforeHeartbeat);
+
+    controller.rateLimitObserver({
+      type: 'wait',
+      apiVersion: 'v3',
+      waitMs: 2_500,
+      waitUntil: 2_003,
+    });
+
+    expect(emitted.at(-1)).toEqual(
+      expect.objectContaining({
+        phase: 'inventory',
+        event: 'waiting_rate_limit',
+        recordsProcessed: 4,
+      })
+    );
+  });
+
   it('shares the five-second non-TTY routine budget with transport retries', () => {
     let now = 0;
     const writes: string[] = [];

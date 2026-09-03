@@ -175,7 +175,11 @@ function page(data: V3Item[]): V3ListResponse<V3Item> {
   };
 }
 
-function variationPage(data: import('../../types/items.types.js').V3ItemVariation[]): import('../../types/items.types.js').V3ListResponse<import('../../types/items.types.js').V3ItemVariation> {
+function variationPage(
+  data: import('../../types/items.types.js').V3ItemVariation[]
+): import('../../types/items.types.js').V3ListResponse<
+  import('../../types/items.types.js').V3ItemVariation
+> {
   return {
     object: 'list',
     url: '/api/v3/items/item-1/variations',

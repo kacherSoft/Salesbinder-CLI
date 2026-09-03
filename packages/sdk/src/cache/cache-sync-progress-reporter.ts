@@ -54,6 +54,7 @@ export class CacheSyncProgressReporter {
   private hasWriteError = false;
   private writeError?: unknown;
   private lastWriteAt = Number.NEGATIVE_INFINITY;
+  private lastHeartbeatWriteAt = Number.NEGATIVE_INFINITY;
   private lastRateLimitWriteAt = Number.NEGATIVE_INFINITY;
   private lastRateLimitSignature?: string;
   private lastRateLimitDeadline?: number;
@@ -79,6 +80,24 @@ export class CacheSyncProgressReporter {
       return this.terminalPromise ?? this.terminalAttempt ?? this.flush();
     this.scheduleStatus('running', summary);
     return this.flush();
+  }
+
+  touchRunning(): void {
+    if (this.terminalCommitted || this.terminalAttempt) return;
+    const now = this.now();
+    if (now - this.lastHeartbeatWriteAt < this.minIntervalMs) return;
+
+    this.lastHeartbeatWriteAt = now;
+    this.enqueue(async () => {
+      const timestamp = toUnixSeconds(now);
+      this.status = {
+        ...this.status,
+        status: 'running',
+        updatedAt: timestamp,
+        ...(this.status.progress ? { progressUpdatedAt: timestamp } : {}),
+      };
+      await this.cache.setSyncStatus(this.status);
+    });
   }
 
   emit(event: CacheSyncProgress): void {

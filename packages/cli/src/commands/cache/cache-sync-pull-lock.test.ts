@@ -73,6 +73,8 @@ let innerSqlitePullLockHeld = false;
 let terminalWriteProtected: boolean | undefined;
 let deletedLogSyncOptions: object[] = [];
 let useActualProgressReporter = false;
+let itemSyncOptions: MockProgressOptions[] = [];
+const progressReporterTouchRunning = jest.fn();
 
 const outerPgService = {
   tryAcquireSyncLock: jest.fn(async () => {
@@ -144,6 +146,7 @@ const v3InventoryIndexerConstructor = jest.fn();
 
 type MockProgressOptions = {
   onProgressEvent?: (event: Record<string, unknown>) => void;
+  onProgressHeartbeat?: () => void;
   includeItemDeletes?: boolean;
   full?: boolean;
 };
@@ -195,6 +198,11 @@ class MockCacheSyncProgressReporter {
   emit(event: object) {
     if (!this.terminal) emittedProgress.push(event);
     this.actual?.emit(event as never);
+  }
+
+  touchRunning() {
+    progressReporterTouchRunning();
+    this.actual?.touchRunning();
   }
 
   async flush() {
@@ -311,6 +319,8 @@ class SuccessfulItemIndexer {
 
   async sync(options?: MockProgressOptions) {
     phaseOrder.push('items');
+    if (options) itemSyncOptions.push(options);
+    options?.onProgressHeartbeat?.();
     emitCompletedPhase(options, 'inventory', 0);
     return { itemsProcessed: 0, stockRowsProcessed: 0, recordIssues: itemRecordIssues };
   }
@@ -503,6 +513,7 @@ describe('cache sync --pull lock ordering', () => {
     terminalWriteProtected = undefined;
     deletedLogSyncOptions = [];
     useActualProgressReporter = false;
+    itemSyncOptions = [];
     jest.clearAllMocks();
     mockLoadConfig.mockReturnValue({ subdomain: 'example', v3ApiKey: 'test-v3-key' });
     outerPgService.getCacheState.mockResolvedValue(null);
@@ -579,6 +590,13 @@ describe('cache sync --pull lock ordering', () => {
     expect(deletedLogSyncOptions).toEqual([
       { onProgressEvent: expect.any(Function), includeItemDeletes: false },
     ]);
+    expect(itemSyncOptions).toEqual([
+      {
+        onProgressEvent: expect.any(Function),
+        onProgressHeartbeat: expect.any(Function),
+      },
+    ]);
+    expect(progressReporterTouchRunning).toHaveBeenCalledTimes(1);
     expect(emittedProgress.some((event) => 'currentRecordId' in event || 'message' in event)).toBe(
       false
     );

@@ -189,6 +189,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           const syncProgress = new CacheSyncProgressController({ reporter: syncReporter });
           progressController = syncProgress;
           const onProgressEvent = syncProgress.onProgressEvent;
+          const onProgressHeartbeat = syncProgress.onProgressHeartbeat;
           const clientOptions = { rateLimitObserver: syncProgress.rateLimitObserver };
           const client = new SalesBinderClient(accountName, clientOptions);
           const v3Client = new SalesBinderV3Client(accountName, clientOptions);
@@ -288,7 +289,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           );
 
           const itemResult = await runFullResumePhase('items', () =>
-            itemIndexer.sync({ onProgressEvent })
+            itemIndexer.sync({ onProgressEvent, onProgressHeartbeat })
           );
 
           const indexedRecordIssues = collectSyncRecordIssues(result, itemResult);
