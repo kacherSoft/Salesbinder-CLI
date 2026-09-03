@@ -22,7 +22,6 @@ import {
   contentChangedReason,
   createInventorySnapshot,
   invalidRecordReason,
-  invalidVariationsReason,
   type LocalIssueReason,
 } from './v3-inventory-recovery.js';
 import {
@@ -33,6 +32,13 @@ import {
 } from './v3-inventory-source-validation.js';
 
 const PAGE_LIMIT = 100;
+const SNAPSHOT_MAX_ATTEMPTS = 3;
+const SNAPSHOT_RETRY_DELAY_MS = 2_000;
+const STABILITY_HEARTBEAT_INTERVAL_MS = 45_000;
+const INTRA_ROOT_PAGINATION_DRIFT_MESSAGE = 'V3 items pagination changed during snapshot';
+const ITEM_MEMBERSHIP_DRIFT_MESSAGE = 'V3 item membership changed during stability verification';
+const ROOT_PAGINATION_DRIFT_MESSAGE =
+  'V3 item root pagination changed during stability verification';
 const INVENTORY_SNAPSHOT_READ_CAPABILITY_ERROR =
   'V3 inventory sync requires inventory snapshot read support.';
 
@@ -49,6 +55,7 @@ export interface V3InventoryClient {
 
 export interface V3InventorySyncOptions {
   onProgressEvent?: CacheSyncProgressCallback;
+  onProgressHeartbeat?: () => void;
 }
 
 export interface V3InventorySyncResult {
@@ -58,17 +65,28 @@ export interface V3InventorySyncResult {
 }
 
 interface ItemObservation {
-  item: V3Item;
   normalized?: NormalizedV3InventoryItem;
   fingerprint?: string;
   failure?: LocalIssueReason;
 }
 
+interface RootPass {
+  items: V3Item[];
+  ids: string[];
+  paginationSignature: V3PaginationSignature;
+}
+
+interface RootSnapshotRead {
+  root: RootPass;
+  progressEvents: CacheSyncProgress[];
+}
+
 interface SourcePass {
   ids: string[];
   observations: Map<string, ItemObservation>;
-  paginationSignature: V3PaginationSignature;
 }
+
+class RootSnapshotDriftError extends Error {}
 
 type InventoryProgress = Omit<CacheSyncProgress, 'phase' | 'apiVersion'>;
 
@@ -102,16 +120,11 @@ export class V3InventoryIndexerService {
       ? new Map(categorySnapshot.rows.map((row) => [row.category_id, row.name]))
       : null;
 
-    const firstPass = await this.readPass(1, categoryNames, options.onProgressEvent);
-    const secondPass = await this.readPass(
-      2,
+    const { firstPass, secondPass } = await this.readStablePassPair(
       categoryNames,
       options.onProgressEvent,
-      firstPass.ids
+      options.onProgressHeartbeat
     );
-    if (!sameV3PaginationSignature(firstPass.paginationSignature, secondPass.paginationSignature)) {
-      throw new Error('V3 item root pagination changed during stability verification');
-    }
     const fresh = new Map<string, NormalizedV3InventoryItem>();
     const recovery = new Map<string, LocalIssueReason>();
 
@@ -119,7 +132,7 @@ export class V3InventoryIndexerService {
       const first = firstPass.observations.get(id);
       const second = secondPass.observations.get(id);
       if (!first || !second) {
-        throw new Error('V3 item membership changed during stability verification');
+        throw new Error(ITEM_MEMBERSHIP_DRIFT_MESSAGE);
       }
       const failure = second.failure ?? first.failure;
       if (failure) {
@@ -222,36 +235,97 @@ export class V3InventoryIndexerService {
     };
   }
 
-  private async readPass(
-    pass: number,
+  private async readStablePassPair(
     categoryNames: Map<string, string> | null,
     onProgressEvent?: CacheSyncProgressCallback,
-    expectedIds?: string[]
-  ): Promise<SourcePass> {
-    this.emit(onProgressEvent, {
-      event: 'pass_started',
-      pass,
-      recordsProcessed: 0,
-      recordsTotal: null,
-      indeterminate: true,
-    });
-    const source = await this.fetchAllItems(pass, onProgressEvent);
+    onProgressHeartbeat?: () => void
+  ): Promise<{ firstPass: SourcePass; secondPass: SourcePass }> {
+    const heartbeat = startStabilityHeartbeat(onProgressHeartbeat);
+    try {
+      let lastError: Error | null = null;
+      for (let attempt = 1; attempt <= SNAPSHOT_MAX_ATTEMPTS; attempt++) {
+        try {
+          // A silent preflight rejects immediately unstable roots without spending
+          // requests on variations or exposing a pass that can never complete.
+          const { root: preflightRoot } = await this.readRootSnapshot();
+          const firstRootRead = await this.readRootSnapshot(1);
+          assertSameRootSnapshot(preflightRoot, firstRootRead.root);
+          replayProgressEvents(firstRootRead.progressEvents, onProgressEvent);
+          const firstPass = await this.observePass(
+            1,
+            firstRootRead.root,
+            categoryNames,
+            onProgressEvent
+          );
+
+          // Read and validate the next root after observing pass 1. This catches
+          // changes that occurred while its variation snapshots were hydrated.
+          const secondRootRead = await this.readRootSnapshot(2);
+          assertSameRootSnapshot(firstRootRead.root, secondRootRead.root);
+          replayProgressEvents(secondRootRead.progressEvents, onProgressEvent);
+          const secondPass = await this.observePass(
+            2,
+            secondRootRead.root,
+            categoryNames,
+            onProgressEvent
+          );
+          return { firstPass, secondPass };
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error));
+          if (!(lastError instanceof RootSnapshotDriftError) || attempt === SNAPSHOT_MAX_ATTEMPTS) {
+            throw lastError;
+          }
+          await sleep(SNAPSHOT_RETRY_DELAY_MS * attempt);
+        }
+      }
+      throw lastError ?? new Error('Unable to verify a stable v3 item root snapshot');
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+    }
+  }
+
+  private async readRootSnapshot(pass?: number): Promise<RootSnapshotRead> {
+    const progressEvents: CacheSyncProgress[] = [];
+    const bufferProgressEvent: CacheSyncProgressCallback | undefined =
+      pass === undefined
+        ? undefined
+        : (event) => {
+            progressEvents.push(event);
+          };
+    if (pass !== undefined) {
+      this.emit(bufferProgressEvent, {
+        event: 'pass_started',
+        pass,
+        recordsProcessed: 0,
+        recordsTotal: null,
+        indeterminate: true,
+      });
+    }
+    const source = await this.fetchAllItems(pass, bufferProgressEvent);
     const items = source.rows;
     const ids = items.map((item) => item.id).sort(compareSourceIds);
-    if (expectedIds && !sameSourceIdArray(ids, expectedIds)) {
-      throw new Error('V3 item membership changed during stability verification');
-    }
+    return {
+      root: { items, ids, paginationSignature: source.signature },
+      progressEvents,
+    };
+  }
 
+  private async observePass(
+    pass: number,
+    root: RootPass,
+    categoryNames: Map<string, string> | null,
+    onProgressEvent?: CacheSyncProgressCallback
+  ): Promise<SourcePass> {
     const observations = new Map<string, ItemObservation>();
     let recordsProcessed = 0;
-    for (const item of items) {
+    for (const item of root.items) {
       observations.set(item.id, await this.observeItem(item, categoryNames));
       recordsProcessed++;
       this.emit(onProgressEvent, {
         event: 'record_processed',
         pass,
         recordsProcessed,
-        recordsTotal: items.length,
+        recordsTotal: root.items.length,
         indeterminate: false,
       });
     }
@@ -259,10 +333,13 @@ export class V3InventoryIndexerService {
       event: 'pass_completed',
       pass,
       recordsProcessed,
-      recordsTotal: items.length,
+      recordsTotal: root.items.length,
       indeterminate: false,
     });
-    return { ids, observations, paginationSignature: source.signature };
+    return {
+      ids: root.ids,
+      observations,
+    };
   }
 
   private requireInventorySnapshotReader(): NonNullable<CacheService['getInventorySnapshot']> {
@@ -276,30 +353,29 @@ export class V3InventoryIndexerService {
     categoryNames: Map<string, string> | null
   ): Promise<ItemObservation> {
     if (!Number.isSafeInteger(item.variation_count) || item.variation_count < 0) {
-      return { item, failure: invalidRecordReason() };
+      return { failure: invalidRecordReason() };
     }
 
     let variations: V3ItemVariation[];
     try {
-      variations = item.variation_count > 0 ? await this.fetchAllVariations(item) : [];
+      // The live v3 root item's variation_count is advisory and can lag behind
+      // the authoritative paginated variations endpoint (including reporting
+      // zero while rows exist). Always read and validate the endpoint snapshot.
+      variations = await this.fetchAllVariations(item);
     } catch (error) {
       const failure = classifyInventoryLocalFailure(error, 'variations');
-      if (failure) return { item, failure };
+      if (failure) return { failure };
       throw error;
-    }
-    if (variations.length !== item.variation_count) {
-      return { item, failure: invalidVariationsReason() };
     }
 
     try {
       return {
-        item,
         normalized: normalizeV3InventoryItem(item, variations, categoryNames),
         fingerprint: createV3ItemSourceFingerprint(item, variations),
       };
     } catch (error) {
       const failure = classifyInventoryLocalFailure(error, 'record');
-      if (failure) return { item, failure };
+      if (failure) return { failure };
       throw error;
     }
   }
@@ -313,7 +389,7 @@ export class V3InventoryIndexerService {
       item = await this.client.items.get(id);
     } catch (error) {
       const failure = classifyInventoryLocalFailure(error, 'record');
-      if (failure) return { item: { id } as V3Item, failure };
+      if (failure) return { failure };
       throw error;
     }
     assertCanonicalV3SourceId(item.id, 'item detail');
@@ -324,35 +400,37 @@ export class V3InventoryIndexerService {
   }
 
   private fetchAllItems(
-    pass: number,
+    pass?: number,
     onProgressEvent?: CacheSyncProgressCallback
   ): Promise<V3PageSnapshot<V3Item>> {
     return fetchAllV3PageSnapshot(
       (page) => this.client.items.list({ page, limit: PAGE_LIMIT, archived: 'all' }),
       'items',
-      (message) => new Error(message),
-      {
-        onPageStarted: (page, pagesTotal, recordsProcessed, recordsTotal) =>
-          this.emit(onProgressEvent, {
-            event: 'page_started',
-            pass,
-            page,
-            pagesTotal,
-            recordsProcessed,
-            recordsTotal,
-            indeterminate: recordsTotal == null,
-          }),
-        onPageCompleted: (page, pagesTotal, recordsProcessed, recordsTotal) =>
-          this.emit(onProgressEvent, {
-            event: 'page_completed',
-            pass,
-            page,
-            pagesTotal,
-            recordsProcessed,
-            recordsTotal,
-            indeterminate: false,
-          }),
-      }
+      rootSnapshotError,
+      pass === undefined
+        ? undefined
+        : {
+            onPageStarted: (page, pagesTotal, recordsProcessed, recordsTotal) =>
+              this.emit(onProgressEvent, {
+                event: 'page_started',
+                pass,
+                page,
+                pagesTotal,
+                recordsProcessed,
+                recordsTotal,
+                indeterminate: recordsTotal == null,
+              }),
+            onPageCompleted: (page, pagesTotal, recordsProcessed, recordsTotal) =>
+              this.emit(onProgressEvent, {
+                event: 'page_completed',
+                pass,
+                page,
+                pagesTotal,
+                recordsProcessed,
+                recordsTotal,
+                indeterminate: false,
+              }),
+          }
     );
   }
 
@@ -375,6 +453,46 @@ export class V3InventoryIndexerService {
   ): void {
     onProgressEvent?.({ phase: 'inventory', apiVersion: '3', ...progress });
   }
+}
+
+function assertSameRootSnapshot(left: RootPass, right: RootPass): void {
+  if (!sameSourceIdArray(left.ids, right.ids)) {
+    throw new RootSnapshotDriftError(ITEM_MEMBERSHIP_DRIFT_MESSAGE);
+  }
+  if (!sameV3PaginationSignature(left.paginationSignature, right.paginationSignature)) {
+    throw new RootSnapshotDriftError(ROOT_PAGINATION_DRIFT_MESSAGE);
+  }
+}
+
+function rootSnapshotError(message: string): Error {
+  return message === INTRA_ROOT_PAGINATION_DRIFT_MESSAGE
+    ? new RootSnapshotDriftError(message)
+    : new Error(message);
+}
+
+function replayProgressEvents(
+  progressEvents: readonly CacheSyncProgress[],
+  onProgressEvent?: CacheSyncProgressCallback
+): void {
+  if (!onProgressEvent) return;
+  for (const event of progressEvents) onProgressEvent(event);
+}
+
+function startStabilityHeartbeat(onProgressHeartbeat?: () => void): NodeJS.Timeout | undefined {
+  if (!onProgressHeartbeat) return undefined;
+  const heartbeat = setInterval(() => {
+    try {
+      onProgressHeartbeat();
+    } catch {
+      // Heartbeats are best-effort and must never change the stability result.
+    }
+  }, STABILITY_HEARTBEAT_INTERVAL_MS);
+  heartbeat.unref();
+  return heartbeat;
+}
+
+function sleep(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function nowSeconds(): number {

@@ -64,6 +64,135 @@ describe('CacheSyncProgressReporter', () => {
     expect(statuses[2].progress).not.toHaveProperty('message');
   });
 
+  it('touches liveness without changing semantic progress or summaries', async () => {
+    let now = 100_000;
+    const statuses: CacheSyncStatus[] = [];
+    const reporter = new CacheSyncProgressReporter(
+      cacheWithWriter(async (status) => {
+        statuses.push(status);
+      }),
+      context,
+      { now: () => now }
+    );
+
+    await reporter.markRunning({ message: 'Syncing documents', documentsProcessed: 3 });
+    now += 1_000;
+    reporter.emit(
+      progress('record_processed', {
+        recordsProcessed: 4,
+        recordsTotal: 10,
+        indeterminate: false,
+        timestamp: 97,
+      })
+    );
+    await reporter.flush();
+    const semanticStatus = statuses.at(-1);
+
+    now = 102_500;
+    reporter.touchRunning();
+    await reporter.flush();
+
+    expect(statuses.at(-1)).toMatchObject({
+      status: 'running',
+      phase: 'documents',
+      message: 'Syncing documents',
+      documentsProcessed: 3,
+      updatedAt: 102,
+      progressUpdatedAt: 102,
+    });
+    expect(statuses.at(-1)?.progress).toEqual(semanticStatus?.progress);
+    expect(statuses.at(-1)?.progress?.timestamp).toBe(97);
+
+    now += 100;
+    reporter.touchRunning();
+    await reporter.flush();
+    expect(statuses).toHaveLength(3);
+  });
+
+  it('does not let a heartbeat suppress the next semantic progress write', async () => {
+    let now = 100_000;
+    const statuses: CacheSyncStatus[] = [];
+    const reporter = new CacheSyncProgressReporter(
+      cacheWithWriter(async (status) => {
+        statuses.push(status);
+      }),
+      context,
+      { now: () => now }
+    );
+
+    await reporter.markRunning();
+    now += 1_000;
+    reporter.touchRunning();
+    await reporter.flush();
+    expect(statuses.at(-1)).toMatchObject({ status: 'running', updatedAt: 101 });
+    expect(statuses.at(-1)).not.toHaveProperty('progressUpdatedAt');
+
+    now += 1;
+    reporter.emit(progress('record_processed', { recordsProcessed: 1 }));
+    await reporter.flush();
+
+    expect(statuses).toHaveLength(3);
+    expect(statuses.at(-1)?.progress).toMatchObject({
+      event: 'record_processed',
+      recordsProcessed: 1,
+    });
+  });
+
+  it('ignores heartbeat touches after a terminal attempt and commit', async () => {
+    const statuses: CacheSyncStatus[] = [];
+    let releaseTerminalWrite: (() => void) | undefined;
+    const terminalWriteBlocked = new Promise<void>((resolve) => {
+      releaseTerminalWrite = resolve;
+    });
+    const reporter = new CacheSyncProgressReporter(
+      cacheWithWriter(async (status) => {
+        if (status.status === 'success') await terminalWriteBlocked;
+        statuses.push(status);
+      }),
+      context,
+      { now: () => 100_000 }
+    );
+
+    await reporter.markRunning();
+    const terminal = reporter.markSuccess();
+    reporter.touchRunning();
+    releaseTerminalWrite?.();
+    await terminal;
+
+    reporter.touchRunning();
+    await reporter.flush();
+
+    expect(statuses.map(({ status }) => status)).toEqual(['running', 'success']);
+  });
+
+  it('tracks heartbeat write failures as routine persistence errors', async () => {
+    const attempts: CacheSyncStatus[] = [];
+    const heartbeatFailure = new Error('heartbeat status write failed');
+    let rejectHeartbeat = true;
+    const reporter = new CacheSyncProgressReporter(
+      cacheWithWriter(async (status) => {
+        attempts.push(status);
+        if (rejectHeartbeat && status.status === 'running' && attempts.length === 2) {
+          rejectHeartbeat = false;
+          throw heartbeatFailure;
+        }
+      }),
+      context,
+      { now: () => 100_000 }
+    );
+
+    await reporter.markRunning();
+    reporter.touchRunning();
+    await expect(reporter.flush()).rejects.toBe(heartbeatFailure);
+    await expect(reporter.markSuccess()).rejects.toBe(heartbeatFailure);
+    await expect(
+      reporter.markFailure(new Error('private failure detail'))
+    ).resolves.toBeUndefined();
+    await expect(reporter.flush()).resolves.toBeUndefined();
+
+    expect(attempts.map(({ status }) => status)).toEqual(['running', 'running', 'failed']);
+  });
+
   it('coalesces repeated waits and immediately replaces a persisted wait after requests resume', async () => {
     let now = 100_000;
     const statuses: CacheSyncStatus[] = [];
@@ -124,6 +253,8 @@ describe('CacheSyncProgressReporter', () => {
     await reporter.flush();
     expect(statuses).toHaveLength(4);
 
+    reporter.touchRunning();
+    await reporter.flush();
     reporter.emit(
       progress('page_completed', {
         phase: 'categories',

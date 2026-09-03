@@ -1468,9 +1468,17 @@ describe('SQLiteCacheService', () => {
       const db = (service as unknown as { db: Database.Database }).db;
       db.exec('DROP TABLE items');
 
-      await expect(Promise.resolve().then(() => service.getInventoryCacheMeta())).rejects.toThrow(
-        /no such table: items/i
-      );
+      const outcome = await Promise.resolve()
+        .then(() => service.getInventoryCacheMeta())
+        .then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error })
+        );
+      expect(outcome).toEqual({
+        error: expect.objectContaining({
+          message: expect.stringMatching(/no such table: items/i),
+        }),
+      });
     });
 
     it('preserves CSV inventory values and valid authority while replacing a categorized mirror', async () => {

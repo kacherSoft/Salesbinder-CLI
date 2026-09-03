@@ -16,6 +16,7 @@ export type CacheSyncHealth =
 
 export interface CacheSyncProgressReporterPort {
   emit(progress: CacheSyncProgress): void;
+  touchRunning?(): void;
 }
 
 type WritableProgressStream = { write(chunk: string): unknown };
@@ -86,6 +87,10 @@ export class CacheSyncProgressController {
     this.current = progress;
     this.reporter.emit(progress);
     this.render(progress);
+  };
+
+  readonly onProgressHeartbeat = (): void => {
+    this.reporter.touchRunning?.();
   };
 
   readonly rateLimitObserver = (observation: RateObservation): void => {

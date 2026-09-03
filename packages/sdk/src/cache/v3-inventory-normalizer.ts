@@ -39,6 +39,10 @@ export function normalizeV3InventoryItem(
   const price = optionalDecimalNumber(item.price, 'item price');
   const cost = optionalDecimalNumber(item.cost, 'item cost');
   const categoryName = canonicalCategoryName(item, categoryId, categoryNames);
+  const archived = requiredBoolean(item.archived, 'item archived');
+  const sku = nullableIdentifierText(item.sku, 'item sku');
+  const serialNumber = nullableIdentifierText(item.serial_number, 'item serial_number');
+  const barcode = nullableIdentifierText(item.barcode, 'item barcode');
   const inTransit = variations.length === 0 ? null : sumVariationInTransit(variations);
   const stockRows =
     variations.length === 0
@@ -53,11 +57,12 @@ export function normalizeV3InventoryItem(
             incoming,
             categoryName,
             price,
-            cost
+            cost,
+            barcode
           ),
         ]
       : variations.flatMap((variation) =>
-          variationStockRows(item, itemNumber, variation, categoryName, price, cost)
+          variationStockRows(item, itemNumber, variation, categoryName, price, cost, barcode)
         );
   if (variations.length > 0) assertUniqueVariationStockRowIds(stockRows);
 
@@ -65,11 +70,11 @@ export function normalizeV3InventoryItem(
     item: {
       item_id: requiredText(item.id, 'item id'),
       item_number: itemNumber,
-      name: requiredText(item.name, 'item name'),
-      description: nullableText(item.description),
-      sku: nullableText(item.sku),
-      serial_number: nullableText(item.serial_number),
-      barcode: nullableText(item.barcode),
+      name: itemDisplayName(item, itemNumber, archived),
+      description: nullableDisplayText(item.description),
+      sku,
+      serial_number: serialNumber,
+      barcode,
       category_id: categoryId,
       category_name: categoryName,
       quantity,
@@ -81,7 +86,7 @@ export function normalizeV3InventoryItem(
       cost,
       price,
       published: requiredBoolean(item.published, 'item published') ? 1 : 0,
-      archived: requiredBoolean(item.archived, 'item archived') ? 1 : 0,
+      archived: archived ? 1 : 0,
       created: requiredSalesBinderTimestamp(item.created_at, 'created_at'),
       modified: toUnix(item.updated_at),
       cache_source: 'api',
@@ -126,7 +131,8 @@ function parentStockRow(
   incoming: number,
   categoryName: string | null,
   price: number | null,
-  cost: number | null
+  cost: number | null,
+  barcode: string | null
 ): ItemStockLocationRow {
   return {
     stock_row_id: syntheticId('v3-parent-stock', item.id, locationId ?? 'default'),
@@ -137,14 +143,7 @@ function parentStockRow(
     quantity_available: quantityAvailable,
     quantity_incoming: incoming,
     in_transit: null,
-    ...commonStockRowFields(
-      item,
-      itemNumber,
-      categoryName,
-      price,
-      cost,
-      nullableText(item.barcode)
-    ),
+    ...commonStockRowFields(item, itemNumber, categoryName, price, cost, barcode),
   };
 }
 
@@ -154,7 +153,8 @@ function variationStockRows(
   variation: V3ItemVariation,
   categoryName: string | null,
   price: number | null,
-  cost: number | null
+  cost: number | null,
+  itemBarcode: string | null
 ): ItemStockLocationRow[] {
   if (variation.object !== 'item_variation' || variation.item_id !== item.id) {
     throw invalidVariations(`Invalid v3 variation identity for item ${item.id}`);
@@ -174,6 +174,8 @@ function variationStockRows(
   if (Array.isArray(variation.locations)) {
     assertVisibleLocationTotals(variation, locations);
   }
+  const barcode =
+    nullableIdentifierText(variation.barcode, 'variation barcode', 'variations') ?? itemBarcode;
   if (locations.length === 0) {
     return [
       {
@@ -203,14 +205,7 @@ function variationStockRows(
           'variation in-transit quantity',
           'variations'
         ),
-        ...commonStockRowFields(
-          item,
-          itemNumber,
-          categoryName,
-          price,
-          cost,
-          nullableText(variation.barcode, 'variations') ?? nullableText(item.barcode)
-        ),
+        ...commonStockRowFields(item, itemNumber, categoryName, price, cost, barcode),
       },
     ];
   }
@@ -233,7 +228,7 @@ function variationStockRows(
         'variation location id',
         'variations'
       ),
-      location_name: nullableText(location.location_name, 'variations'),
+      location_name: nullableDisplayText(location.location_name, 'variations'),
       quantity_on_hand: requiredJsonNumber(
         location.quantity,
         'variation-location quantity',
@@ -255,14 +250,7 @@ function variationStockRows(
         'variation-location in-transit quantity',
         'variations'
       ),
-      ...commonStockRowFields(
-        item,
-        itemNumber,
-        categoryName,
-        price,
-        cost,
-        nullableText(variation.barcode, 'variations') ?? nullableText(item.barcode)
-      ),
+      ...commonStockRowFields(item, itemNumber, categoryName, price, cost, barcode),
     };
   });
 }
@@ -409,7 +397,7 @@ function canonicalCategoryName(
   categoryId: string | null,
   names: Map<string, string> | null
 ): string | null {
-  if (!names) return nullableText(item.category_name);
+  if (!names) return nullableDisplayText(item.category_name);
   return categoryId ? (names.get(categoryId) ?? null) : null;
 }
 
@@ -450,6 +438,20 @@ function requiredText(
   return value.trim();
 }
 
+function itemDisplayName(item: V3Item, itemNumber: number, archived: boolean): string {
+  try {
+    return requiredText(item.name, 'item name');
+  } catch (error) {
+    if (!archived || !(error instanceof ApiResponseValidationError)) throw error;
+    for (const candidate of [item.sku, item.barcode, item.serial_number]) {
+      if (typeof candidate === 'string' && candidate.trim() && !candidate.includes('\0')) {
+        return requiredText(candidate, 'archived item fallback name');
+      }
+    }
+    return `Unnamed archived item ${itemNumber || item.id}`;
+  }
+}
+
 function requiredCanonicalText(
   value: unknown,
   field: string,
@@ -467,10 +469,29 @@ function nullableCanonicalText(value: unknown, field: string): string | null {
   return requiredCanonicalText(value, field);
 }
 
-function nullableText(value: unknown, scope: 'record' | 'variations' = 'record'): string | null {
+function nullableDisplayText(
+  value: unknown,
+  scope: 'record' | 'variations' = 'record'
+): string | null {
   if (value == null || value === '') return null;
-  if (typeof value !== 'string' || value.includes('\0') || hasUnpairedUtf16Surrogate(value)) {
+  if (typeof value !== 'string' || hasUnpairedUtf16Surrogate(value)) {
     throw new ApiResponseValidationError('Invalid v3 text value', scope);
+  }
+  // PostgreSQL text cannot contain U+0000. The legacy API has returned it in
+  // optional display/free-text fields, so remove only that code point here;
+  // canonical IDs still go through strict validation above.
+  const sanitized = value.replace(/\0/g, '');
+  return sanitized === '' ? null : sanitized;
+}
+
+function nullableIdentifierText(
+  value: unknown,
+  field: string,
+  scope: 'record' | 'variations' = 'record'
+): string | null {
+  if (value == null || value === '') return null;
+  if (typeof value !== 'string' || hasControlCharacter(value) || hasUnpairedUtf16Surrogate(value)) {
+    throw new ApiResponseValidationError(`Invalid v3 ${field}`, scope);
   }
   return value;
 }
