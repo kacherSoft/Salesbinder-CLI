@@ -4,6 +4,11 @@ import { buildPaymentSyncStatusFingerprint } from './full-resume-checkpoint.js';
 
 const mockHomeDirectory = `/tmp/salesbinder-cli-cache-command-${process.pid}`;
 const mockCheckpointPath = `${mockHomeDirectory}/.salesbinder/cache/full-resume-default.json`;
+let mockUuidSequence = 0;
+const mockRandomUUID = jest.fn(() => {
+  mockUuidSequence += 1;
+  return `00000000-0000-4000-8000-${String(mockUuidSequence).padStart(12, '0')}`;
+});
 const actualFileExists = (path: unknown) =>
   jest.requireActual<typeof import('fs')>('fs').existsSync(path as import('fs').PathLike);
 let mockCheckpointCleanupFailure = false;
@@ -56,6 +61,11 @@ jest.mock('os', () => ({
   homedir: () => mockHomeDirectory,
 }));
 
+jest.mock('crypto', () => ({
+  ...jest.requireActual('crypto'),
+  randomUUID: () => mockRandomUUID(),
+}));
+
 let outerPgLockHeld = false;
 let phaseOrder: string[] = [];
 let documentRecordIssues: object[] = [];
@@ -74,10 +84,20 @@ let terminalWriteProtected: boolean | undefined;
 let deletedLogSyncOptions: object[] = [];
 let useActualProgressReporter = false;
 let itemSyncOptions: MockProgressOptions[] = [];
+type MockPostgresSyncLockOptions = { onLost?: (error: Error) => void };
+let outerPgLockLossCallback: ((error: Error) => void) | undefined;
+let loseOuterPgLockDuringInventory = false;
+let loseOuterPgLockDuringPullSettlement = false;
+let loseOuterPgLockAfterPullSuccessHook = false;
+let loseOuterPgLockDuringClear = false;
+let loseOuterPgLockDuringImport = false;
+let loseOuterPgLockDuringPayments = false;
+let sqliteMirrorStatusPublished = false;
 const progressReporterTouchRunning = jest.fn();
 
 const outerPgService = {
-  tryAcquireSyncLock: jest.fn(async () => {
+  tryAcquireSyncLock: jest.fn(async (_lockKey: string, options?: MockPostgresSyncLockOptions) => {
+    outerPgLockLossCallback = options?.onLost;
     outerPgLockHeld = true;
     return true;
   }),
@@ -107,7 +127,22 @@ const outerPgService = {
   getCategoryCacheMeta: jest.fn(async () => null),
   getInventoryCacheMeta: jest.fn(async () => null),
   getStockLocationCount: jest.fn(async () => 0),
+  truncateAll: jest.fn(async () => {
+    if (loseOuterPgLockDuringClear) triggerOuterPgLockLoss();
+  }),
 };
+
+function triggerOuterPgLockLoss(): boolean {
+  outerPgLockHeld = false;
+  const onLost = outerPgLockLossCallback;
+  if (!onLost) return false;
+  onLost(
+    new Error(
+      'PostgreSQL advisory lock owner session lost: ETIMEDOUT postgres://writer:secret@private.example/salesbinder'
+    )
+  );
+  return true;
+}
 
 const sqliteCacheService = {
   verifyAccountBinding: jest.fn(async () => undefined),
@@ -134,7 +169,9 @@ type MockPullSettlement =
   | { status: 'failed'; error: unknown };
 type MockPullOptions = {
   pgLockAlreadyHeld?: boolean;
+  lockLossSignal?: AbortSignal;
   onSettledWhileLocked?: (settlement: MockPullSettlement) => void | Promise<void>;
+  onPostSuccessFailureWhileLocked?: (error: unknown) => void | Promise<void>;
 };
 const pullFromPostgres = jest.fn<
   Promise<MockPullResult>,
@@ -150,6 +187,13 @@ type MockProgressOptions = {
   includeItemDeletes?: boolean;
   full?: boolean;
 };
+
+class MockPostgresSyncLockLostError extends Error {
+  constructor() {
+    super('PostgreSQL sync lock lost.');
+    this.name = 'PostgresSyncLockLostError';
+  }
+}
 
 function emitCompletedPhase(
   options: MockProgressOptions | boolean | undefined,
@@ -174,6 +218,47 @@ class MockSalesBinderClient {
 class MockSalesBinderV3Client {
   constructor(_accountName?: string, runtimeOptions?: object) {
     if (runtimeOptions) clientRuntimeOptions.push(runtimeOptions);
+  }
+}
+
+class MockCsvCacheImportService {
+  constructor(_cache: unknown) {}
+
+  async importDirectory(_directory: string, options: { dryRun?: boolean }) {
+    if (loseOuterPgLockDuringImport) triggerOuterPgLockLoss();
+    return {
+      success: true,
+      mode: options.dryRun ? 'dry_run' : 'import',
+      files_checked: 7,
+      accounts: { customers: 0, suppliers: 0, total: 0 },
+      documents: { invoices: 0, purchase_orders: 0, total: 0 },
+      line_items: { invoice_lines: 0, po_lines: 0, total: 0 },
+      items: { item_rows: 0, stock_location_rows: 0, locations: 0, categories: 0 },
+      warnings: {
+        unmatched_account_names: 0,
+        ambiguous_account_names: 0,
+        unmatched_item_numbers: 0,
+      },
+      duration: '0s',
+    };
+  }
+}
+
+class MockPaymentSyncService {
+  constructor(_client: unknown, _cache: unknown) {}
+
+  async syncHistoricalPayments() {
+    if (loseOuterPgLockDuringPayments) triggerOuterPgLockLoss();
+    return {
+      success: true,
+      mode: 'full',
+      resumed: false,
+      documentsProcessed: 0,
+      totalDocuments: 0,
+      transactionsProcessed: 0,
+      duration: '0s',
+      cursor: null,
+    };
   }
 }
 
@@ -321,6 +406,7 @@ class SuccessfulItemIndexer {
     phaseOrder.push('items');
     if (options) itemSyncOptions.push(options);
     options?.onProgressHeartbeat?.();
+    if (loseOuterPgLockDuringInventory) triggerOuterPgLockLoss();
     emitCompletedPhase(options, 'inventory', 0);
     return { itemsProcessed: 0, stockRowsProcessed: 0, recordIssues: itemRecordIssues };
   }
@@ -375,6 +461,14 @@ jest.mock(
     V3InventoryIndexerService: SuccessfulItemIndexer,
     DeletedLogSyncService: SuccessfulDeletedLogSync,
     CacheSyncProgressReporter: MockCacheSyncProgressReporter,
+    CsvCacheImportService: MockCsvCacheImportService,
+    PaymentSyncService: MockPaymentSyncService,
+    PostgresSyncLockLostError: MockPostgresSyncLockLostError,
+    PostgresCacheService: class {
+      constructor() {
+        return outerPgService;
+      }
+    },
     SQLiteCacheService: class {
       constructor() {
         return sqliteCacheService;
@@ -425,10 +519,19 @@ function unresolvedInvoicePaymentStatus(mode: 'full' | 'delta') {
 async function settleSuccessfulPull(options?: MockPullOptions): Promise<MockPullResult> {
   expect(outerPgLockHeld).toBe(true);
   expect(options?.pgLockAlreadyHeld).toBe(true);
+  expect(options?.lockLossSignal).toEqual(expect.objectContaining({ aborted: false }));
   innerSqlitePullLockHeld = true;
   const result = successfulPullResult();
   try {
+    if (loseOuterPgLockDuringPullSettlement) triggerOuterPgLockLoss();
     await options?.onSettledWhileLocked?.({ status: 'success', result });
+    if (loseOuterPgLockAfterPullSuccessHook) {
+      triggerOuterPgLockLoss();
+      const error = new MockPostgresSyncLockLostError();
+      await options?.onPostSuccessFailureWhileLocked?.(error);
+      throw error;
+    }
+    sqliteMirrorStatusPublished = true;
     return result;
   } finally {
     innerSqlitePullLockHeld = false;
@@ -438,6 +541,7 @@ async function settleSuccessfulPull(options?: MockPullOptions): Promise<MockPull
 async function settleFailedPull(error: Error, options?: MockPullOptions): Promise<never> {
   expect(outerPgLockHeld).toBe(true);
   expect(options?.pgLockAlreadyHeld).toBe(true);
+  expect(options?.lockLossSignal).toEqual(expect.objectContaining({ aborted: false }));
   innerSqlitePullLockHeld = true;
   try {
     await options?.onSettledWhileLocked?.({ status: 'failed', error });
@@ -476,12 +580,120 @@ async function runClear(forceUnbound = false): Promise<void> {
   await program.parseAsync(args);
 }
 
+async function runImportExport(...importOptions: string[]): Promise<void> {
+  const program = new Command();
+  program.option('--account <account>');
+  (await ensureRegisterCacheCommands())(program);
+  await program.parseAsync([
+    'node',
+    'test',
+    'cache',
+    'import-export',
+    '/tmp/salesbinder-cache-import',
+    ...importOptions,
+  ]);
+}
+
+async function runPaymentSync(): Promise<void> {
+  const program = new Command();
+  program.option('--account <account>');
+  (await ensureRegisterCacheCommands())(program);
+  await program.parseAsync(['node', 'test', 'cache', 'sync-payments']);
+}
+
 async function runCacheStatus(): Promise<void> {
   const program = new Command();
   program.option('--account <account>');
   (await ensureRegisterCacheCommands())(program);
   await program.parseAsync(['node', 'test', 'cache', 'status']);
 }
+
+function formattedCliErrorOutputs(): Array<{ error: boolean; message: string }> {
+  return (console.error as jest.Mock).mock.calls
+    .map(([message]) => message)
+    .filter((message): message is string => typeof message === 'string')
+    .map((message) => {
+      try {
+        return JSON.parse(message) as unknown;
+      } catch {
+        return null;
+      }
+    })
+    .filter((message): message is { error: boolean; message: string } =>
+      Boolean(
+        message &&
+        typeof message === 'object' &&
+        (message as Record<string, unknown>).error === true &&
+        typeof (message as Record<string, unknown>).message === 'string'
+      )
+    );
+}
+
+function expectSingleSanitizedCliError(message = 'PostgreSQL sync lock lost.'): void {
+  const errors = formattedCliErrorOutputs();
+  expect(errors).toEqual([{ error: true, message }]);
+  expect(JSON.stringify(errors)).not.toMatch(/ETIMEDOUT|writer:secret|private\.example/);
+  expect(JSON.stringify((console.error as jest.Mock).mock.calls)).not.toMatch(
+    /ETIMEDOUT|writer:secret|private\.example/
+  );
+}
+
+function expectClientRuntimeOptionsWithSharedSignal(count: number): void {
+  expect(clientRuntimeOptions).toHaveLength(count);
+  const signals = clientRuntimeOptions.map(
+    (options) => (options as { signal?: AbortSignal }).signal
+  );
+  for (const options of clientRuntimeOptions) {
+    expect(options).toEqual(
+      expect.objectContaining({
+        rateLimitObserver: expect.any(Function),
+        signal: expect.objectContaining({ aborted: false }),
+      })
+    );
+  }
+  expect(new Set(signals).size).toBe(1);
+}
+
+describe('PostgreSQL sync lock loss guard', () => {
+  it.each(['resolve', 'reject'] as const)(
+    'rejects promptly and cleans its abort listener before an operation can later %s',
+    async (lateOutcome) => {
+      const { awaitWhileSyncLockHeld, createSyncLockLossGuard } =
+        await import('./postgres-sync-lock-loss.guard.js');
+      const guard = createSyncLockLossGuard();
+      const operation = deferred<string>();
+      const removeListener = jest.spyOn(guard.signal, 'removeEventListener');
+      let settled = false;
+      const guarded = awaitWhileSyncLockHeld(guard, () => operation.promise).then(
+        () => {
+          settled = true;
+          return null;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        }
+      );
+
+      guard.onLost(new Error('private owner-session failure'));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const settledBeforeOperation = settled;
+      if (lateOutcome === 'resolve') operation.resolve('late result');
+      else operation.reject(new Error('late private rejection'));
+      const error = await guarded;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(settledBeforeOperation).toBe(true);
+      expect(error).toEqual(
+        expect.objectContaining({
+          name: 'PostgresSyncLockLostError',
+          message: 'PostgreSQL sync lock lost.',
+        })
+      );
+      expect(removeListener).toHaveBeenCalledTimes(1);
+    }
+  );
+});
 
 describe('cache sync --pull lock ordering', () => {
   const originalDatabaseUrl = process.env.SALESBINDER_DB_URL;
@@ -514,10 +726,20 @@ describe('cache sync --pull lock ordering', () => {
     deletedLogSyncOptions = [];
     useActualProgressReporter = false;
     itemSyncOptions = [];
+    outerPgLockLossCallback = undefined;
+    loseOuterPgLockDuringInventory = false;
+    loseOuterPgLockDuringPullSettlement = false;
+    loseOuterPgLockAfterPullSuccessHook = false;
+    loseOuterPgLockDuringClear = false;
+    loseOuterPgLockDuringImport = false;
+    loseOuterPgLockDuringPayments = false;
+    sqliteMirrorStatusPublished = false;
+    mockUuidSequence = 0;
     jest.clearAllMocks();
     mockLoadConfig.mockReturnValue({ subdomain: 'example', v3ApiKey: 'test-v3-key' });
     outerPgService.getCacheState.mockResolvedValue(null);
     outerPgService.setCacheState.mockImplementation(async () => undefined);
+    outerPgService.setSyncStatus.mockImplementation(async () => undefined);
     outerPgService.getSyncStatus.mockResolvedValue(null);
     outerPgService.getPaymentSyncStatus.mockImplementation(async () => paymentSyncStatus as never);
     outerPgService.setPaymentSyncStatus.mockImplementation(async (status) => {
@@ -552,6 +774,217 @@ describe('cache sync --pull lock ordering', () => {
       .rmSync(mockHomeDirectory, { recursive: true, force: true });
   });
 
+  it('fails closed when the PostgreSQL writer lock is lost during inventory before pull', async () => {
+    loseOuterPgLockDuringInventory = true;
+
+    await runExplicitPull();
+
+    expect(phaseOrder).toEqual(['accounts', 'categories', 'documents', 'items']);
+    expect(pullFromPostgres).not.toHaveBeenCalled();
+    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    const terminalWrites = outerPgService.setSyncStatus.mock.calls.filter(
+      ([status]) =>
+        typeof status.status === 'string' &&
+        ['success', 'success_with_warnings', 'failed'].includes(status.status)
+    );
+    expect(terminalWrites.map(([status]) => status.status)).toEqual(['failed']);
+    expect(outerPgService.setCacheState).not.toHaveBeenCalled();
+    expect(outerPgService.releaseSyncLock).toHaveBeenCalledTimes(1);
+    expect(outerPgService.close).toHaveBeenCalledTimes(1);
+    expect(outerPgService.tryAcquireSyncLock).toHaveBeenCalledWith(
+      'salesbinder-cache-sync:salesbinder:example',
+      expect.objectContaining({ onLost: expect.any(Function) })
+    );
+    expectSingleSanitizedCliError();
+  });
+
+  it('does not let SQLite mirror publish after outer PostgreSQL lock loss during pull settlement', async () => {
+    loseOuterPgLockDuringPullSettlement = true;
+
+    await runExplicitPull();
+
+    expect(phaseOrder).toEqual(['accounts', 'categories', 'documents', 'items', 'deleted-log']);
+    expect(pullFromPostgres).toHaveBeenCalledTimes(1);
+    expect(sqliteMirrorStatusPublished).toBe(false);
+    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    const terminalWrites = outerPgService.setSyncStatus.mock.calls.filter(
+      ([status]) =>
+        typeof status.status === 'string' &&
+        ['success', 'success_with_warnings', 'failed'].includes(status.status)
+    );
+    expect(terminalWrites.map(([status]) => status.status)).toEqual(['failed']);
+    expect(pullFromPostgres).toHaveBeenCalledWith(
+      'postgres://example.test/salesbinder',
+      'default',
+      undefined,
+      expect.objectContaining({ accountIdentity: 'salesbinder:example' }),
+      expect.objectContaining({
+        pgLockAlreadyHeld: true,
+        lockLossSignal: expect.objectContaining({ aborted: true }),
+        onSettledWhileLocked: expect.any(Function),
+        onPostSuccessFailureWhileLocked: expect.any(Function),
+      })
+    );
+    expect(outerPgService.releaseSyncLock).toHaveBeenCalledTimes(1);
+    expect(outerPgService.close).toHaveBeenCalledTimes(1);
+    expectSingleSanitizedCliError();
+  });
+
+  it('compensates the same run when the writer lock is lost after pull success settlement', async () => {
+    loseOuterPgLockAfterPullSuccessHook = true;
+
+    await runExplicitPull();
+
+    const terminalWrites = outerPgService.setSyncStatus.mock.calls
+      .map(([status]) => status)
+      .filter((status) =>
+        ['success', 'success_with_warnings', 'failed'].includes(String(status.status))
+      );
+    expect(terminalWrites.map(({ status }) => status)).toEqual(['success', 'failed']);
+    expect(terminalWrites[0].runId).toBe(terminalWrites[1].runId);
+    expect(terminalWrites[1]).toEqual(
+      expect.objectContaining({
+        status: 'failed',
+        runId: expect.any(String),
+        message: 'Sync failed',
+        error: 'Cache sync failed.',
+      })
+    );
+    expect(sqliteMirrorStatusPublished).toBe(false);
+    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    expectSingleSanitizedCliError();
+  });
+
+  it('uses the outer owner to compensate a non-lock failure after pull success', async () => {
+    const postSuccessFailure = new Error('local terminal mirror failed');
+    pullFromPostgres.mockImplementation(async (_url, _account, _path, _binding, options) => {
+      innerSqlitePullLockHeld = true;
+      const result = successfulPullResult();
+      try {
+        await options?.onSettledWhileLocked?.({ status: 'success', result });
+        await options?.onPostSuccessFailureWhileLocked?.(postSuccessFailure);
+      } finally {
+        innerSqlitePullLockHeld = false;
+      }
+      throw postSuccessFailure;
+    });
+
+    await runExplicitPull();
+
+    const terminalWrites = outerPgService.setSyncStatus.mock.calls
+      .map(([status]) => status)
+      .filter((status) =>
+        ['success', 'success_with_warnings', 'failed'].includes(String(status.status))
+      );
+    expect(terminalWrites.map(({ status }) => status)).toEqual(['success', 'failed']);
+    expect(terminalWrites[0].runId).toBe(terminalWrites[1].runId);
+    expect(outerPgService.setSyncStatus.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      outerPgService.releaseSyncLock.mock.invocationCallOrder[0]
+    );
+    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    expectSingleSanitizedCliError('Cache sync failed.');
+  });
+
+  it('same-run compensation from the outer owner cannot overwrite a successor after lock loss', async () => {
+    const successorStatus = {
+      status: 'running',
+      runId: 'successor-run',
+      accountName: 'default',
+      syncTarget: 'postgresql',
+    };
+    let durableStatus: Record<string, unknown> | undefined;
+    outerPgService.setSyncStatus.mockImplementation(async (status) => {
+      if (status.status === 'success') {
+        durableStatus = { ...status };
+        return;
+      }
+      if (!outerPgLockHeld && durableStatus?.runId !== status.runId) return;
+      durableStatus = { ...status };
+    });
+    pullFromPostgres.mockImplementation(async (_url, _account, _path, _binding, options) => {
+      innerSqlitePullLockHeld = true;
+      const result = successfulPullResult();
+      const lockLost = new MockPostgresSyncLockLostError();
+      try {
+        await options?.onSettledWhileLocked?.({ status: 'success', result });
+        triggerOuterPgLockLoss();
+        durableStatus = successorStatus;
+        await options?.onPostSuccessFailureWhileLocked?.(lockLost);
+      } finally {
+        innerSqlitePullLockHeld = false;
+      }
+      throw lockLost;
+    });
+
+    await runExplicitPull();
+
+    const terminalWrites = outerPgService.setSyncStatus.mock.calls
+      .map(([status]) => status)
+      .filter((status) =>
+        ['success', 'success_with_warnings', 'failed'].includes(String(status.status))
+      );
+    expect(terminalWrites.map(({ status }) => status)).toEqual(['success', 'failed']);
+    expect(terminalWrites[0].runId).toBe(terminalWrites[1].runId);
+    expect(durableStatus).toBe(successorStatus);
+    expect(outerPgService.setSyncStatus.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      outerPgService.releaseSyncLock.mock.invocationCallOrder[0]
+    );
+    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    expectSingleSanitizedCliError();
+  });
+
+  it('compensates when success persists but its reporter call observes lock loss', async () => {
+    outerPgService.setSyncStatus.mockImplementation(async (status) => {
+      if (status.status === 'success') {
+        triggerOuterPgLockLoss();
+        throw new MockPostgresSyncLockLostError();
+      }
+    });
+
+    await runExplicitPull();
+
+    const terminalWrites = outerPgService.setSyncStatus.mock.calls
+      .map(([status]) => status)
+      .filter((status) =>
+        ['success', 'success_with_warnings', 'failed'].includes(String(status.status))
+      );
+    expect(terminalWrites.map(({ status }) => status)).toEqual(['success', 'failed']);
+    expect(terminalWrites[0].runId).toBe(terminalWrites[1].runId);
+    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    expectSingleSanitizedCliError();
+  });
+
+  it('uses distinct status ownership tokens for two syncs started at the same millisecond', async () => {
+    const frozenNow = 1_780_000_000_123;
+    jest.spyOn(Date, 'now').mockReturnValue(frozenNow);
+
+    await runExplicitPull();
+    await runExplicitPull();
+
+    const statusWrites = outerPgService.setSyncStatus.mock.calls.map(([status]) => status);
+    const runningRunIds = statusWrites
+      .filter(({ status }) => status === 'running')
+      .map(({ runId }) => runId);
+    const successfulRunIds = statusWrites
+      .filter(({ status }) => status === 'success')
+      .map(({ runId }) => runId);
+    expect(runningRunIds).toHaveLength(2);
+    expect(new Set(runningRunIds).size).toBe(2);
+    expect(successfulRunIds).toEqual(runningRunIds);
+    expect(runningRunIds).toEqual([
+      `sync-${frozenNow}-00000000-0000-4000-8000-000000000001`,
+      `sync-${frozenNow}-00000000-0000-4000-8000-000000000002`,
+    ]);
+    expect(runningRunIds.every((runId) => String(runId).length <= 256)).toBe(true);
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it('holds one continuous PostgreSQL writer lock through pull terminal persistence', async () => {
     await runExplicitPull();
 
@@ -571,11 +1004,7 @@ describe('cache sync --pull lock ordering', () => {
     );
     expect(outerPgService.releaseSyncLock).toHaveBeenCalledTimes(1);
     expect(outerPgService.close).toHaveBeenCalledTimes(1);
-    expect(clientRuntimeOptions).toHaveLength(2);
-    expect(clientRuntimeOptions).toEqual([
-      { rateLimitObserver: expect.any(Function) },
-      { rateLimitObserver: expect.any(Function) },
-    ]);
+    expectClientRuntimeOptionsWithSharedSignal(2);
     expect(emittedProgress.map((event) => (event as { phase: string }).phase)).toEqual(
       expect.arrayContaining([
         'accounts',
@@ -626,7 +1055,9 @@ describe('cache sync --pull lock ordering', () => {
       expect.objectContaining({ accountIdentity: 'salesbinder:example' }),
       expect.objectContaining({
         pgLockAlreadyHeld: true,
+        lockLossSignal: expect.objectContaining({ aborted: false }),
         onSettledWhileLocked: expect.any(Function),
+        onPostSuccessFailureWhileLocked: expect.any(Function),
       })
     );
     expect(console.log).toHaveBeenCalledTimes(1);
@@ -1592,6 +2023,76 @@ describe('cache sync --pull lock ordering', () => {
     expect(outerPgService.close).toHaveBeenCalledTimes(1);
   });
 
+  it('fails PostgreSQL cache clear without success output after writer lock loss', async () => {
+    loseOuterPgLockDuringClear = true;
+
+    await runClear();
+
+    expect(outerPgService.truncateAll).toHaveBeenCalledTimes(1);
+    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    expect(outerPgService.tryAcquireSyncLock).toHaveBeenCalledWith(
+      'salesbinder-cache-sync:salesbinder:example',
+      expect.objectContaining({ onLost: expect.any(Function) })
+    );
+    expect(outerPgService.releaseSyncLock).toHaveBeenCalledTimes(1);
+    expect(outerPgService.close).toHaveBeenCalledTimes(1);
+    expectSingleSanitizedCliError();
+  });
+
+  it('fails PostgreSQL cache import-export without success output after writer lock loss', async () => {
+    loseOuterPgLockDuringImport = true;
+
+    await runImportExport('--target', 'postgresql');
+
+    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    expect(outerPgService.tryAcquireSyncLock).toHaveBeenCalledWith(
+      'salesbinder-cache-sync:salesbinder:example',
+      expect.objectContaining({ onLost: expect.any(Function) })
+    );
+    expect(outerPgService.releaseSyncLock).toHaveBeenCalledTimes(1);
+    expect(outerPgService.close).toHaveBeenCalledTimes(1);
+    expectSingleSanitizedCliError();
+  });
+
+  it('fails PostgreSQL payment sync without success output after writer lock loss', async () => {
+    loseOuterPgLockDuringPayments = true;
+
+    await runPaymentSync();
+
+    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    expect(outerPgService.tryAcquireSyncLock).toHaveBeenCalledWith(
+      'salesbinder-cache-sync:salesbinder:example',
+      expect.objectContaining({ onLost: expect.any(Function) })
+    );
+    expect(clientRuntimeOptions).toEqual([
+      expect.objectContaining({ signal: expect.objectContaining({ aborted: true }) }),
+    ]);
+    expect(outerPgService.releaseSyncLock).toHaveBeenCalledTimes(1);
+    expect(outerPgService.close).toHaveBeenCalledTimes(1);
+    expectSingleSanitizedCliError();
+  });
+
+  it('does not release the PostgreSQL payment sync lock when acquisition fails', async () => {
+    outerPgService.tryAcquireSyncLock.mockImplementationOnce(
+      async (_lockKey: string, options?: MockPostgresSyncLockOptions) => {
+        outerPgLockLossCallback = options?.onLost;
+        return false;
+      }
+    );
+
+    await runPaymentSync();
+
+    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+    expect(clientRuntimeOptions).toEqual([]);
+    expect(outerPgService.releaseSyncLock).not.toHaveBeenCalled();
+    expect(outerPgService.close).toHaveBeenCalledTimes(1);
+    expectSingleSanitizedCliError('Another cache sync is already running for this account.');
+  });
+
   it('projects first-sync status progress and derives stale-running health without mutation', async () => {
     outerPgService.getCacheState.mockResolvedValue(null);
     const persistedStatus = {
@@ -1704,6 +2205,20 @@ describe('cache sync --pull lock ordering', () => {
     expect(createPostgresCacheService).not.toHaveBeenCalled();
   });
 });
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 describe('cache clear SQLite account preconditions', () => {
   const originalDatabaseUrl = process.env.SALESBINDER_DB_URL;

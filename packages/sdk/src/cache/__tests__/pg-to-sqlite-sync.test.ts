@@ -6,9 +6,10 @@
  */
 
 import { SQLiteCacheService } from '../sqlite-cache.service.js';
-import { PostgresCacheService } from '../postgres-cache.service.js';
+import { PostgresCacheService, PostgresSyncLockLostError } from '../postgres-cache.service.js';
 import { pullFromPostgres } from '../pg-to-sqlite-sync.service.js';
 import { createCategoryFingerprint } from '../category-indexer.service.js';
+import type { SQLiteMirrorSnapshot } from '../cache.interface.js';
 import type { PgPullLifecycleOptions, PgPullResult, PgPullSettlement } from '../index.js';
 import {
   CACHE_SCHEMA_VERSION,
@@ -247,6 +248,8 @@ describe('PgToSqliteSyncService', () => {
       });
       await targetDb.setCacheState(oldState);
       await targetDb.setPaymentSyncStatus(oldPaymentStatus);
+      const oldSyncStatus = cleanSyncStatus();
+      await targetDb.setSyncStatus(oldSyncStatus);
       targetDb.setRawMeta('pg_pull_timestamp', '12345');
 
       expect(() =>
@@ -276,6 +279,7 @@ describe('PgToSqliteSyncService', () => {
             schemaVersion: CACHE_SCHEMA_VERSION,
           },
           paymentSyncStatus: null,
+          syncStatus: { ...cleanSyncStatus(), runId: 'new-run' },
           pulledAt: 99999,
         })
       ).toThrow(/FOREIGN KEY constraint failed/);
@@ -284,6 +288,7 @@ describe('PgToSqliteSyncService', () => {
       expect(await targetDb.getDocument('new-doc')).toBeUndefined();
       expect(await targetDb.getCacheState()).toEqual(oldState);
       expect(await targetDb.getPaymentSyncStatus()).toEqual(oldPaymentStatus);
+      expect(await targetDb.getSyncStatus()).toEqual(oldSyncStatus);
       expect(targetDb.getRawMeta('pg_pull_timestamp')).toBe(12345);
     });
 
@@ -346,6 +351,7 @@ describe('PgToSqliteSyncService', () => {
         processedDocuments: 1,
         totalDocuments: 1,
       };
+      const syncStatus = { ...cleanSyncStatus(), runId: 'atomic-mirror-run' };
       await targetDb.insertDocument({
         doc_id: 'old-doc',
         context_id: DocumentContextId.Invoice,
@@ -374,6 +380,7 @@ describe('PgToSqliteSyncService', () => {
         paymentTransactions: [payment('payment-new', 'doc-new')],
         cacheState,
         paymentSyncStatus: paymentStatus,
+        syncStatus,
         pulledAt: 54321,
       });
 
@@ -390,6 +397,7 @@ describe('PgToSqliteSyncService', () => {
       ]);
       expect(await targetDb.getCacheState()).toEqual(cacheState);
       expect(await targetDb.getPaymentSyncStatus()).toEqual(paymentStatus);
+      expect(await targetDb.getSyncStatus()).toEqual(syncStatus);
       expect(targetDb.getRawMeta('pg_pull_timestamp')).toBe(54321);
     });
 
@@ -498,6 +506,7 @@ describe('PgToSqliteSyncService', () => {
           inventorySourceApiVersion: '3',
         },
         paymentSyncStatus: null,
+        syncStatus: null,
         pulledAt: 401,
       });
 
@@ -539,6 +548,7 @@ describe('PgToSqliteSyncService', () => {
     let pgSyncStatus: CacheSyncStatus | null;
     let attemptedSqliteStatuses: CacheSyncStatus[];
     let mirroredSyncStatuses: CacheSyncStatus[];
+    let atomicMirrorStatuses: Array<CacheSyncStatus | null | undefined>;
     let compensatedPgStatuses: CacheSyncStatus[];
 
     beforeEach(() => {
@@ -550,6 +560,7 @@ describe('PgToSqliteSyncService', () => {
       pgSyncStatus = cleanSyncStatus();
       attemptedSqliteStatuses = [];
       mirroredSyncStatuses = [];
+      atomicMirrorStatuses = [];
       compensatedPgStatuses = [];
       sqlitePath = join(
         tmpdir(),
@@ -605,10 +616,13 @@ describe('PgToSqliteSyncService', () => {
           events.push('sqlite-lock-acquired');
           return true;
         });
-      jest.spyOn(SQLiteCacheService.prototype, 'replaceMirror').mockImplementation(async () => {
-        events.push('mirror-replaced');
-        if (mirrorFailure) throw mirrorFailure;
-      });
+      jest
+        .spyOn(SQLiteCacheService.prototype, 'replaceMirror')
+        .mockImplementation(async (snapshot: SQLiteMirrorSnapshot) => {
+          events.push('mirror-replaced');
+          if (mirrorFailure) throw mirrorFailure;
+          atomicMirrorStatuses.push(snapshot.syncStatus);
+        });
       jest
         .spyOn(SQLiteCacheService.prototype, 'setSyncStatus')
         .mockImplementation(async (status) => {
@@ -640,6 +654,378 @@ describe('PgToSqliteSyncService', () => {
 
     const pullWithOptions = (options?: PgPullLifecycleOptions): Promise<PgPullResult> =>
       pullFromPostgres('postgres://example/cache', 'pull-lifecycle', sqlitePath, binding, options);
+
+    it('runtime-validates an inherited lock request from JavaScript without a loss signal', async () => {
+      const invalidOptions = { pgLockAlreadyHeld: true } as unknown as PgPullLifecycleOptions;
+
+      await expect(pullWithOptions(invalidOptions)).rejects.toThrow(
+        'PostgreSQL lock-loss signal is required when reusing the writer lock.'
+      );
+
+      expect(PostgresCacheService.prototype.ensureSchema).not.toHaveBeenCalled();
+      expect(SQLiteCacheService.prototype.tryAcquireSyncLock).not.toHaveBeenCalled();
+    });
+
+    it('does not open or replace the mirror when a caller-held PostgreSQL lock is already lost', async () => {
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(
+        pullWithOptions({ pgLockAlreadyHeld: true, lockLossSignal: controller.signal })
+      ).rejects.toBeInstanceOf(PostgresSyncLockLostError);
+
+      expect(PostgresCacheService.prototype.ensureSchema).not.toHaveBeenCalled();
+      expect(SQLiteCacheService.prototype.tryAcquireSyncLock).not.toHaveBeenCalled();
+      expect(SQLiteCacheService.prototype.replaceMirror).not.toHaveBeenCalled();
+      expect(SQLiteCacheService.prototype.setSyncStatus).not.toHaveBeenCalled();
+      expect(PostgresCacheService.prototype.setSyncStatus).not.toHaveBeenCalled();
+      expect(events).toEqual([]);
+    });
+
+    it('fails closed when a caller-held PostgreSQL lock is lost during a major read', async () => {
+      const controller = new AbortController();
+      const settlements: PgPullSettlement[] = [];
+      const hook = jest.fn((settlement: PgPullSettlement) => {
+        settlements.push(settlement);
+        events.push(`${settlement.status}-hook`);
+      });
+      jest.mocked(PostgresCacheService.prototype.getAllAccounts).mockImplementation(async () => {
+        events.push('postgres-accounts-read');
+        controller.abort();
+        return [];
+      });
+
+      await expect(
+        pullWithOptions({
+          pgLockAlreadyHeld: true,
+          lockLossSignal: controller.signal,
+          onSettledWhileLocked: hook,
+        })
+      ).rejects.toBeInstanceOf(PostgresSyncLockLostError);
+
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(settlements).toHaveLength(1);
+      expect(settlements[0]?.status).toBe('failed');
+      expect((settlements[0] as { status: 'failed'; error: unknown }).error).toBeInstanceOf(
+        PostgresSyncLockLostError
+      );
+      expect(SQLiteCacheService.prototype.replaceMirror).not.toHaveBeenCalled();
+      expect(SQLiteCacheService.prototype.setSyncStatus).not.toHaveBeenCalled();
+      expect(PostgresCacheService.prototype.setSyncStatus).not.toHaveBeenCalled();
+      expect(attemptedSqliteStatuses).toEqual([]);
+      expect(mirroredSyncStatuses).toEqual([]);
+      expect(compensatedPgStatuses).toEqual([]);
+      expect(events).toEqual([
+        'sqlite-lock-acquired',
+        'postgres-accounts-read',
+        'failed-hook',
+        'sqlite-lock-released',
+        'postgres-closed',
+        'sqlite-closed',
+      ]);
+    });
+
+    it('publishes a local failed status when lock loss lands after replacement but before settlement', async () => {
+      const controller = new AbortController();
+      const runningStatus = { ...cleanSyncStatus(), status: 'running' as const };
+      delete runningStatus.finishedAt;
+      pgSyncStatus = runningStatus;
+      const settlements: PgPullSettlement[] = [];
+      const hook = jest.fn((settlement: PgPullSettlement) => {
+        settlements.push(settlement);
+        events.push(`${settlement.status}-hook`);
+      });
+      jest
+        .mocked(SQLiteCacheService.prototype.replaceMirror)
+        .mockImplementation(async (snapshot) => {
+          events.push('mirror-replaced');
+          atomicMirrorStatuses.push(snapshot.syncStatus);
+          controller.abort();
+        });
+
+      await expect(
+        pullWithOptions({
+          pgLockAlreadyHeld: true,
+          lockLossSignal: controller.signal,
+          onSettledWhileLocked: hook,
+        })
+      ).rejects.toBeInstanceOf(PostgresSyncLockLostError);
+
+      expect(atomicMirrorStatuses).toEqual([expect.objectContaining({ status: 'running' })]);
+      expect(attemptedSqliteStatuses).toEqual([
+        expect.objectContaining({
+          status: 'failed',
+          runId: 'pull-run',
+          message: 'Sync failed',
+          error: 'Cache sync failed.',
+        }),
+      ]);
+      expect(compensatedPgStatuses).toEqual([]);
+      expect(settlements).toEqual([
+        expect.objectContaining({ status: 'failed', error: expect.any(PostgresSyncLockLostError) }),
+      ]);
+      expect(events.indexOf('sqlite-status-written')).toBeLessThan(
+        events.indexOf('sqlite-lock-released')
+      );
+    });
+
+    it.each(['resolve', 'reject'] as const)(
+      'rejects promptly on lock loss during the terminal status read and handles its late %s',
+      async (lateOutcome) => {
+        const controller = new AbortController();
+        const settlements: PgPullSettlement[] = [];
+        const postSuccessFailures: unknown[] = [];
+        const terminalRead = deferred<CacheSyncStatus | null>();
+        const terminalReadStarted = deferred<void>();
+        const runningStatus = { ...cleanSyncStatus(), status: 'running' as const };
+        delete runningStatus.finishedAt;
+        jest
+          .mocked(PostgresCacheService.prototype.getSyncStatus)
+          .mockResolvedValueOnce(runningStatus)
+          .mockImplementationOnce(async () => {
+            events.push('postgres-status-read');
+            terminalReadStarted.resolve(undefined);
+            return terminalRead.promise;
+          });
+        const hook = jest.fn((settlement: PgPullSettlement) => {
+          settlements.push(settlement);
+          events.push(`${settlement.status}-hook`);
+        });
+        const postSuccessFailureHook = jest.fn((error: unknown) => {
+          postSuccessFailures.push(error);
+          events.push('failed-hook');
+        });
+        let settled = false;
+        const pull = pullWithOptions({
+          pgLockAlreadyHeld: true,
+          lockLossSignal: controller.signal,
+          onSettledWhileLocked: hook,
+          onPostSuccessFailureWhileLocked: postSuccessFailureHook,
+        }).then(
+          () => {
+            settled = true;
+            return null;
+          },
+          (error: unknown) => {
+            settled = true;
+            return error;
+          }
+        );
+
+        await terminalReadStarted.promise;
+        controller.abort();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const settledBeforeTerminalRead = settled;
+        if (lateOutcome === 'resolve') terminalRead.resolve(cleanSyncStatus());
+        else terminalRead.reject(new Error('late private PostgreSQL read failure'));
+        const error = await pull;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(settledBeforeTerminalRead).toBe(true);
+        expect(error).toBeInstanceOf(PostgresSyncLockLostError);
+        expect(hook).toHaveBeenCalledTimes(1);
+        expect(settlements.map(({ status }) => status)).toEqual(['success']);
+        expect(postSuccessFailureHook).toHaveBeenCalledTimes(1);
+        expect(postSuccessFailures[0]).toBeInstanceOf(PostgresSyncLockLostError);
+        expect(attemptedSqliteStatuses).toEqual([
+          expect.objectContaining({ status: 'failed', runId: 'pull-run' }),
+        ]);
+        expect(compensatedPgStatuses).toEqual([]);
+        expect(events.indexOf('sqlite-status-written')).toBeLessThan(
+          events.indexOf('sqlite-lock-released')
+        );
+      }
+    );
+
+    it('never uses the inner PostgreSQL service after inherited lock loss during SQLite compensation', async () => {
+      const controller = new AbortController();
+      const compensationStarted = deferred<void>();
+      const compensationGate = deferred<void>();
+      const statusReadFailure = new Error('terminal status reread failed');
+      const settlements: PgPullSettlement[] = [];
+      const postSuccessFailures: unknown[] = [];
+      jest
+        .mocked(PostgresCacheService.prototype.getSyncStatus)
+        .mockImplementationOnce(async () => {
+          events.push('postgres-status-read');
+          return cleanSyncStatus();
+        })
+        .mockImplementationOnce(async () => {
+          events.push('postgres-status-read');
+          throw statusReadFailure;
+        });
+      jest.mocked(SQLiteCacheService.prototype.setSyncStatus).mockImplementation(async (status) => {
+        events.push('sqlite-status-written');
+        attemptedSqliteStatuses.push(status);
+        compensationStarted.resolve(undefined);
+        await compensationGate.promise;
+        mirroredSyncStatuses.push(status);
+      });
+      const hook = jest.fn((settlement: PgPullSettlement) => {
+        settlements.push(settlement);
+        events.push(`${settlement.status}-hook`);
+      });
+      const postSuccessFailureHook = jest.fn((error: unknown) => {
+        postSuccessFailures.push(error);
+        events.push('failed-hook');
+      });
+      let settled = false;
+      const pull = pullWithOptions({
+        pgLockAlreadyHeld: true,
+        lockLossSignal: controller.signal,
+        onSettledWhileLocked: hook,
+        onPostSuccessFailureWhileLocked: postSuccessFailureHook,
+      }).then(
+        () => {
+          settled = true;
+          return null;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        }
+      );
+
+      await compensationStarted.promise;
+      controller.abort();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(PostgresCacheService.prototype.setSyncStatus).not.toHaveBeenCalled();
+      expect(events).not.toContain('sqlite-lock-released');
+
+      compensationGate.resolve(undefined);
+      const error = await pull;
+
+      expect(error).toBeInstanceOf(PostgresSyncLockLostError);
+      expect(settlements.map(({ status }) => status)).toEqual(['success']);
+      expect(postSuccessFailureHook).toHaveBeenCalledTimes(1);
+      expect(postSuccessFailures[0]).toBeInstanceOf(PostgresSyncLockLostError);
+      expect(PostgresCacheService.prototype.setSyncStatus).not.toHaveBeenCalled();
+      expect(events.indexOf('sqlite-status-written')).toBeLessThan(events.indexOf('failed-hook'));
+      expect(events.indexOf('failed-hook')).toBeLessThan(events.indexOf('sqlite-lock-released'));
+    });
+
+    it('delegates inherited non-lock PostgreSQL compensation to the outer owner callback', async () => {
+      const controller = new AbortController();
+      const statusReadFailure = new Error('terminal status reread failed');
+      const postSuccessFailureHook = jest.fn((error: unknown) => {
+        events.push('failed-hook');
+        expect(error).toBe(statusReadFailure);
+      });
+      jest
+        .mocked(PostgresCacheService.prototype.getSyncStatus)
+        .mockImplementationOnce(async () => {
+          events.push('postgres-status-read');
+          return cleanSyncStatus();
+        })
+        .mockImplementationOnce(async () => {
+          events.push('postgres-status-read');
+          throw statusReadFailure;
+        });
+
+      await expect(
+        pullWithOptions({
+          pgLockAlreadyHeld: true,
+          lockLossSignal: controller.signal,
+          onSettledWhileLocked: async ({ status }) => {
+            events.push(`${status}-hook`);
+          },
+          onPostSuccessFailureWhileLocked: postSuccessFailureHook,
+        })
+      ).rejects.toBe(statusReadFailure);
+
+      expect(postSuccessFailureHook).toHaveBeenCalledTimes(1);
+      expect(PostgresCacheService.prototype.setSyncStatus).not.toHaveBeenCalled();
+      expect(attemptedSqliteStatuses).toEqual([
+        expect.objectContaining({ status: 'failed', runId: 'pull-run' }),
+      ]);
+      expect(events.indexOf('sqlite-status-written')).toBeLessThan(events.indexOf('failed-hook'));
+      expect(events.indexOf('failed-hook')).toBeLessThan(events.indexOf('sqlite-lock-released'));
+    });
+
+    it('awaits an in-flight SQLite replacement before releasing its writer lock after abort', async () => {
+      const controller = new AbortController();
+      const replacement = deferred<void>();
+      const replacementStarted = deferred<void>();
+      const runningStatus = { ...cleanSyncStatus(), status: 'running' as const };
+      delete runningStatus.finishedAt;
+      pgSyncStatus = runningStatus;
+      jest
+        .mocked(SQLiteCacheService.prototype.replaceMirror)
+        .mockImplementation(async (snapshot) => {
+          events.push('mirror-replaced');
+          atomicMirrorStatuses.push(snapshot.syncStatus);
+          replacementStarted.resolve(undefined);
+          await replacement.promise;
+        });
+      let settled = false;
+      const pull = pullWithOptions({
+        pgLockAlreadyHeld: true,
+        lockLossSignal: controller.signal,
+        onSettledWhileLocked: async () => undefined,
+      }).catch((error: unknown) => {
+        settled = true;
+        return error;
+      });
+
+      await replacementStarted.promise;
+      controller.abort();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(events).not.toContain('sqlite-lock-released');
+
+      replacement.resolve(undefined);
+      await expect(pull).resolves.toBeInstanceOf(PostgresSyncLockLostError);
+      expect(events.indexOf('sqlite-status-written')).toBeLessThan(
+        events.indexOf('sqlite-lock-released')
+      );
+    });
+
+    it('passes an onLost callback when the pull owns the PostgreSQL lock', async () => {
+      await pullWithOptions();
+
+      expect(PostgresCacheService.prototype.tryAcquireSyncLock).toHaveBeenCalledWith(
+        `salesbinder-cache-sync:${binding.accountIdentity}`,
+        expect.objectContaining({ onLost: expect.any(Function) })
+      );
+    });
+
+    it('rejects promptly and releases a PostgreSQL lock acquired after its wait was aborted', async () => {
+      const acquisition = deferred<boolean>();
+      const acquisitionStarted = deferred<void>();
+      let onLost: ((error: Error) => void) | undefined;
+      jest
+        .mocked(PostgresCacheService.prototype.tryAcquireSyncLock)
+        .mockImplementation(async (_lockKey, options) => {
+          onLost = options?.onLost;
+          acquisitionStarted.resolve(undefined);
+          return acquisition.promise;
+        });
+      let settled = false;
+      const pull = pullWithOptions().then(
+        () => {
+          settled = true;
+          return null;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        }
+      );
+
+      await acquisitionStarted.promise;
+      onLost?.(new Error('private owner-session failure'));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const settledBeforeAcquisition = settled;
+      acquisition.resolve(true);
+      const error = await pull;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(settledBeforeAcquisition).toBe(true);
+      expect(error).toBeInstanceOf(PostgresSyncLockLostError);
+      expect(PostgresCacheService.prototype.releaseSyncLock).toHaveBeenCalledTimes(1);
+      expect(SQLiteCacheService.prototype.tryAcquireSyncLock).not.toHaveBeenCalled();
+    });
 
     it('mirrors documents with null or zero modified values and their dependent bundles', async () => {
       const nullModifiedDocument: DocumentRow = {
@@ -740,8 +1126,8 @@ describe('PgToSqliteSyncService', () => {
     it('mirrors a terminal warning status written by the success hook before releasing locks', async () => {
       const documentId = 'document-warning-with-stable-id';
       const itemId = 'item-warning-with-stable-id';
-      const hook = jest.fn(async () => {
-        events.push('success-hook');
+      const hook = jest.fn(async (settlement: PgPullSettlement) => {
+        events.push(`${settlement.status}-hook`);
         pgSyncStatus = {
           ...cleanSyncStatus(),
           status: 'success_with_warnings',
@@ -795,8 +1181,8 @@ describe('PgToSqliteSyncService', () => {
       expect(events).toEqual([
         'postgres-lock-acquired',
         'sqlite-lock-acquired',
-        'mirror-replaced',
         'postgres-status-read',
+        'mirror-replaced',
         'success-hook',
         'postgres-status-read',
         'sqlite-status-written',
@@ -810,22 +1196,23 @@ describe('PgToSqliteSyncService', () => {
     it.each([1, 999])(
       'rejects warning attempts %s without mirroring the untrusted terminal status',
       async (attempts) => {
-        const hook = jest.fn(async () => {
-          events.push('success-hook');
-          pgSyncStatus = {
-            ...cleanSyncStatus(),
-            status: 'success_with_warnings',
-            recordIssues: [
-              {
-                resource: 'item',
-                id: 'invalid-attempt-count-warning',
-                code: 'invalid_record',
-                message: 'untrusted source text',
-                attempts,
-                outcome: 'omitted_new',
-              },
-            ],
-          } as unknown as CacheSyncStatus;
+        const hook = jest.fn(async (settlement: PgPullSettlement) => {
+          events.push(`${settlement.status}-hook`);
+          if (settlement.status === 'success')
+            pgSyncStatus = {
+              ...cleanSyncStatus(),
+              status: 'success_with_warnings',
+              recordIssues: [
+                {
+                  resource: 'item',
+                  id: 'invalid-attempt-count-warning',
+                  code: 'invalid_record',
+                  message: 'untrusted source text',
+                  attempts,
+                  outcome: 'omitted_new',
+                },
+              ],
+            } as unknown as CacheSyncStatus;
         });
 
         await expect(pullWithOptions({ onSettledWhileLocked: hook })).rejects.toThrow(
@@ -850,8 +1237,8 @@ describe('PgToSqliteSyncService', () => {
         expect(events).toEqual([
           'postgres-lock-acquired',
           'sqlite-lock-acquired',
-          'mirror-replaced',
           'postgres-status-read',
+          'mirror-replaced',
           'success-hook',
           'postgres-status-read',
           'sqlite-status-written',
@@ -942,8 +1329,8 @@ describe('PgToSqliteSyncService', () => {
       expect(events).toEqual([
         'postgres-lock-acquired',
         'sqlite-lock-acquired',
-        'mirror-replaced',
         'postgres-status-read',
+        'mirror-replaced',
         'success-hook',
         'postgres-status-read',
         'sqlite-status-written',
@@ -987,11 +1374,44 @@ describe('PgToSqliteSyncService', () => {
       expect(events.indexOf('hook-finished')).toBeLessThan(events.indexOf('sqlite-lock-released'));
     });
 
+    it('does not abandon an in-flight lifecycle hook when the PostgreSQL lock is lost', async () => {
+      const controller = new AbortController();
+      const hookStarted = deferred<void>();
+      const hookGate = deferred<void>();
+      let settled = false;
+      const pull = pullWithOptions({
+        pgLockAlreadyHeld: true,
+        lockLossSignal: controller.signal,
+        onSettledWhileLocked: async () => {
+          events.push('hook-started');
+          hookStarted.resolve(undefined);
+          await hookGate.promise;
+          events.push('hook-finished');
+        },
+      }).catch((error: unknown) => {
+        settled = true;
+        return error;
+      });
+
+      await hookStarted.promise;
+      controller.abort();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(events).not.toContain('sqlite-lock-released');
+
+      hookGate.resolve(undefined);
+      await expect(pull).resolves.toBeInstanceOf(PostgresSyncLockLostError);
+      expect(events.indexOf('hook-finished')).toBeLessThan(events.indexOf('sqlite-status-written'));
+      expect(events.indexOf('sqlite-status-written')).toBeLessThan(
+        events.indexOf('sqlite-lock-released')
+      );
+    });
+
     it('treats a successful-pull hook rejection as fatal and still cleans up both locks', async () => {
       const hookError = new Error('terminal persistence failed');
-      const hook = jest.fn(async () => {
-        events.push('success-hook');
-        throw hookError;
+      const hook = jest.fn(async (settlement: PgPullSettlement) => {
+        events.push(`${settlement.status}-hook`);
+        if (settlement.status === 'success') throw hookError;
       });
 
       await expect(pullWithOptions({ onSettledWhileLocked: hook })).rejects.toBe(hookError);
@@ -1000,7 +1420,12 @@ describe('PgToSqliteSyncService', () => {
       expect(events.indexOf('success-hook')).toBeLessThan(events.indexOf('sqlite-lock-released'));
       expect(events.filter((event) => event === 'postgres-status-read')).toHaveLength(1);
       expect(events.indexOf('postgres-status-read')).toBeLessThan(events.indexOf('success-hook'));
-      expect(events).not.toContain('sqlite-status-written');
+      expect(attemptedSqliteStatuses).toEqual([
+        expect.objectContaining({ status: 'failed', runId: 'pull-run' }),
+      ]);
+      expect(compensatedPgStatuses).toEqual([
+        expect.objectContaining({ status: 'failed', runId: 'pull-run' }),
+      ]);
       expect(events).toEqual(
         expect.arrayContaining([
           'sqlite-lock-released',
@@ -1011,13 +1436,13 @@ describe('PgToSqliteSyncService', () => {
       );
     });
 
-    it('keeps a post-hook SQLite status-write failure fatal without invoking the hook twice', async () => {
+    it('reports a post-hook SQLite status-write failure without retrying the success hook', async () => {
       const statusWriteFailure = new Error('local terminal status write failed');
       sqliteStatusFailure = statusWriteFailure;
       sqliteStatusFailuresRemaining = 2;
-      const hook = jest.fn(async () => {
-        events.push('success-hook');
-        pgSyncStatus = cleanSyncStatus();
+      const hook = jest.fn(async (settlement: PgPullSettlement) => {
+        events.push(`${settlement.status}-hook`);
+        if (settlement.status === 'success') pgSyncStatus = cleanSyncStatus();
       });
 
       await expect(pullWithOptions({ onSettledWhileLocked: hook })).rejects.toBe(
@@ -1042,8 +1467,8 @@ describe('PgToSqliteSyncService', () => {
       expect(events).toEqual([
         'postgres-lock-acquired',
         'sqlite-lock-acquired',
-        'mirror-replaced',
         'postgres-status-read',
+        'mirror-replaced',
         'success-hook',
         'postgres-status-read',
         'sqlite-status-written',
@@ -1060,8 +1485,8 @@ describe('PgToSqliteSyncService', () => {
       const statusWriteFailure = new Error('transient local terminal status write failed');
       sqliteStatusFailure = statusWriteFailure;
       sqliteStatusFailuresRemaining = 1;
-      const hook = jest.fn(async () => {
-        events.push('success-hook');
+      const hook = jest.fn(async (settlement: PgPullSettlement) => {
+        events.push(`${settlement.status}-hook`);
       });
 
       await expect(pullWithOptions({ onSettledWhileLocked: hook })).rejects.toBe(
@@ -1082,8 +1507,8 @@ describe('PgToSqliteSyncService', () => {
       expect(events).toEqual([
         'postgres-lock-acquired',
         'sqlite-lock-acquired',
-        'mirror-replaced',
         'postgres-status-read',
+        'mirror-replaced',
         'success-hook',
         'postgres-status-read',
         'sqlite-status-written',
@@ -1108,8 +1533,8 @@ describe('PgToSqliteSyncService', () => {
           events.push('postgres-status-read');
           throw statusReadFailure;
         });
-      const hook = jest.fn(async () => {
-        events.push('success-hook');
+      const hook = jest.fn(async (settlement: PgPullSettlement) => {
+        events.push(`${settlement.status}-hook`);
       });
 
       await expect(pullWithOptions({ onSettledWhileLocked: hook })).rejects.toBe(statusReadFailure);
@@ -1125,8 +1550,8 @@ describe('PgToSqliteSyncService', () => {
       expect(events).toEqual([
         'postgres-lock-acquired',
         'sqlite-lock-acquired',
-        'mirror-replaced',
         'postgres-status-read',
+        'mirror-replaced',
         'success-hook',
         'postgres-status-read',
         'sqlite-status-written',
@@ -1143,8 +1568,8 @@ describe('PgToSqliteSyncService', () => {
       sqliteStatusFailure = statusWriteFailure;
       sqliteStatusFailuresRemaining = 2;
       pgStatusFailure = new Error('postgres compensation failed');
-      const hook = jest.fn(async () => {
-        events.push('success-hook');
+      const hook = jest.fn(async (settlement: PgPullSettlement) => {
+        events.push(`${settlement.status}-hook`);
       });
 
       await expect(pullWithOptions({ onSettledWhileLocked: hook })).rejects.toBe(
@@ -1157,8 +1582,8 @@ describe('PgToSqliteSyncService', () => {
       expect(events).toEqual([
         'postgres-lock-acquired',
         'sqlite-lock-acquired',
-        'mirror-replaced',
         'postgres-status-read',
+        'mirror-replaced',
         'success-hook',
         'postgres-status-read',
         'sqlite-status-written',
@@ -1173,8 +1598,8 @@ describe('PgToSqliteSyncService', () => {
 
     it('fails closed when a success hook does not leave a terminal PostgreSQL status', async () => {
       pgSyncStatus = { ...cleanSyncStatus(), status: 'running', finishedAt: undefined };
-      const hook = jest.fn(async () => {
-        events.push('success-hook');
+      const hook = jest.fn(async (settlement: PgPullSettlement) => {
+        events.push(`${settlement.status}-hook`);
       });
 
       await expect(pullWithOptions({ onSettledWhileLocked: hook })).rejects.toThrow(
@@ -1191,8 +1616,8 @@ describe('PgToSqliteSyncService', () => {
       expect(events).toEqual([
         'postgres-lock-acquired',
         'sqlite-lock-acquired',
-        'mirror-replaced',
         'postgres-status-read',
+        'mirror-replaced',
         'success-hook',
         'postgres-status-read',
         'sqlite-status-written',
@@ -1213,13 +1638,15 @@ describe('PgToSqliteSyncService', () => {
         attempts: 2 as const,
         outcome: 'omitted_new' as const,
       };
-      const hook = jest.fn(async () => {
-        events.push('success-hook');
-        pgSyncStatus = {
-          ...cleanSyncStatus(),
-          status: 'success_with_warnings',
-          recordIssues: [repeatedIssue, { ...repeatedIssue }],
-        };
+      const hook = jest.fn(async (settlement: PgPullSettlement) => {
+        events.push(`${settlement.status}-hook`);
+        if (settlement.status === 'success') {
+          pgSyncStatus = {
+            ...cleanSyncStatus(),
+            status: 'success_with_warnings',
+            recordIssues: [repeatedIssue, { ...repeatedIssue }],
+          };
+        }
       });
 
       await expect(pullWithOptions({ onSettledWhileLocked: hook })).rejects.toThrow(
@@ -1236,8 +1663,8 @@ describe('PgToSqliteSyncService', () => {
       expect(events).toEqual([
         'postgres-lock-acquired',
         'sqlite-lock-acquired',
-        'mirror-replaced',
         'postgres-status-read',
+        'mirror-replaced',
         'success-hook',
         'postgres-status-read',
         'sqlite-status-written',
@@ -1283,22 +1710,18 @@ describe('PgToSqliteSyncService', () => {
 
       expect(result).toEqual(expect.objectContaining({ success: true, documentsPulled: 0 }));
       expect(events).not.toContain('success-hook');
-      expect(mirroredSyncStatuses).toEqual([
+      expect(atomicMirrorStatuses).toEqual([
         expect.objectContaining({
           status: 'success',
           runId: 'pull-run',
           message: 'Sync completed',
         }),
       ]);
-      expect(events.indexOf('mirror-replaced')).toBeLessThan(
-        events.indexOf('postgres-status-read')
-      );
       expect(events.indexOf('postgres-status-read')).toBeLessThan(
-        events.indexOf('sqlite-status-written')
+        events.indexOf('mirror-replaced')
       );
-      expect(events.indexOf('sqlite-status-written')).toBeLessThan(
-        events.indexOf('sqlite-lock-released')
-      );
+      expect(attemptedSqliteStatuses).toEqual([]);
+      expect(PostgresCacheService.prototype.setSyncStatus).not.toHaveBeenCalled();
       expect(events).toEqual(
         expect.arrayContaining([
           'sqlite-lock-released',
@@ -1313,23 +1736,91 @@ describe('PgToSqliteSyncService', () => {
       const hook = jest.fn(() => {
         events.push('success-hook');
       });
+      const lockLossController = new AbortController();
 
-      await pullWithOptions({ pgLockAlreadyHeld: true, onSettledWhileLocked: hook });
+      await pullWithOptions({
+        pgLockAlreadyHeld: true,
+        lockLossSignal: lockLossController.signal,
+        onSettledWhileLocked: hook,
+      });
 
       expect(hook).toHaveBeenCalledTimes(1);
       expect(events).not.toContain('postgres-lock-acquired');
       expect(events).not.toContain('postgres-lock-released');
       expect(events).toEqual([
         'sqlite-lock-acquired',
-        'mirror-replaced',
         'postgres-status-read',
+        'mirror-replaced',
         'success-hook',
         'postgres-status-read',
         'sqlite-status-written',
-        'sqlite-lock-released',
         'postgres-closed',
+        'sqlite-lock-released',
         'sqlite-closed',
       ]);
+    });
+
+    it('keeps SQLite locked through inherited PostgreSQL cleanup and fails locally on late lock loss', async () => {
+      const controller = new AbortController();
+      const closeStarted = deferred<void>();
+      const closeGate = deferred<void>();
+      const settlements: PgPullSettlement[] = [];
+      const postSuccessFailures: unknown[] = [];
+      jest.mocked(PostgresCacheService.prototype.close).mockImplementation(async () => {
+        events.push('postgres-close-started');
+        closeStarted.resolve(undefined);
+        await closeGate.promise;
+        events.push('postgres-closed');
+      });
+      const hook = jest.fn((settlement: PgPullSettlement) => {
+        settlements.push(settlement);
+        events.push(`${settlement.status}-hook`);
+      });
+      const postSuccessFailureHook = jest.fn((error: unknown) => {
+        postSuccessFailures.push(error);
+        events.push('failed-hook');
+      });
+      let settled = false;
+      const pull = pullWithOptions({
+        pgLockAlreadyHeld: true,
+        lockLossSignal: controller.signal,
+        onSettledWhileLocked: hook,
+        onPostSuccessFailureWhileLocked: postSuccessFailureHook,
+      }).then(
+        () => {
+          settled = true;
+          return null;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        }
+      );
+
+      await closeStarted.promise;
+      controller.abort();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(attemptedSqliteStatuses.map(({ status }) => status)).toEqual(['success']);
+      expect(events).not.toContain('sqlite-lock-released');
+
+      closeGate.resolve(undefined);
+      const error = await pull;
+
+      expect(error).toBeInstanceOf(PostgresSyncLockLostError);
+      expect(PostgresCacheService.prototype.close).toHaveBeenCalledTimes(1);
+      expect(PostgresCacheService.prototype.setSyncStatus).not.toHaveBeenCalled();
+      expect(attemptedSqliteStatuses.map(({ status }) => status)).toEqual(['success', 'failed']);
+      expect(settlements.map(({ status }) => status)).toEqual(['success']);
+      expect(postSuccessFailureHook).toHaveBeenCalledTimes(1);
+      expect(postSuccessFailures[0]).toBeInstanceOf(PostgresSyncLockLostError);
+      expect(events.indexOf('postgres-closed')).toBeLessThan(
+        events.lastIndexOf('sqlite-status-written')
+      );
+      expect(events.lastIndexOf('sqlite-status-written')).toBeLessThan(
+        events.indexOf('failed-hook')
+      );
+      expect(events.indexOf('failed-hook')).toBeLessThan(events.indexOf('sqlite-lock-released'));
     });
   });
 });
@@ -1357,4 +1848,18 @@ function cleanSyncStatus(): CacheSyncStatus {
     message: 'Sync completed',
     syncType: 'full',
   };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }

@@ -1348,10 +1348,14 @@ export class SQLiteCacheService implements CacheService {
   }
 
   setSyncStatus(status: CacheSyncStatus): Promise<void> {
+    this.setSyncStatusInTransaction(status);
+    return Promise.resolve();
+  }
+
+  private setSyncStatusInTransaction(status: CacheSyncStatus): void {
     this.db
       .prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('sync_status', ?)`)
       .run(JSON.stringify(status));
-    return Promise.resolve();
   }
 
   getPaymentSyncStatus(): Promise<PaymentSyncStatus | null> {
@@ -1475,6 +1479,7 @@ export class SQLiteCacheService implements CacheService {
         this.invalidateInventoryAuthorityInTransaction();
       }
       if (snapshot.paymentSyncStatus) void this.setPaymentSyncStatus(snapshot.paymentSyncStatus);
+      if (snapshot.syncStatus) this.setSyncStatusInTransaction(snapshot.syncStatus);
       this.setRawMeta('pg_pull_timestamp', String(snapshot.pulledAt));
     });
     tx.immediate();

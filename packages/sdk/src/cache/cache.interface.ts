@@ -36,6 +36,8 @@ export interface SQLiteMirrorSnapshot {
   paymentTransactions: PaymentTransactionRow[];
   cacheState: CacheState | null;
   paymentSyncStatus: PaymentSyncStatus | null;
+  /** Sanitized source status to publish atomically with the replacement. */
+  syncStatus: CacheSyncStatus | null;
   pulledAt: number;
 }
 

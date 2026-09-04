@@ -49,6 +49,7 @@ const { Pool } = pg;
 const DB_WRITE_LOCK_KEY = 'salesbinder.cache.database-write.v6';
 const INVENTORY_NULLABILITY_MIGRATION_META_KEY = 'schema.v7.inventory-nullability-migrated';
 const POSTGRES_INTEGER_MAX = 2_147_483_647;
+const swallowReleasedClientError = (): void => undefined;
 
 const CATEGORY_COLUMNS = [
   'category_id',
@@ -204,11 +205,48 @@ const STOCK_COLUMNS = [
 ] as const;
 
 type QueryExecutor = Pick<PoolClient, 'query'>;
+const supportsClientLifecycleEvents = (client: PoolClient): boolean =>
+  typeof client.on === 'function' &&
+  typeof client.once === 'function' &&
+  typeof client.removeListener === 'function';
+
+export interface PostgresSyncLockOptions {
+  onLost?: (error: Error) => void | Promise<void>;
+}
+
+export class PostgresSyncLockLostError extends Error {
+  constructor() {
+    super('PostgreSQL sync lock lost.');
+    this.name = 'PostgresSyncLockLostError';
+  }
+}
+
+class PostgresSyncStatusStaleError extends Error {
+  constructor() {
+    super('PostgreSQL sync status belongs to another run.');
+    this.name = 'PostgresSyncStatusStaleError';
+  }
+}
+
+type HeldPostgresSyncLock = {
+  client: PoolClient;
+  lockKey: string;
+  queue: Promise<void>;
+  lostError?: PostgresSyncLockLostError;
+  releaseStarted: boolean;
+  clientReleased: boolean;
+  releasePromise?: Promise<void>;
+  cleanupListeners: () => void;
+  onLost?: (error: Error) => void | Promise<void>;
+};
 
 export class PostgresCacheService implements CacheService {
   private pool: InstanceType<typeof Pool>;
   private opened = true;
-  private readonly syncLockClients = new Map<string, PoolClient>();
+  private readonly syncLockClients = new Map<string, HeldPostgresSyncLock>();
+  private lostSyncLockErrors?: Map<string, PostgresSyncLockLostError>;
+  private syncLockAcquisitions?: Map<string, Promise<void>>;
+  private closePromise?: Promise<void>;
   private readonly connectionString: string;
   private expectedBinding: CacheAccountBinding | null = null;
 
@@ -218,8 +256,8 @@ export class PostgresCacheService implements CacheService {
     // node-postgres emits pool-level errors when an idle connection drops.
     // Handle them here so a transient idle-client failure does not become an
     // uncaught EventEmitter error. Never include the connection string.
-    this.pool.on('error', (error) => {
-      console.error(`PostgreSQL idle client error: ${error.message}`);
+    this.pool.on('error', () => {
+      console.error('PostgreSQL idle client error.');
     });
   }
 
@@ -944,33 +982,14 @@ export class PostgresCacheService implements CacheService {
   }
 
   async getCategorySnapshot(): Promise<CategorySnapshot | null> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      const snapshot = await this.readAuthoritativeCategorySnapshot(client);
-      await client.query('COMMIT');
-      return snapshot;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+    return this.withReadOnlyTransaction((client) => this.readAuthoritativeCategorySnapshot(client));
   }
 
   async getCategoryCacheMeta(): Promise<CategoryCacheMeta | null> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    return this.withReadOnlyTransaction(async (client) => {
       const snapshot = await this.readAuthoritativeCategorySnapshot(client);
-      await client.query('COMMIT');
       return snapshot?.meta ?? null;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async getCategory(categoryId: string): Promise<CategoryCacheRow | undefined> {
@@ -1429,33 +1448,16 @@ export class PostgresCacheService implements CacheService {
   }
 
   async getInventoryCacheMeta(): Promise<InventoryCacheMeta | null> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    return this.withReadOnlyTransaction(async (client) => {
       const snapshot = await this.readAuthoritativeInventorySnapshot(client);
-      await client.query('COMMIT');
       return snapshot?.meta ?? null;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async getInventorySnapshot(): Promise<InventorySnapshot | null> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
-      const snapshot = await this.readAuthoritativeInventorySnapshot(client);
-      await client.query('COMMIT');
-      return snapshot;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+    return this.withReadOnlyTransaction((client) =>
+      this.readAuthoritativeInventorySnapshot(client)
+    );
   }
 
   async getItemDocumentsForPeriod(
@@ -1634,13 +1636,32 @@ export class PostgresCacheService implements CacheService {
   }
 
   async setSyncStatus(status: CacheSyncStatus): Promise<void> {
-    await this.withVerifiedWrite(async (client) => {
-      await client.query(
-        `INSERT INTO cache_meta (key, value) VALUES ('sync_status', $1)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [JSON.stringify(status)]
-      );
-    });
+    const binding = this.requireExpectedBinding();
+    const persist = async (): Promise<void> => {
+      await this.withVerifiedWrite(async (client) => {
+        await client.query(
+          `INSERT INTO cache_meta (key, value) VALUES ('sync_status', $1)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+          [JSON.stringify(status)]
+        );
+      });
+    };
+
+    const lostError = this.getLostSyncLockError(binding);
+    if (lostError) {
+      if (status.status !== 'failed') throw lostError;
+      await this.persistFailedSyncStatusAfterLockLoss(status, binding);
+      return;
+    }
+
+    try {
+      await persist();
+    } catch (error) {
+      const transactionLostError = this.getLostSyncLockError(binding);
+      if (!transactionLostError) throw error;
+      if (status.status !== 'failed') throw transactionLostError;
+      await this.persistFailedSyncStatusAfterLockLoss(status, binding);
+    }
   }
 
   async getPaymentSyncStatus(): Promise<PaymentSyncStatus | null> {
@@ -1661,43 +1682,99 @@ export class PostgresCacheService implements CacheService {
     });
   }
 
-  async tryAcquireSyncLock(_lockKey: string): Promise<boolean> {
+  async tryAcquireSyncLock(
+    _lockKey: string,
+    options: PostgresSyncLockOptions = {}
+  ): Promise<boolean> {
     const binding = this.requireExpectedBinding();
     const lockKey = this.syncLockKey(binding);
-    if (this.syncLockClients.has(lockKey)) return false;
-    const client = await this.pool.connect();
+    const lostError = this.getLostSyncLockError(binding);
+    if (lostError) throw lostError;
+    const acquisitions = (this.syncLockAcquisitions ??= new Map<string, Promise<void>>());
+    if (!this.opened || this.syncLockClients.has(lockKey) || acquisitions.has(lockKey))
+      return false;
+
+    let completeAcquisition!: () => void;
+    const acquisitionComplete = new Promise<void>((resolve) => {
+      completeAcquisition = resolve;
+    });
+    acquisitions.set(lockKey, acquisitionComplete);
+
     try {
-      const result = await client.query<{ acquired: boolean }>(
-        `SELECT pg_try_advisory_lock(hashtext($1)) AS acquired`,
-        [lockKey]
-      );
-      if (result.rows[0]?.acquired !== true) {
-        client.release();
-        return false;
+      const client = await this.pool.connect();
+      const lease: HeldPostgresSyncLock = {
+        client,
+        lockKey,
+        queue: Promise.resolve(),
+        releaseStarted: false,
+        clientReleased: false,
+        cleanupListeners: () => undefined,
+        onLost: options.onLost,
+      };
+      let acquired = false;
+      let advisoryLockAttemptPending = false;
+      try {
+        const handleError = (): void => this.markSyncLockLost(lease, false);
+        const handleEnd = (): void => this.markSyncLockLost(lease, true);
+        if (supportsClientLifecycleEvents(client)) {
+          lease.cleanupListeners = () => {
+            client.removeListener('error', handleError);
+            client.removeListener('end', handleEnd);
+          };
+          // Checked-out clients are not covered by the pool's idle-client listener.
+          // Install handlers before the first lock query closes that event gap.
+          client.on('error', handleError);
+          client.once('end', handleEnd);
+        }
+
+        if (!this.opened) {
+          await this.discardSyncLockAcquisition(lease, acquired);
+          return false;
+        }
+        advisoryLockAttemptPending = true;
+        const result = await client.query<{ acquired: boolean }>(
+          `SELECT pg_try_advisory_lock(hashtext($1)) AS acquired`,
+          [lockKey]
+        );
+        advisoryLockAttemptPending = false;
+        if (lease.lostError) throw lease.lostError;
+        if (result.rows[0]?.acquired !== true) {
+          await this.discardSyncLockAcquisition(lease, acquired);
+          return false;
+        }
+        acquired = true;
+        if (!this.opened) {
+          await this.discardSyncLockAcquisition(lease, acquired);
+          return false;
+        }
+        this.assertMatchingBinding(await this.readBinding(client, false), binding);
+        if (lease.lostError) throw lease.lostError;
+        if (!this.opened) {
+          await this.discardSyncLockAcquisition(lease, acquired);
+          return false;
+        }
+        this.syncLockClients.set(lockKey, lease);
+        return true;
+      } catch (error) {
+        await this.discardSyncLockAcquisition(lease, acquired, advisoryLockAttemptPending);
+        throw lease.lostError ?? error;
       }
-      this.assertMatchingBinding(await this.readBinding(client, false), binding);
-      this.syncLockClients.set(lockKey, client);
-      return true;
-    } catch (error) {
-      await client
-        .query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey])
-        .catch(() => undefined);
-      client.release();
-      throw error;
+    } finally {
+      if (acquisitions.get(lockKey) === acquisitionComplete) acquisitions.delete(lockKey);
+      completeAcquisition();
     }
   }
 
   async releaseSyncLock(_lockKey: string): Promise<void> {
     const binding = this.requireExpectedBinding();
     const lockKey = this.syncLockKey(binding);
-    const client = this.syncLockClients.get(lockKey);
-    if (!client) return;
-    try {
-      await client.query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockKey]);
-    } finally {
-      this.syncLockClients.delete(lockKey);
-      client.release();
+    const lease = this.syncLockClients.get(lockKey);
+    if (!lease) return;
+    if (!lease.releasePromise) {
+      lease.releaseStarted = true;
+      lease.releasePromise = this.finishSyncLockRelease(lease);
     }
+    await lease.releasePromise;
   }
 
   async getDocumentCount(): Promise<number> {
@@ -1731,11 +1808,16 @@ export class PostgresCacheService implements CacheService {
   }
 
   async close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.opened = false;
-    for (const lockKey of [...this.syncLockClients.keys()]) {
-      await this.releaseSyncLock(lockKey);
-    }
-    await this.pool.end();
+    this.closePromise = (async () => {
+      await Promise.all(this.syncLockAcquisitions?.values() ?? []);
+      for (const lockKey of [...this.syncLockClients.keys()]) {
+        await this.releaseSyncLock(lockKey);
+      }
+      await this.pool.end();
+    })();
+    return this.closePromise;
   }
 
   isOpen(): boolean {
@@ -1752,27 +1834,261 @@ export class PostgresCacheService implements CacheService {
     });
   }
 
-  private async withDatabaseTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+  private async withPooledClient<T>(
+    run: (client: PoolClient, markClientBroken: () => void) => Promise<T>
+  ): Promise<T> {
     const client = await this.pool.connect();
+    let clientBroken = false;
+    let clientError: Error | undefined;
+    const markClientBroken = (error?: Error): void => {
+      clientBroken = true;
+      clientError ??= error;
+    };
+    if (supportsClientLifecycleEvents(client)) client.on('error', markClientBroken);
     try {
-      await client.query('BEGIN');
-      await this.acquireDatabaseWriteLock(client);
-      const result = await run(client);
-      await client.query('COMMIT');
+      const result = await run(client, markClientBroken);
+      if (clientError) throw clientError;
       return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
     } finally {
-      client.release();
+      try {
+        if (clientBroken) client.release(true);
+        else client.release();
+      } finally {
+        if (supportsClientLifecycleEvents(client)) {
+          client.removeListener('error', markClientBroken);
+        }
+      }
     }
+  }
+
+  private withDatabaseTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+    return this.withPooledClient((client, markClientBroken) =>
+      this.runDatabaseTransaction(client, run, undefined, markClientBroken)
+    );
+  }
+
+  private withReadOnlyTransaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+    return this.withPooledClient((client, markClientBroken) =>
+      this.runTransaction(
+        client,
+        'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY',
+        run,
+        undefined,
+        markClientBroken
+      )
+    );
   }
 
   private async withVerifiedWrite<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
     const binding = this.requireExpectedBinding();
+    const lockKey = this.syncLockKey(binding);
+    const lease = this.syncLockClients.get(lockKey);
+    if (lease) {
+      return this.runWithSyncLockLease(lease, async (client) => {
+        this.assertMatchingBinding(await this.readBinding(client, true), binding);
+        return run(client);
+      });
+    }
+    const lostError = this.getLostSyncLockError(binding);
+    if (lostError) throw lostError;
     return this.withDatabaseTransaction(async (client) => {
       this.assertMatchingBinding(await this.readBinding(client, true), binding);
       return run(client);
+    });
+  }
+
+  private async runDatabaseTransaction<T>(
+    client: PoolClient,
+    run: (client: PoolClient) => Promise<T>,
+    lease?: HeldPostgresSyncLock,
+    markClientBroken?: () => void
+  ): Promise<T> {
+    return this.runTransaction(
+      client,
+      'BEGIN',
+      async (transactionClient) => {
+        await this.acquireDatabaseWriteLock(transactionClient);
+        if (lease?.lostError) throw lease.lostError;
+        return run(transactionClient);
+      },
+      lease,
+      markClientBroken
+    );
+  }
+
+  private async runTransaction<T>(
+    client: PoolClient,
+    beginStatement: string,
+    run: (client: PoolClient) => Promise<T>,
+    lease?: HeldPostgresSyncLock,
+    markClientBroken?: () => void
+  ): Promise<T> {
+    let transactionStarted = false;
+    let transactionBoundaryPending = false;
+    try {
+      if (lease?.lostError) throw lease.lostError;
+      transactionBoundaryPending = true;
+      await client.query(beginStatement);
+      transactionBoundaryPending = false;
+      transactionStarted = true;
+      if (lease?.lostError) throw lease.lostError;
+      const result = await run(client);
+      if (lease?.lostError) throw lease.lostError;
+      transactionBoundaryPending = true;
+      await client.query('COMMIT');
+      transactionBoundaryPending = false;
+      transactionStarted = false;
+      if (lease?.lostError) throw lease.lostError;
+      return result;
+    } catch (error) {
+      let rollbackFailed = false;
+      if (transactionStarted) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          rollbackFailed = true;
+        }
+      }
+      if (transactionBoundaryPending || rollbackFailed) {
+        if (lease) this.markSyncLockLost(lease);
+        else markClientBroken?.();
+      }
+      throw lease?.lostError ?? error;
+    }
+  }
+
+  private runWithSyncLockLease<T>(
+    lease: HeldPostgresSyncLock,
+    run: (client: PoolClient) => Promise<T>
+  ): Promise<T> {
+    if (lease.lostError || lease.releaseStarted) {
+      return Promise.reject(lease.lostError ?? new PostgresSyncLockLostError());
+    }
+
+    const operation = lease.queue.then(async () => {
+      if (lease.lostError) throw lease.lostError;
+      return this.runDatabaseTransaction(lease.client, run, lease);
+    });
+    lease.queue = operation.then(
+      () => undefined,
+      () => undefined
+    );
+    return operation;
+  }
+
+  private markSyncLockLost(lease: HeldPostgresSyncLock, clientEnded = false): void {
+    if (lease.lostError) return;
+    const lostError = new PostgresSyncLockLostError();
+    lease.lostError = lostError;
+    (this.lostSyncLockErrors ??= new Map<string, PostgresSyncLockLostError>()).set(
+      lease.lockKey,
+      lostError
+    );
+    if (this.syncLockClients.get(lease.lockKey) === lease) {
+      this.syncLockClients.delete(lease.lockKey);
+    }
+    lease.cleanupListeners();
+    if (!clientEnded && supportsClientLifecycleEvents(lease.client)) {
+      const releasedClient = lease.client;
+      releasedClient.on('error', swallowReleasedClientError);
+      releasedClient.once('end', () => {
+        releasedClient.removeListener('error', swallowReleasedClientError);
+      });
+    }
+    this.releaseSyncLockClient(lease, true);
+    try {
+      void Promise.resolve(lease.onLost?.(lostError)).catch(() => undefined);
+    } catch {
+      // Event handlers must never surface callback failures as uncaught client errors.
+    }
+  }
+
+  private async discardSyncLockAcquisition(
+    lease: HeldPostgresSyncLock,
+    acquired: boolean,
+    destroy = false
+  ): Promise<void> {
+    if (acquired && !lease.lostError) {
+      const unlockResult = await lease.client
+        .query<{
+          pg_advisory_unlock: boolean;
+        }>(`SELECT pg_advisory_unlock(hashtext($1))`, [lease.lockKey])
+        .catch(() => undefined);
+      if (unlockResult?.rows[0]?.pg_advisory_unlock !== true && !lease.lostError) {
+        this.markSyncLockLost(lease, false);
+      }
+    }
+    if (!lease.lostError) {
+      lease.cleanupListeners();
+      this.releaseSyncLockClient(lease, destroy);
+    }
+  }
+
+  private releaseSyncLockClient(lease: HeldPostgresSyncLock, destroy: boolean): void {
+    if (lease.clientReleased) return;
+    lease.clientReleased = true;
+    try {
+      if (destroy) lease.client.release(true);
+      else lease.client.release();
+    } catch {
+      // Cleanup is best-effort and must not mask the primary lock-loss signal.
+    }
+  }
+
+  private async finishSyncLockRelease(lease: HeldPostgresSyncLock): Promise<void> {
+    await lease.queue;
+    if (lease.lostError) return;
+
+    try {
+      const result = await lease.client.query<{ pg_advisory_unlock: boolean }>(
+        `SELECT pg_advisory_unlock(hashtext($1))`,
+        [lease.lockKey]
+      );
+      if (result.rows[0]?.pg_advisory_unlock !== true) {
+        this.markSyncLockLost(lease);
+        return;
+      }
+    } catch {
+      this.markSyncLockLost(lease);
+      return;
+    }
+
+    if (this.syncLockClients.get(lease.lockKey) === lease) {
+      this.syncLockClients.delete(lease.lockKey);
+    }
+    lease.cleanupListeners();
+    this.releaseSyncLockClient(lease, false);
+  }
+
+  private getLostSyncLockError(
+    binding: CacheAccountBinding
+  ): PostgresSyncLockLostError | undefined {
+    return this.lostSyncLockErrors?.get(this.syncLockKey(binding));
+  }
+
+  private async persistFailedSyncStatusAfterLockLoss(
+    status: CacheSyncStatus,
+    binding: CacheAccountBinding
+  ): Promise<void> {
+    await this.withDatabaseTransaction(async (client) => {
+      this.assertMatchingBinding(await this.readBinding(client, true), binding);
+      const persistedResult = await client.query<{ value: string }>(
+        `SELECT value FROM cache_meta WHERE key = 'sync_status' FOR UPDATE`
+      );
+      let persistedRunId: unknown;
+      try {
+        persistedRunId = (
+          JSON.parse(persistedResult.rows[0]?.value ?? 'null') as {
+            runId?: unknown;
+          } | null
+        )?.runId;
+      } catch {
+        persistedRunId = undefined;
+      }
+      if (persistedRunId !== status.runId) throw new PostgresSyncStatusStaleError();
+      await client.query(`UPDATE cache_meta SET value = $1 WHERE key = 'sync_status'`, [
+        JSON.stringify(status),
+      ]);
     });
   }
 

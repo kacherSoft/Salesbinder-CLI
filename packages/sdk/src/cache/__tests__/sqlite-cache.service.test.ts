@@ -1518,6 +1518,7 @@ describe('SQLiteCacheService', () => {
         paymentTransactions: [],
         cacheState: mirrorState,
         paymentSyncStatus: null,
+        syncStatus: null,
         pulledAt: 100,
       });
       expect(await service.getInventoryCacheMeta()).toEqual(snapshot.meta);
@@ -1541,6 +1542,7 @@ describe('SQLiteCacheService', () => {
           paymentTransactions: [],
           cacheState: mirrorState,
           paymentSyncStatus: null,
+          syncStatus: null,
           pulledAt: 200,
         })
       ).toThrow(/metadata does not match/);
@@ -1560,6 +1562,7 @@ describe('SQLiteCacheService', () => {
           paymentTransactions: [],
           cacheState: { ...mirrorState, stockLocationCount: 0 },
           paymentSyncStatus: null,
+          syncStatus: null,
           pulledAt: 300,
         })
       ).toThrow(/at least one stock row for every item/i);
@@ -1713,6 +1716,7 @@ describe('SQLiteCacheService', () => {
         paymentTransactions: [],
         cacheState: mirrorState,
         paymentSyncStatus: null,
+        syncStatus: null,
         pulledAt: 101,
       });
       expect(await service.getInventoryCacheMeta()).toEqual(inventory.meta);
@@ -1732,6 +1736,7 @@ describe('SQLiteCacheService', () => {
           paymentTransactions: [],
           cacheState: mirrorState,
           paymentSyncStatus: null,
+          syncStatus: null,
           pulledAt: 102,
         })
       ).toThrow(/category reconciliation.*inventory metadata/i);
@@ -2152,6 +2157,8 @@ describe('SQLiteCacheService', () => {
 
     it('uses plain PostgreSQL inserts for payment batches so existing IDs cannot be overwritten', async () => {
       const pgService = Object.create(PostgresCacheService.prototype) as PostgresCacheService;
+      (pgService as unknown as { syncLockClients: Map<string, unknown> }).syncLockClients =
+        new Map();
       const query = jest.fn(async (sql: string, _params?: unknown[]) => ({
         rows: sql.includes('SELECT account_identity')
           ? [
@@ -2188,6 +2195,8 @@ describe('SQLiteCacheService', () => {
 
     it('uses plain PostgreSQL inserts for payment replacements after deleting that invoice only', async () => {
       const pgService = Object.create(PostgresCacheService.prototype) as PostgresCacheService;
+      (pgService as unknown as { syncLockClients: Map<string, unknown> }).syncLockClients =
+        new Map();
       const query = jest.fn(async (sql: string, _params?: unknown[]) => ({
         rows: sql.includes('SELECT account_identity')
           ? [

@@ -9,7 +9,8 @@ export * from './sync-record-issue.types.js';
 export * from './cache-sync-progress-reporter.js';
 export type { CacheService } from './cache.interface.js';
 export { SQLiteCacheService } from './sqlite-cache.service.js';
-export { PostgresCacheService } from './postgres-cache.service.js';
+export { PostgresCacheService, PostgresSyncLockLostError } from './postgres-cache.service.js';
+export type { PostgresSyncLockOptions } from './postgres-cache.service.js';
 export {
   createCacheService,
   createPostgresCacheService,

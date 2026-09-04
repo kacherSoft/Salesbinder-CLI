@@ -38,6 +38,7 @@ const DEFAULT_IDLE_BUCKET_TTL_MS = 30 * 60_000;
 export interface ClientRuntimeOptions {
   rateLimitObserver?: RateLimitObserver;
   rateLimiterRegistry?: SalesBinderRateLimiter;
+  signal?: GenericAbortSignal;
 }
 
 /** A process-local FIFO registry shared by all SDK clients unless explicitly injected. */

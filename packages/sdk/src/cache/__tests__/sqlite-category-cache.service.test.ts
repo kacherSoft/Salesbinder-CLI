@@ -250,6 +250,7 @@ describe('SQLite category cache v7', () => {
         paymentTransactions: [],
         cacheState: state(7),
         paymentSyncStatus: null,
+        syncStatus: null,
         pulledAt: 123,
       });
 
@@ -296,6 +297,7 @@ describe('SQLite category cache v7', () => {
         paymentTransactions: [],
         cacheState: state(7),
         paymentSyncStatus: null,
+        syncStatus: null,
         pulledAt: 456,
       })
     ).toThrow(/forced mirror failure/);

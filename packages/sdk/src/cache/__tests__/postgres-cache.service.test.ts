@@ -2,9 +2,11 @@ import { PostgresCacheService } from '../postgres-cache.service.js';
 import { createCategoryFingerprint } from '../category-indexer.service.js';
 import { createInventorySnapshotFingerprint } from '../types.js';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import type {
   CacheAccountBinding,
   CacheState,
+  CacheSyncStatus,
   CategoryCacheMeta,
   CategorySnapshot,
   DocumentRow,
@@ -255,6 +257,35 @@ const payloadDocumentMutations = (statements: string[]): string[] =>
 
 type QueryResult = { rows: unknown[] };
 type QueryHandler = (sql: string, params?: unknown[]) => Promise<QueryResult>;
+type PostgresSyncLockOptions = { onLost?: (error: Error) => void | Promise<void> };
+type SyncLockAwarePostgresCacheService = PostgresCacheService & {
+  tryAcquireSyncLock(lockKey: string, options?: PostgresSyncLockOptions): Promise<boolean>;
+};
+type EventedClient = EventEmitter & {
+  label: string;
+  query: jest.Mock<Promise<QueryResult>, [string, unknown[]?]>;
+  release: jest.Mock<void, [boolean?]>;
+};
+type EventedClientHandler = (
+  client: EventedClient,
+  sql: string,
+  params?: unknown[]
+) => Promise<QueryResult>;
+
+const lockAware = (service: PostgresCacheService): SyncLockAwarePostgresCacheService =>
+  service as SyncLockAwarePostgresCacheService;
+
+const deferred = <T = void>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+};
+
+const nextTick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 function makeService(handler: QueryHandler, expected: CacheAccountBinding | null = binding) {
   const query = jest.fn(handler);
@@ -270,6 +301,58 @@ function makeService(handler: QueryHandler, expected: CacheAccountBinding | null
   return { service, client, query };
 }
 
+function makeEventedClient(label: string, handler: EventedClientHandler): EventedClient {
+  const client = new EventEmitter() as EventedClient;
+  client.label = label;
+  client.query = jest.fn((sql: string, params?: unknown[]) => handler(client, sql, params));
+  client.release = jest.fn();
+  return client;
+}
+
+function makeEventedService(
+  clients: EventedClient[],
+  expected: CacheAccountBinding | null = binding
+) {
+  const service = new PostgresCacheService('postgres://example/cache');
+  const pool = {
+    connect: jest.fn(async () => {
+      const client = clients.shift();
+      if (!client) throw new Error('No mock PostgreSQL client is available.');
+      return client;
+    }),
+    query: jest.fn(async () => ({ rows: [] })),
+    end: jest.fn(async () => undefined),
+  };
+  Object.assign(service as object, {
+    opened: true,
+    expectedBinding: expected,
+    pool,
+  });
+  return { service: lockAware(service), pool };
+}
+
+const syncStatus = (runId: string, message: string): CacheSyncStatus => ({
+  status: 'running',
+  runId,
+  accountName: 'acme',
+  syncTarget: 'postgresql',
+  startedAt: 100,
+  updatedAt: 100,
+  message,
+});
+
+const failedSyncStatus = (runId: string): CacheSyncStatus => ({
+  status: 'failed',
+  runId,
+  accountName: 'acme',
+  syncTarget: 'postgresql',
+  startedAt: 100,
+  updatedAt: 120,
+  finishedAt: 120,
+  message: 'Cache sync failed.',
+  error: 'PostgreSQL sync lock lost.',
+});
+
 function bindingRow(value: CacheAccountBinding = binding) {
   return {
     account_identity: value.accountIdentity,
@@ -277,6 +360,645 @@ function bindingRow(value: CacheAccountBinding = binding) {
     created_at: value.createdAt ?? 100,
   };
 }
+
+describe('PostgresCacheService read-only transaction lifecycle', () => {
+  it('rejects a checked-out read client error and destroys the client', async () => {
+    const clientError = new Error('read socket failed');
+    const readClient = makeEventedClient('read', async (client, sql) => {
+      if (sql === 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY') return { rows: [] };
+      if (sql.includes('FROM category_cache_meta AS snapshot')) {
+        expect(() => client.emit('error', clientError)).not.toThrow();
+        return { rows: [] };
+      }
+      if (sql === 'COMMIT') return { rows: [] };
+      throw new Error(`Unexpected ${client.label} query: ${sql}`);
+    });
+    const { service } = makeEventedService([readClient]);
+
+    await expect(service.getCategorySnapshot()).rejects.toBe(clientError);
+
+    expect(readClient.release).toHaveBeenCalledTimes(1);
+    expect(readClient.release).toHaveBeenCalledWith(true);
+    expect(readClient.listenerCount('error')).toBe(0);
+  });
+
+  it('preserves an inventory read error when rollback fails and destroys the client', async () => {
+    const primaryError = new Error('inventory read failed');
+    const rollbackError = new Error('inventory rollback failed');
+    const { service, client } = makeService(async (sql) => {
+      if (sql === 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY') return { rows: [] };
+      if (sql === 'ROLLBACK') throw rollbackError;
+      throw primaryError;
+    });
+
+    await expect(service.getInventoryCacheMeta()).rejects.toBe(primaryError);
+
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith(true);
+  });
+
+  it.each([
+    [
+      'category snapshot BEGIN',
+      'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY',
+      (service: PostgresCacheService) => service.getCategorySnapshot(),
+    ],
+    [
+      'category metadata COMMIT',
+      'COMMIT',
+      (service: PostgresCacheService) => service.getCategoryCacheMeta(),
+    ],
+    [
+      'inventory metadata BEGIN',
+      'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY',
+      (service: PostgresCacheService) => service.getInventoryCacheMeta(),
+    ],
+    [
+      'inventory snapshot COMMIT',
+      'COMMIT',
+      (service: PostgresCacheService) => service.getInventorySnapshot(),
+    ],
+  ])('destroys the checked-out client when %s rejects', async (_name, rejectedSql, read) => {
+    const primaryError = new Error(`${rejectedSql} failed`);
+    const { service, client, query } = makeService(async (sql) => {
+      if (sql === rejectedSql) throw primaryError;
+      return { rows: [] };
+    });
+
+    await expect(read(service)).rejects.toBe(primaryError);
+
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith(true);
+    expect(query.mock.calls.some(([sql]) => sql === 'ROLLBACK')).toBe(rejectedSql === 'COMMIT');
+  });
+});
+
+describe('PostgresCacheService sync lock owner-session loss', () => {
+  it('attaches checked-out lock-client error and end handlers', async () => {
+    const lockClient = makeEventedClient('lock', async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      throw new Error(`Unexpected ${client.label} query: ${sql}`);
+    });
+    const { service } = makeEventedService([lockClient]);
+
+    await expect(service.tryAcquireSyncLock('alias')).resolves.toBe(true);
+
+    expect(lockClient.listenerCount('error')).toBe(1);
+    expect(lockClient.listenerCount('end')).toBe(1);
+  });
+
+  it('handles ETIMEDOUT once and reports one sanitized stable lock-loss error', async () => {
+    const onLost = jest.fn<void, [Error]>();
+    const lockClient = makeEventedClient('lock', async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      throw new Error(`Unexpected ${client.label} query: ${sql}`);
+    });
+    const { service } = makeEventedService([lockClient]);
+    await service.tryAcquireSyncLock('alias', { onLost });
+
+    const networkError = Object.assign(new Error('read ETIMEDOUT from database socket'), {
+      code: 'ETIMEDOUT',
+    });
+    expect(() => lockClient.emit('error', networkError)).not.toThrow();
+    lockClient.emit('end');
+
+    expect(onLost).toHaveBeenCalledTimes(1);
+    const lostError = onLost.mock.calls[0]?.[0];
+    expect(lostError).toBeInstanceOf(Error);
+    expect(lostError?.name).toBe('PostgresSyncLockLostError');
+    expect(lostError?.message).toBe('PostgreSQL sync lock lost.');
+    expect(lostError?.message).not.toMatch(/ETIMEDOUT|database socket|postgres:\/\//i);
+  });
+
+  it('absorbs a rejected async loss callback and notifies only once', async () => {
+    const unhandledRejections: unknown[] = [];
+    const handleUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on('unhandledRejection', handleUnhandledRejection);
+    const onLost = jest.fn(async (): Promise<void> => {
+      throw new Error('loss observer failed');
+    });
+    const lockClient = makeEventedClient('lock', async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      throw new Error(`Unexpected ${client.label} query: ${sql}`);
+    });
+    const { service } = makeEventedService([lockClient]);
+
+    try {
+      await service.tryAcquireSyncLock('alias', { onLost });
+
+      expect(() => lockClient.emit('error', new Error('socket failure'))).not.toThrow();
+      expect(() => lockClient.emit('error', new Error('repeated socket failure'))).not.toThrow();
+      lockClient.emit('end');
+      lockClient.emit('end');
+      await nextTick();
+
+      expect(onLost).toHaveBeenCalledTimes(1);
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.removeListener('unhandledRejection', handleUnhandledRejection);
+    }
+  });
+
+  it('drains a deferred pool connection before concurrent closes end the pool', async () => {
+    const connectedClient = deferred<EventedClient>();
+    const lockClient = makeEventedClient('lock', async (client, sql) => {
+      throw new Error(`Unexpected ${client.label} query after close began: ${sql}`);
+    });
+    const service = new PostgresCacheService('postgres://example/cache');
+    const pool = {
+      connect: jest.fn(() => connectedClient.promise),
+      query: jest.fn(async () => ({ rows: [] })),
+      end: jest.fn(async () => undefined),
+    };
+    Object.assign(service as object, {
+      opened: true,
+      expectedBinding: binding,
+      pool,
+    });
+    const lockService = lockAware(service);
+
+    const acquisition = lockService.tryAcquireSyncLock('alias');
+    let closesSettled = false;
+    const closes = Promise.all([lockService.close(), lockService.close()]).then(() => {
+      closesSettled = true;
+    });
+    await nextTick();
+
+    expect(closesSettled).toBe(false);
+    expect(pool.end).not.toHaveBeenCalled();
+
+    connectedClient.resolve(lockClient);
+    await expect(acquisition).resolves.toBe(false);
+    await expect(closes).resolves.toBeUndefined();
+
+    expect(lockClient.query).not.toHaveBeenCalled();
+    expect(lockClient.release).toHaveBeenCalledTimes(1);
+    expect(lockClient.release).toHaveBeenCalledWith();
+    expect(pool.end).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['pg_try_advisory_lock', 'binding verification'] as const)(
+    'drains a deferred %s acquisition before concurrent closes end the pool',
+    async (deferredStep) => {
+      const queryStarted = deferred<void>();
+      const queryCanFinish = deferred<void>();
+      const lockClient = makeEventedClient('lock', async (client, sql) => {
+        if (sql.includes('pg_try_advisory_lock')) {
+          if (deferredStep === 'pg_try_advisory_lock') {
+            queryStarted.resolve();
+            await queryCanFinish.promise;
+          }
+          return { rows: [{ acquired: true }] };
+        }
+        if (sql.includes('SELECT account_identity')) {
+          if (deferredStep === 'binding verification') {
+            queryStarted.resolve();
+            await queryCanFinish.promise;
+          }
+          return { rows: [bindingRow()] };
+        }
+        if (sql.includes('pg_advisory_unlock')) {
+          return { rows: [{ pg_advisory_unlock: true }] };
+        }
+        throw new Error(`Unexpected ${client.label} query: ${sql}`);
+      });
+      const { service, pool } = makeEventedService([lockClient]);
+
+      const acquisition = service.tryAcquireSyncLock('alias');
+      await queryStarted.promise;
+      let closesSettled = false;
+      const closes = Promise.all([service.close(), service.close()]).then(() => {
+        closesSettled = true;
+      });
+      await nextTick();
+
+      expect(closesSettled).toBe(false);
+      expect(pool.end).not.toHaveBeenCalled();
+
+      queryCanFinish.resolve();
+      await expect(acquisition).resolves.toBe(false);
+      await expect(closes).resolves.toBeUndefined();
+
+      expect(pool.end).toHaveBeenCalledTimes(1);
+      expect(lockClient.release).toHaveBeenCalledTimes(1);
+      expect(lockClient.release).toHaveBeenCalledWith();
+      expect(
+        lockClient.query.mock.calls.filter(([sql]) => String(sql).includes('pg_advisory_unlock'))
+      ).toHaveLength(1);
+      expect(
+        (service as unknown as { syncLockClients: Map<string, unknown> }).syncLockClients.size
+      ).toBe(0);
+    }
+  );
+
+  it('destroys a client after an advisory-lock query rejects without reporting ownership', async () => {
+    const primaryError = new Error('injected advisory-lock timeout');
+    const onLost = jest.fn<void, [Error]>();
+    const failedClient = makeEventedClient('failed-lock', async (_client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) throw primaryError;
+      throw new Error(`Unexpected query after advisory-lock timeout: ${sql}`);
+    });
+    const successorClient = makeEventedClient('successor-lock', async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('pg_advisory_unlock')) {
+        return { rows: [{ pg_advisory_unlock: true }] };
+      }
+      throw new Error(`Unexpected ${client.label} query: ${sql}`);
+    });
+    const { service } = makeEventedService([failedClient, successorClient]);
+
+    await expect(service.tryAcquireSyncLock('alias', { onLost })).rejects.toBe(primaryError);
+
+    expect(failedClient.release).toHaveBeenCalledTimes(1);
+    expect(failedClient.release).toHaveBeenCalledWith(true);
+    expect(onLost).not.toHaveBeenCalled();
+    await expect(service.tryAcquireSyncLock('alias')).resolves.toBe(true);
+    await expect(service.releaseSyncLock('alias')).resolves.toBeUndefined();
+    expect(successorClient.release).toHaveBeenCalledTimes(1);
+    expect(successorClient.release).toHaveBeenCalledWith();
+  });
+
+  it('removes service loss listeners after error-only loss but swallows client errors until end', async () => {
+    const onLost = jest.fn<void, [Error]>();
+    const lockClient = makeEventedClient('lock', async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      throw new Error(`Unexpected ${client.label} query: ${sql}`);
+    });
+    const { service } = makeEventedService([lockClient]);
+    await service.tryAcquireSyncLock('alias', { onLost });
+
+    lockClient.emit('error', new Error('socket timeout before end event'));
+
+    expect(onLost).toHaveBeenCalledTimes(1);
+    expect(lockClient.release).toHaveBeenCalledTimes(1);
+    expect(lockClient.release).toHaveBeenCalledWith(true);
+    expect(lockClient.listenerCount('error')).toBe(1);
+    expect(lockClient.listenerCount('end')).toBe(1);
+    expect(() => lockClient.emit('error', new Error('late socket error'))).not.toThrow();
+    expect(onLost).toHaveBeenCalledTimes(1);
+
+    lockClient.emit('end');
+    expect(lockClient.listenerCount('error')).toBe(0);
+    expect(lockClient.listenerCount('end')).toBe(0);
+    expect(onLost).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes writes through the retained owner client while the lock is held', async () => {
+    const firstInsertCanFinish = deferred<void>();
+    const statusInsertOrder: string[] = [];
+    const handler: EventedClientHandler = async (client, sql, params) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes("VALUES ('sync_status'")) {
+        const status = JSON.parse(String(params?.[0])) as CacheSyncStatus;
+        statusInsertOrder.push(`${client.label}:${status.message ?? status.runId}`);
+        if (status.message === 'first') await firstInsertCanFinish.promise;
+      }
+      return { rows: [] };
+    };
+    const lockClient = makeEventedClient('lock', handler);
+    const freshClientA = makeEventedClient('fresh-a', handler);
+    const freshClientB = makeEventedClient('fresh-b', handler);
+    const { service, pool } = makeEventedService([lockClient, freshClientA, freshClientB]);
+    await service.tryAcquireSyncLock('alias');
+
+    const firstWrite = service.setSyncStatus(syncStatus('run-1', 'first'));
+    await nextTick();
+    expect(statusInsertOrder).toEqual(['lock:first']);
+
+    const secondWrite = service.setSyncStatus(syncStatus('run-2', 'second'));
+    await nextTick();
+    expect(statusInsertOrder).toEqual(['lock:first']);
+
+    firstInsertCanFinish.resolve();
+    await expect(firstWrite).resolves.toBeUndefined();
+    await expect(secondWrite).resolves.toBeUndefined();
+    expect(statusInsertOrder).toEqual(['lock:first', 'lock:second']);
+    expect(pool.connect).toHaveBeenCalledTimes(1);
+    expect(freshClientA.query).not.toHaveBeenCalled();
+    expect(freshClientB.query).not.toHaveBeenCalled();
+  });
+
+  it('loses and destroys a retained lock when rollback fails without a client event', async () => {
+    const onLost = jest.fn<void, [Error]>();
+    const primaryError = new Error('injected retained write failure');
+    const lockClient = makeEventedClient('lock', async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes("VALUES ('sync_status'")) throw primaryError;
+      if (sql === 'ROLLBACK') throw new Error('injected retained rollback failure');
+      if (sql.includes('pg_advisory_unlock')) {
+        throw new Error(`Unexpected unlock on ${client.label} after rollback failure.`);
+      }
+      return { rows: [] };
+    });
+    const { service } = makeEventedService([lockClient]);
+    await service.tryAcquireSyncLock('alias', { onLost });
+
+    await expect(service.setSyncStatus(syncStatus('run-1', 'first'))).rejects.toThrow(
+      'PostgreSQL sync lock lost.'
+    );
+
+    expect(onLost).toHaveBeenCalledTimes(1);
+    expect(onLost.mock.calls[0]?.[0].message).toBe('PostgreSQL sync lock lost.');
+    expect(lockClient.release).toHaveBeenCalledTimes(1);
+    expect(lockClient.release).toHaveBeenCalledWith(true);
+    const queryCountAfterLoss = lockClient.query.mock.calls.length;
+
+    await expect(service.setSyncStatus(syncStatus('run-2', 'second'))).rejects.toThrow(
+      'PostgreSQL sync lock lost.'
+    );
+    expect(lockClient.query).toHaveBeenCalledTimes(queryCountAfterLoss);
+    expect(onLost).toHaveBeenCalledTimes(1);
+    expect(lockClient.release).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['BEGIN', 'COMMIT'] as const)(
+    'loses and destroys a retained lock when %s rejects without a client event',
+    async (failedStatement) => {
+      const onLost = jest.fn<void, [Error]>();
+      const primaryError = new Error(`injected retained ${failedStatement} failure`);
+      const lockClient = makeEventedClient('lock', async (client, sql) => {
+        if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+        if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+        if (sql === failedStatement) throw primaryError;
+        if (sql.includes('pg_advisory_unlock')) {
+          throw new Error(`Unexpected unlock on ${client.label} after boundary failure.`);
+        }
+        return { rows: [] };
+      });
+      const { service } = makeEventedService([lockClient]);
+      await service.tryAcquireSyncLock('alias', { onLost });
+
+      await expect(service.setSyncStatus(syncStatus('run-1', 'first'))).rejects.toThrow(
+        'PostgreSQL sync lock lost.'
+      );
+
+      const statements = lockClient.query.mock.calls.map(([sql]) => String(sql));
+      expect(statements.includes('ROLLBACK')).toBe(failedStatement === 'COMMIT');
+      expect(onLost).toHaveBeenCalledTimes(1);
+      expect(onLost.mock.calls[0]?.[0].message).toBe('PostgreSQL sync lock lost.');
+      expect(lockClient.release).toHaveBeenCalledTimes(1);
+      expect(lockClient.release).toHaveBeenCalledWith(true);
+      const queryCountAfterLoss = lockClient.query.mock.calls.length;
+
+      await expect(service.setSyncStatus(syncStatus('run-2', 'second'))).rejects.toThrow(
+        'PostgreSQL sync lock lost.'
+      );
+      expect(lockClient.query).toHaveBeenCalledTimes(queryCountAfterLoss);
+      expect(onLost).toHaveBeenCalledTimes(1);
+      expect(lockClient.release).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it.each(['BEGIN', 'COMMIT'] as const)(
+    'destroys a fresh client but preserves the primary %s error when the boundary rejects',
+    async (failedStatement) => {
+      const primaryError = new Error(`injected fresh ${failedStatement} failure`);
+      const { service, client, query } = makeService(async (sql) => {
+        if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+        if (sql === failedStatement) throw primaryError;
+        return { rows: [] };
+      });
+
+      await expect(service.setSyncStatus(syncStatus('run-1', 'first'))).rejects.toBe(primaryError);
+
+      const statements = query.mock.calls.map(([sql]) => String(sql));
+      expect(statements.includes('ROLLBACK')).toBe(failedStatement === 'COMMIT');
+      expect(client.release).toHaveBeenCalledTimes(1);
+      expect(client.release).toHaveBeenCalledWith(true);
+    }
+  );
+
+  it.each(['operation', 'commit'] as const)(
+    'destroys a fresh client but preserves the primary %s error when rollback fails',
+    async (failurePoint) => {
+      const primaryError = new Error(`injected ${failurePoint} failure`);
+      const { service, client, query } = makeService(async (sql) => {
+        if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+        if (failurePoint === 'operation' && sql.includes("VALUES ('sync_status'")) {
+          throw primaryError;
+        }
+        if (failurePoint === 'commit' && sql === 'COMMIT') throw primaryError;
+        if (sql === 'ROLLBACK') throw new Error('injected fresh rollback failure');
+        return { rows: [] };
+      });
+
+      await expect(service.setSyncStatus(syncStatus('run-1', 'first'))).rejects.toBe(primaryError);
+
+      expect(query).toHaveBeenCalledWith('ROLLBACK');
+      expect(client.release).toHaveBeenCalledTimes(1);
+      expect(client.release).toHaveBeenCalledWith(true);
+    }
+  );
+
+  it('fails closed after lock loss without falling back or publishing inventory', async () => {
+    const handler: EventedClientHandler = async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes("key = 'state' FOR UPDATE")) {
+        return { rows: [{ value: JSON.stringify(state(7)) }] };
+      }
+      if (sql.includes('AS item_count')) {
+        return { rows: [{ item_count: '1', stock_row_count: '1' }] };
+      }
+      if (client.label === 'fresh-after-loss' && sql.includes('inventory_cache.v7.snapshot')) {
+        return { rows: [] };
+      }
+      return { rows: [] };
+    };
+    const lockClient = makeEventedClient('lock', handler);
+    const freshAfterLoss = makeEventedClient('fresh-after-loss', handler);
+    const { service, pool } = makeEventedService([lockClient, freshAfterLoss]);
+    await service.tryAcquireSyncLock('alias');
+
+    lockClient.emit('end');
+    const result = await service
+      .replaceInventorySnapshot(inventorySnapshot())
+      .then(() => ({ completed: true, error: null }))
+      .catch((error: Error) => ({ completed: false, error }));
+    const statements = [lockClient, freshAfterLoss].flatMap((client) =>
+      client.query.mock.calls.map(([sql]) => String(sql))
+    );
+
+    expect({
+      completed: result.completed,
+      openedFreshClients: pool.connect.mock.calls.length - 1,
+      publishedInventorySnapshot: statements.some((sql) =>
+        sql.includes('inventory_cache.v7.snapshot')
+      ),
+      deletedApiInventory: statements.some((sql) =>
+        sql.includes("DELETE FROM items WHERE cache_source = 'api'")
+      ),
+    }).toEqual({
+      completed: false,
+      openedFreshClients: 0,
+      publishedInventorySnapshot: false,
+      deletedApiInventory: false,
+    });
+    expect(result.error?.message).toBe('PostgreSQL sync lock lost.');
+  });
+
+  it('persists failed sync status after lock loss when the stored run ID still matches', async () => {
+    const failedStatus = failedSyncStatus('run-that-lost-lock');
+    const handler: EventedClientHandler = async (client, sql, params) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes("key = 'sync_status' FOR UPDATE")) {
+        return { rows: [{ value: JSON.stringify(syncStatus(failedStatus.runId, 'running')) }] };
+      }
+      if (sql.includes("UPDATE cache_meta SET value = $1 WHERE key = 'sync_status'")) {
+        expect(client.label).toBe('failed-status');
+        expect(JSON.parse(String(params?.[0]))).toEqual(failedStatus);
+      }
+      return { rows: [] };
+    };
+    const lockClient = makeEventedClient('lock', handler);
+    const failedStatusClient = makeEventedClient('failed-status', handler);
+    const { service, pool } = makeEventedService([lockClient, failedStatusClient]);
+    await service.tryAcquireSyncLock('alias');
+
+    lockClient.emit('end');
+    await expect(service.setSyncStatus(failedStatus)).resolves.toBeUndefined();
+
+    const statements = failedStatusClient.query.mock.calls.map(([sql]) => String(sql));
+    expect(pool.connect).toHaveBeenCalledTimes(2);
+    expect(statements).toContain('BEGIN');
+    expect(
+      statements.some((sql) =>
+        sql.includes("SELECT value FROM cache_meta WHERE key = 'sync_status'")
+      )
+    ).toBe(true);
+    expect(
+      statements.some((sql) =>
+        sql.includes("UPDATE cache_meta SET value = $1 WHERE key = 'sync_status'")
+      )
+    ).toBe(true);
+    expect(statements).toContain('COMMIT');
+    expect(failedStatusClient.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects failed sync status after lock loss when a successor run ID is stored', async () => {
+    const staleFailedStatus = failedSyncStatus('run-that-lost-lock');
+    const handler: EventedClientHandler = async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes("key = 'sync_status' FOR UPDATE")) {
+        return { rows: [{ value: JSON.stringify(syncStatus('successor-run', 'running')) }] };
+      }
+      if (client.label === 'failed-status' && sql.includes('UPDATE cache_meta')) {
+        throw new Error('stale failed status must not update successor status');
+      }
+      return { rows: [] };
+    };
+    const lockClient = makeEventedClient('lock', handler);
+    const failedStatusClient = makeEventedClient('failed-status', handler);
+    const { service } = makeEventedService([lockClient, failedStatusClient]);
+    await service.tryAcquireSyncLock('alias');
+
+    lockClient.emit('end');
+    await expect(service.setSyncStatus(staleFailedStatus)).rejects.toThrow(
+      'PostgreSQL sync status belongs to another run.'
+    );
+
+    const statements = failedStatusClient.query.mock.calls.map(([sql]) => String(sql));
+    expect(
+      statements.some((sql) =>
+        sql.includes("UPDATE cache_meta SET value = $1 WHERE key = 'sync_status'")
+      )
+    ).toBe(false);
+    expect(statements).toContain('ROLLBACK');
+    expect(statements).not.toContain('COMMIT');
+    expect(failedStatusClient.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases a broken lost lock once without unlock query or secondary error', async () => {
+    const lockClient = makeEventedClient('lock', async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('pg_advisory_unlock')) {
+        throw new Error(`Unexpected unlock on ${client.label} after loss.`);
+      }
+      return { rows: [] };
+    });
+    const { service } = makeEventedService([lockClient]);
+    await service.tryAcquireSyncLock('alias');
+
+    lockClient.emit('end');
+    await expect(service.releaseSyncLock('alias')).resolves.toBeUndefined();
+
+    expect(
+      lockClient.query.mock.calls.some(([sql]) => String(sql).includes('pg_advisory_unlock'))
+    ).toBe(false);
+    expect(lockClient.release).toHaveBeenCalledTimes(1);
+    expect(lockClient.release).toHaveBeenCalledWith(true);
+  });
+
+  it.each([
+    ['returns false', async () => ({ rows: [{ pg_advisory_unlock: false }] })],
+    [
+      'throws',
+      async () => {
+        throw new Error('unlock connection failure');
+      },
+    ],
+  ] as const)('destroys the lock client when advisory unlock %s', async (_label, unlockResult) => {
+    const lockClient = makeEventedClient('lock', async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('pg_advisory_unlock')) return unlockResult();
+      throw new Error(`Unexpected ${client.label} query: ${sql}`);
+    });
+    const { service } = makeEventedService([lockClient]);
+    await service.tryAcquireSyncLock('alias');
+
+    await expect(service.releaseSyncLock('alias')).resolves.toBeUndefined();
+    await expect(service.releaseSyncLock('alias')).resolves.toBeUndefined();
+
+    expect(
+      lockClient.query.mock.calls.filter(([sql]) => String(sql).includes('pg_advisory_unlock'))
+    ).toHaveLength(1);
+    expect(lockClient.release).toHaveBeenCalledTimes(1);
+    expect(lockClient.release).toHaveBeenCalledWith(true);
+    expect(
+      (service as unknown as { syncLockClients: Map<string, unknown> }).syncLockClients.size
+    ).toBe(0);
+    await expect(service.tryAcquireSyncLock('alias')).rejects.toThrow('PostgreSQL sync lock lost.');
+  });
+
+  it('detaches normal release listeners and reacquires with a new client', async () => {
+    const handler: EventedClientHandler = async (client, sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('pg_advisory_unlock')) return { rows: [{ pg_advisory_unlock: true }] };
+      throw new Error(`Unexpected ${client.label} query: ${sql}`);
+    };
+    const firstLockClient = makeEventedClient('first-lock', handler);
+    const secondLockClient = makeEventedClient('second-lock', handler);
+    const { service, pool } = makeEventedService([firstLockClient, secondLockClient]);
+
+    await expect(service.tryAcquireSyncLock('alias')).resolves.toBe(true);
+    expect(firstLockClient.listenerCount('error')).toBe(1);
+    expect(firstLockClient.listenerCount('end')).toBe(1);
+
+    await service.releaseSyncLock('alias');
+    expect(firstLockClient.listenerCount('error')).toBe(0);
+    expect(firstLockClient.listenerCount('end')).toBe(0);
+    expect(firstLockClient.release).toHaveBeenCalledTimes(1);
+
+    await expect(service.tryAcquireSyncLock('alias')).resolves.toBe(true);
+    expect(pool.connect).toHaveBeenCalledTimes(2);
+    expect(secondLockClient.listenerCount('error')).toBe(1);
+    expect(secondLockClient.listenerCount('end')).toBe(1);
+  });
+});
 
 describe('PostgresCacheService v7 schema and binding', () => {
   it('repairs exact category and binding schemas transactionally and idempotently', async () => {

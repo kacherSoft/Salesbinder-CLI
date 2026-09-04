@@ -130,6 +130,8 @@ When `SALESBINDER_DB_URL` is set, PostgreSQL is the shared source of truth.
 - **Optional sync-and-pull:** `cache sync --pull` writes PostgreSQL, then refreshes local SQLite
 - **Sync status:** `cache_meta.sync_status` records `running`, `success`, `success_with_warnings`, or `failed` so readers can detect an active writer and partial record recovery
 
+If the PostgreSQL writer loses its session ownership or a transaction outcome is uncertain, `cache sync` fails closed with a sanitized error and no success output. Atomic category and inventory publication keeps the last authoritative snapshot in place, and a later run can reacquire the lock and retry safely.
+
 PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `cache sync` do not start a background pull.
 
 The PostgreSQL schema is created automatically on first use.
@@ -651,6 +653,8 @@ node packages/cli/dist/cli.js cache clear
 ```
 
 `cache sync --pull` is the only sync path that refreshes the local SQLite mirror. If the requested mirror refresh fails, the command exits non-zero and reports the pull error.
+
+When `--pull` is used, the PostgreSQL result and the local SQLite mirror stay aligned at the end of the run; a lock-loss or other terminal failure does not publish a partial mirror or success output.
 
 Every normal, delta, full, and full-resume sync requires `v3ApiKey` and fetches categories and inventory as complete validated v3 snapshots. There is no v2 fallback for either cache resource. Pagination metadata must remain coherent across every page, and two consecutive v3 membership reads must agree before publication. The previous category or inventory snapshot remains unchanged if fetch or validation fails. Item membership and deletion come only from that v3 snapshot; v2 deleted-log item tombstones are excluded, so `deleted_records_processed` covers the remaining deleted-log resources. An item deleted after the snapshot boundary disappears on the next sync.
 

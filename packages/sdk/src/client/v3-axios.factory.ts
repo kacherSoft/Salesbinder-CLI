@@ -26,6 +26,7 @@ export function createV3AxiosClient(
   const client = axios.create({
     baseURL: `https://${account.subdomain}.salesbinder.com/api/v3`,
     timeout: account.timeout || 30000,
+    signal: runtimeOptions.signal,
     headers: {
       Authorization: `Bearer ${account.v3ApiKey}`,
       'Content-Type': 'application/json',

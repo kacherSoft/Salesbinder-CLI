@@ -23,7 +23,7 @@ import type {
 } from './cache-sync-progress.types.js';
 import type { SyncRecordIssue, SyncRecordIssueCode } from './sync-record-issue.types.js';
 import type { PaymentTransactionRow } from './payment-sync.types.js';
-import { PostgresCacheService } from './postgres-cache.service.js';
+import { PostgresCacheService, PostgresSyncLockLostError } from './postgres-cache.service.js';
 import { SQLiteCacheService } from './sqlite-cache.service.js';
 import { loadConfig } from '../config/config.loader.js';
 import { createSalesBinderAccountBinding, DocumentContextId } from './types.js';
@@ -49,12 +49,26 @@ export type PgPullSettlement =
   | { status: 'success'; result: Readonly<PgPullResult> }
   | { status: 'failed'; error: unknown };
 
-export interface PgPullLifecycleOptions {
-  /** Set only while the caller owns this account's PG lock through settlement; skips inner PG locking. */
-  pgLockAlreadyHeld?: boolean;
+interface PgPullLifecycleCallbacks {
   /** Awaited exactly once after required locks are held and the pull settles. */
   onSettledWhileLocked?: (settlement: PgPullSettlement) => void | Promise<void>;
+  /** Awaited at most once if mirror finalization fails after a success settlement was requested. */
+  onPostSuccessFailureWhileLocked?: (error: unknown) => void | Promise<void>;
 }
+
+export type PgPullLifecycleOptions = PgPullLifecycleCallbacks &
+  (
+    | {
+        /** Reuse the caller-owned PostgreSQL writer lock. */
+        pgLockAlreadyHeld: true;
+        /** Owner-session loss signal required while reusing the writer lock. */
+        lockLossSignal: AbortSignal;
+      }
+    | {
+        pgLockAlreadyHeld?: false;
+        lockLossSignal?: never;
+      }
+  );
 
 /**
  * Pull all data from PostgreSQL into the local SQLite cache.
@@ -69,21 +83,33 @@ export async function pullFromPostgres(
   accountBinding?: CacheAccountBinding,
   lifecycle: PgPullLifecycleOptions = {}
 ): Promise<PgPullResult> {
+  if (lifecycle.pgLockAlreadyHeld && !lifecycle.lockLossSignal) {
+    throw new Error('PostgreSQL lock-loss signal is required when reusing the writer lock.');
+  }
   const start = Date.now();
   const resolvedBinding =
     accountBinding ?? createSalesBinderAccountBinding(loadConfig(sqliteAccountName).subdomain);
-  let lifecycleHookInvoked = false;
+  let settlementHookInvoked = false;
+  let successSettlementRequested = false;
+  let postSuccessFailureHookInvoked = false;
   let pg: PostgresCacheService | null = null;
   let sqlite: SQLiteCacheService | null = null;
   let pgLockAcquired = false;
   let sqliteLockAcquired = false;
+  let pullFailed = false;
+  let pgCloseAttempted = false;
+  let replacementCommitted = false;
+  let sourceSyncStatus: CacheSyncStatus | null = null;
+  let compensationSyncStatus: CacheSyncStatus | null = null;
+  const lockLoss = createPullLockLossGuard(lifecycle.lockLossSignal);
   const lockKey = `salesbinder-cache-sync:${resolvedBinding.accountIdentity}`;
   const notifySettlementWhileLocked = async (
     settlement: PgPullSettlement,
     suppressHookFailure = false
   ): Promise<void> => {
-    if (lifecycleHookInvoked || !lifecycle.onSettledWhileLocked) return;
-    lifecycleHookInvoked = true;
+    if (settlementHookInvoked || !lifecycle.onSettledWhileLocked) return;
+    settlementHookInvoked = true;
+    successSettlementRequested = settlement.status === 'success';
     if (!suppressHookFailure) {
       await lifecycle.onSettledWhileLocked(settlement);
       return;
@@ -94,49 +120,100 @@ export async function pullFromPostgres(
       // Preserve the primary pull failure; cleanup still runs in the outer finally.
     }
   };
+  const notifyPostSuccessFailureWhileLocked = async (error: unknown): Promise<void> => {
+    if (
+      !successSettlementRequested ||
+      postSuccessFailureHookInvoked ||
+      !lifecycle.onPostSuccessFailureWhileLocked
+    ) {
+      return;
+    }
+    postSuccessFailureHookInvoked = true;
+    try {
+      await lifecycle.onPostSuccessFailureWhileLocked(error);
+    } catch {
+      // Preserve the mirror failure; the outer owner compensation is best-effort.
+    }
+  };
 
   try {
+    lockLoss.assertHeld();
     // Open both connections
-    pg = new PostgresCacheService(pgConnectionString);
-    await pg.ensureSchema();
-    await pg.verifyAccountBinding(resolvedBinding);
+    const pgService = new PostgresCacheService(pgConnectionString);
+    pg = pgService;
+    await lockLoss.runCheckedOperation(() => pgService.ensureSchema());
+    await lockLoss.runAbortablePgOperation(() => pgService.verifyAccountBinding(resolvedBinding));
     if (!lifecycle.pgLockAlreadyHeld) {
-      pgLockAcquired = await pg.tryAcquireSyncLock(lockKey);
+      const acquisition = pgService.tryAcquireSyncLock(lockKey, { onLost: lockLoss.onLost });
+      try {
+        pgLockAcquired = await lockLoss.runAbortablePgOperation(() => acquisition);
+      } catch (error) {
+        void acquisition.then(
+          async (acquired) => {
+            if (acquired) await pgService.releaseSyncLock(lockKey).catch(() => undefined);
+          },
+          () => undefined
+        );
+        throw error;
+      }
       if (!pgLockAcquired)
         throw new Error('Another cache sync is already running for this account.');
     }
-    sqlite = new SQLiteCacheService(sqliteAccountName, sqliteCustomPath);
-    await sqlite.verifyAccountBinding(resolvedBinding);
-    sqliteLockAcquired = await sqlite.tryAcquireSyncLock(lockKey);
+    const sqliteService = new SQLiteCacheService(sqliteAccountName, sqliteCustomPath);
+    sqlite = sqliteService;
+    await lockLoss.runCheckedOperation(() => sqliteService.verifyAccountBinding(resolvedBinding));
+    sqliteLockAcquired = await lockLoss.runCheckedOperation(() =>
+      sqliteService.tryAcquireSyncLock(lockKey)
+    );
     if (!sqliteLockAcquired)
       throw new Error('Another local cache writer is already running for this account.');
 
     try {
       // 1. Pull all documents from PG
-      const allDocs = await getAllDocuments(pg);
-      const allItems = await getAllItemDocuments(pg, allDocs);
-      const allPayments = await getAllPaymentTransactions(pg);
-      const allAccounts = await getAllAccounts(pg);
-      const categorySnapshot = await pg.getCategorySnapshot();
-      const inventoryCacheMeta = await pg.getInventoryCacheMeta();
-      const allMasterItems = await getAllItems(pg);
-      const allStockRows = await getAllStockRows(pg);
-      const pgState = await pg.getCacheState();
-      const pgPaymentSyncStatus = await pg.getPaymentSyncStatus();
+      const allDocs = await lockLoss.runAbortablePgOperation(() => getAllDocuments(pgService));
+      const allItems = await getAllItemDocuments(pgService, allDocs, lockLoss);
+      const allPayments = await lockLoss.runAbortablePgOperation(() =>
+        getAllPaymentTransactions(pgService)
+      );
+      const allAccounts = await lockLoss.runAbortablePgOperation(() => getAllAccounts(pgService));
+      const categorySnapshot = await lockLoss.runAbortablePgOperation(() =>
+        pgService.getCategorySnapshot()
+      );
+      const inventoryCacheMeta = await lockLoss.runAbortablePgOperation(() =>
+        pgService.getInventoryCacheMeta()
+      );
+      const allMasterItems = await lockLoss.runAbortablePgOperation(() => getAllItems(pgService));
+      const allStockRows = await lockLoss.runAbortablePgOperation(() => getAllStockRows(pgService));
+      const pgState = await lockLoss.runAbortablePgOperation(() => pgService.getCacheState());
+      const pgPaymentSyncStatus = await lockLoss.runAbortablePgOperation(() =>
+        pgService.getPaymentSyncStatus()
+      );
+      sourceSyncStatus = projectSyncStatusForMirror(
+        await lockLoss.runAbortablePgOperation(() => pgService.getSyncStatus()),
+        false
+      );
+      compensationSyncStatus = sourceSyncStatus;
+      if (lifecycle.onSettledWhileLocked && !sourceSyncStatus) {
+        throw new Error('PostgreSQL sync status is missing before pull settlement.');
+      }
 
       // Replace data and metadata together so readers see either the old or new mirror.
-      await sqlite.replaceMirror({
-        accounts: allAccounts,
-        categorySnapshot,
-        inventoryCacheMeta,
-        items: allMasterItems,
-        itemStockLocations: allStockRows,
-        documents: allDocs,
-        itemDocuments: allItems,
-        paymentTransactions: allPayments,
-        cacheState: pgState,
-        paymentSyncStatus: pgPaymentSyncStatus,
-        pulledAt: Date.now(),
+      await lockLoss.runCheckedOperation(async () => {
+        await sqliteService.replaceMirror({
+          accounts: allAccounts,
+          categorySnapshot,
+          inventoryCacheMeta,
+          items: allMasterItems,
+          itemStockLocations: allStockRows,
+          documents: allDocs,
+          itemDocuments: allItems,
+          paymentTransactions: allPayments,
+          cacheState: pgState,
+          paymentSyncStatus: pgPaymentSyncStatus,
+          syncStatus: sourceSyncStatus,
+          pulledAt: Date.now(),
+        });
+        replacementCommitted = true;
       });
 
       const duration = ((Date.now() - start) / 1000).toFixed(1);
@@ -152,24 +229,49 @@ export async function pullFromPostgres(
         duration: `${duration}s`,
       };
       const requireTerminalStatus = lifecycle.onSettledWhileLocked !== undefined;
-      const preSettlementStatus = requireTerminalStatus
-        ? projectSyncStatusForMirror(await pg.getSyncStatus(), false)
-        : undefined;
-      if (requireTerminalStatus && !preSettlementStatus) {
-        throw new Error('PostgreSQL sync status is missing before pull settlement.');
+      if (requireTerminalStatus) {
+        await lockLoss.runCheckedOperation(() =>
+          notifySettlementWhileLocked({ status: 'success', result })
+        );
+        const terminalStatus = projectSyncStatusForMirror(
+          await lockLoss.runAbortablePgOperation(() => pgService.getSyncStatus()),
+          true
+        );
+        if (!terminalStatus) throw new Error('PostgreSQL terminal sync status is missing.');
+        compensationSyncStatus = terminalStatus;
+        await lockLoss.runCheckedOperation(() => sqliteService.setSyncStatus(terminalStatus));
       }
-      await notifySettlementWhileLocked({ status: 'success', result });
-      await mirrorPostgresSyncStatus(
-        pg,
-        sqlite,
-        requireTerminalStatus,
-        preSettlementStatus ?? undefined
-      );
+      if (lifecycle.pgLockAlreadyHeld) {
+        pgCloseAttempted = true;
+        try {
+          await pgService.close();
+        } catch {
+          // Connection cleanup is best-effort; lock loss remains authoritative.
+        }
+        lockLoss.assertHeld();
+      }
       return result;
     } catch (error) {
-      await notifySettlementWhileLocked({ status: 'failed', error }, true);
-      throw error;
+      let safeError = lockLoss.safeError(error);
+      if (replacementCommitted && lifecycle.onSettledWhileLocked && compensationSyncStatus) {
+        const failedStatus = createCompensatingFailureStatus(compensationSyncStatus);
+        await compensatePostReplaceFailure(
+          sqliteService,
+          failedStatus,
+          pgLockAcquired ? pgService : null
+        );
+      }
+      safeError = lockLoss.safeError(safeError);
+      if (successSettlementRequested) {
+        await notifyPostSuccessFailureWhileLocked(safeError);
+      } else {
+        await notifySettlementWhileLocked({ status: 'failed', error: safeError }, true);
+      }
+      throw lockLoss.safeError(safeError);
     }
+  } catch (error) {
+    pullFailed = true;
+    throw error;
   } finally {
     try {
       if (sqlite && sqliteLockAcquired) await sqlite.releaseSyncLock(lockKey);
@@ -182,7 +284,12 @@ export async function pullFromPostgres(
       /* ignore */
     }
     try {
-      if (pg) await pg.close();
+      if (pg && !pgCloseAttempted) {
+        const close = pg.close();
+        if (pullFailed && lockLoss.isLost() && lockLoss.hasPendingAbortablePgOperations()) {
+          void close.catch(() => undefined);
+        } else await close;
+      }
     } catch {
       /* ignore */
     }
@@ -191,27 +298,7 @@ export async function pullFromPostgres(
     } catch {
       /* ignore */
     }
-  }
-}
-
-async function mirrorPostgresSyncStatus(
-  pg: PostgresCacheService,
-  sqlite: SQLiteCacheService,
-  requireTerminal: boolean,
-  compensationBase?: CacheSyncStatus
-): Promise<void> {
-  let safeStatus = compensationBase;
-  try {
-    const status = projectSyncStatusForMirror(await pg.getSyncStatus(), requireTerminal);
-    if (!status) return;
-    safeStatus = status;
-    await sqlite.setSyncStatus(status);
-  } catch (error) {
-    if (requireTerminal && safeStatus) {
-      const failedStatus = createCompensatingFailureStatus(safeStatus);
-      await compensateTerminalStatus(pg, sqlite, failedStatus);
-    }
-    throw error;
+    lockLoss.dispose();
   }
 }
 
@@ -229,20 +316,21 @@ function createCompensatingFailureStatus(terminalStatus: CacheSyncStatus): Cache
   return failedStatus;
 }
 
-async function compensateTerminalStatus(
-  pg: PostgresCacheService,
+async function compensatePostReplaceFailure(
   sqlite: SQLiteCacheService,
-  failedStatus: CacheSyncStatus
+  failedStatus: CacheSyncStatus,
+  postgresLockOwner: PostgresCacheService | null
 ): Promise<void> {
   try {
     await sqlite.setSyncStatus(failedStatus);
   } catch {
-    // Continue to the PostgreSQL compensation while both locks remain held.
+    // Preserve the primary pull failure while the SQLite writer lock is still held.
   }
+  if (!postgresLockOwner) return;
   try {
-    await pg.setSyncStatus(failedStatus);
+    await postgresLockOwner.setSyncStatus(failedStatus);
   } catch {
-    // Preserve the local mirror failure; lock cleanup must still run.
+    // Preserve the primary mirror failure; lifecycle callers still receive it.
   }
 }
 
@@ -604,7 +692,8 @@ async function getAllPaymentTransactions(
 /** Fetch all item_documents from PG */
 async function getAllItemDocuments(
   pg: PostgresCacheService,
-  docs: DocumentRow[]
+  docs: DocumentRow[],
+  lockLoss: PullLockLossGuard
 ): Promise<Omit<ItemDocumentRow, 'id'>[]> {
   const allItems: Omit<ItemDocumentRow, 'id'>[] = [];
 
@@ -613,7 +702,7 @@ async function getAllItemDocuments(
   for (let i = 0; i < docs.length; i += batchSize) {
     const batch = docs.slice(i, i + batchSize);
     const promises = batch.map((doc) => pg.getItemDocuments(doc.doc_id));
-    const results = await Promise.all(promises);
+    const results = await lockLoss.runAbortablePgOperation(() => Promise.all(promises));
     for (const items of results) {
       for (const item of items) {
         allItems.push({
@@ -639,4 +728,59 @@ async function getAllItemDocuments(
   }
 
   return allItems;
+}
+
+type PullLockLossGuard = {
+  onLost: (error: Error) => void;
+  assertHeld: () => void;
+  runAbortablePgOperation: <T>(operation: () => Promise<T>) => Promise<T>;
+  runCheckedOperation: <T>(operation: () => Promise<T>) => Promise<T>;
+  isLost: () => boolean;
+  hasPendingAbortablePgOperations: () => boolean;
+  safeError: (error: unknown) => unknown;
+  dispose: () => void;
+};
+
+function createPullLockLossGuard(externalSignal?: AbortSignal): PullLockLossGuard {
+  const controller = new AbortController();
+  const pendingAbortablePgOperations = new Set<Promise<unknown>>();
+  const abort = () => {
+    if (!controller.signal.aborted) controller.abort();
+  };
+  if (externalSignal?.aborted) abort();
+  else externalSignal?.addEventListener('abort', abort, { once: true });
+  const assertHeld = (): void => {
+    if (controller.signal.aborted) throw new PostgresSyncLockLostError();
+  };
+  return {
+    onLost: abort,
+    assertHeld,
+    runAbortablePgOperation: <T>(operation: () => Promise<T>): Promise<T> => {
+      assertHeld();
+      const operationPromise = Promise.resolve().then(operation);
+      pendingAbortablePgOperations.add(operationPromise);
+      void operationPromise.then(
+        () => pendingAbortablePgOperations.delete(operationPromise),
+        () => pendingAbortablePgOperations.delete(operationPromise)
+      );
+      let removeAbortListener = (): void => undefined;
+      const lockLost = new Promise<never>((_resolve, reject) => {
+        const onAbort = (): void => reject(new PostgresSyncLockLostError());
+        controller.signal.addEventListener('abort', onAbort, { once: true });
+        removeAbortListener = () => controller.signal.removeEventListener('abort', onAbort);
+        if (controller.signal.aborted) onAbort();
+      });
+      return Promise.race([operationPromise, lockLost]).finally(removeAbortListener);
+    },
+    runCheckedOperation: async <T>(operation: () => Promise<T>): Promise<T> => {
+      assertHeld();
+      const result = await operation();
+      assertHeld();
+      return result;
+    },
+    isLost: () => controller.signal.aborted,
+    hasPendingAbortablePgOperations: () => pendingAbortablePgOperations.size > 0,
+    safeError: (error) => (controller.signal.aborted ? new PostgresSyncLockLostError() : error),
+    dispose: () => externalSignal?.removeEventListener('abort', abort),
+  };
 }

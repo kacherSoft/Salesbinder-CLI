@@ -16,6 +16,7 @@ import { formatJson, formatError } from '../../output/json.formatter.js';
 import { existsSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { randomUUID } from 'crypto';
 import { registerCachePaymentSyncCommand } from './cache-payment-sync.command.js';
 import {
   CacheSyncProgressController,
@@ -35,10 +36,22 @@ import {
   requireCanonicalSyncRecordIssueId,
   type FullResumeDocumentTombstone,
 } from './full-resume-phase-results.js';
+import {
+  awaitWhileSyncLockHeld,
+  createSyncLockLossGuard,
+  type SyncLockLossGuard,
+} from './postgres-sync-lock-loss.guard.js';
 
 type ActiveFullResume = {
   checkpoint: FullResumeCheckpoint;
   store: FullResumeCheckpointStore;
+};
+
+type PostgresSyncLockService = CacheService & {
+  tryAcquireSyncLock(
+    lockKey: string,
+    options?: { onLost?: (error: Error) => void }
+  ): Promise<boolean>;
 };
 
 /**
@@ -90,6 +103,9 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
         let progressController: CacheSyncProgressController | null = null;
         let terminalRequested = false;
         let checkpointFailureRecorded = false;
+        let lockLoss: SyncLockLossGuard | null = null;
+        let postSuccessFailureStatus: CacheSyncStatus | null = null;
+        let postSuccessFailureAttempted = false;
 
         try {
           const {
@@ -130,7 +146,14 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             await pgService.ensureAccountBinding(accountBinding);
             console.error('Syncing API → PostgreSQL...');
             syncLockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
-            lockAcquired = await pgService.tryAcquireSyncLock(syncLockKey);
+            const activeLockLoss = createSyncLockLossGuard();
+            const activeLockKey = syncLockKey;
+            lockLoss = activeLockLoss;
+            lockAcquired = await awaitWhileSyncLockHeld(activeLockLoss, () =>
+              pgService.tryAcquireSyncLock(activeLockKey, {
+                onLost: activeLockLoss.onLost,
+              })
+            );
             if (!lockAcquired) {
               throw new Error('Another cache sync is already running for this account.');
             }
@@ -147,6 +170,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             }
           }
 
+          const activeCacheService = cacheService;
           if (options.fullResume || options.resetCheckpoint) {
             checkpointStore = new FullResumeCheckpointStore({
               accountName,
@@ -164,10 +188,12 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
               if (checkpoint.completedPhases.length > 0) {
                 checkpointStore.validateCompletedPhases(
                   checkpoint,
-                  await captureFullResumeCacheSnapshot(
-                    cacheService,
-                    accountName,
-                    CACHE_SCHEMA_VERSION
+                  await awaitWhileSyncLockHeld(lockLoss, () =>
+                    captureFullResumeCacheSnapshot(
+                      activeCacheService,
+                      accountName,
+                      CACHE_SCHEMA_VERSION
+                    )
                   )
                 );
               }
@@ -175,8 +201,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           }
 
           const syncStartedAtMs = Date.now();
-          const currentSyncRunId = `${accountName}-${syncStartedAtMs}`;
-          const activeCacheService = cacheService;
+          const currentSyncRunId = `sync-${syncStartedAtMs}-${randomUUID()}`;
           const startedAtSeconds = Math.floor(syncStartedAtMs / 1000);
           const syncReporter = new CacheSyncProgressReporter(cacheService, {
             runId: currentSyncRunId,
@@ -190,12 +215,17 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           progressController = syncProgress;
           const onProgressEvent = syncProgress.onProgressEvent;
           const onProgressHeartbeat = syncProgress.onProgressHeartbeat;
-          const clientOptions = { rateLimitObserver: syncProgress.rateLimitObserver };
+          const clientOptions = {
+            rateLimitObserver: syncProgress.rateLimitObserver,
+            ...(lockLoss ? { signal: lockLoss.signal } : {}),
+          };
           const client = new SalesBinderClient(accountName, clientOptions);
           const v3Client = new SalesBinderV3Client(accountName, clientOptions);
-          await syncReporter.markRunning({
-            message: 'Sync running',
-          });
+          await awaitWhileSyncLockHeld(lockLoss, () =>
+            syncReporter.markRunning({
+              message: 'Sync running',
+            })
+          );
 
           // Load stale threshold from config
           const prefs = loadPreferences();
@@ -243,7 +273,10 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             phase: FullResumePhase,
             runPhase: () => Promise<T>
           ): Promise<T> => {
-            if (!activeResume) return runPhase();
+            lockLoss?.assertHeld();
+            if (!activeResume) {
+              return await awaitWhileSyncLockHeld(lockLoss, runPhase);
+            }
             if (activeResume.store.isPhaseComplete(activeResume.checkpoint, phase)) {
               console.error(`Skipping ${phase} phase: full-resume checkpoint already complete`);
               return activeResume.store.getPhaseResult(
@@ -252,12 +285,13 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
               ) as unknown as T;
             }
             activeResume.store.markPhaseStarted(activeResume.checkpoint, phase);
-            const phaseResult = await runPhase();
+            const phaseResult = await awaitWhileSyncLockHeld(lockLoss, runPhase);
+            const snapshot = await awaitWhileSyncLockHeld(lockLoss, captureCheckpointSnapshot);
             activeResume.store.markPhaseComplete(
               activeResume.checkpoint,
               phase,
               phaseResult,
-              await captureCheckpointSnapshot()
+              snapshot
             );
             return phaseResult;
           };
@@ -296,19 +330,23 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           let deletedResult: DeletedLogSyncResult;
           let recordIssues: SyncRecordIssue[];
           if (!activeResume) {
-            deletedResult = await deletedLogSync.sync({
-              onProgressEvent,
-              includeItemDeletes: false,
-            });
+            deletedResult = await awaitWhileSyncLockHeld(lockLoss, () =>
+              deletedLogSync.sync({
+                onProgressEvent,
+                includeItemDeletes: false,
+              })
+            );
             recordIssues = reconcileDeletedDocumentWarnings(
               indexedRecordIssues,
               deletedResult.documentTombstones
             );
-            await finalizeResolvedInvoicePaymentStatus(
-              activeCacheService,
-              result.type,
-              indexedRecordIssues,
-              recordIssues
+            await awaitWhileSyncLockHeld(lockLoss, () =>
+              finalizeResolvedInvoicePaymentStatus(
+                activeCacheService,
+                result.type,
+                indexedRecordIssues,
+                recordIssues
+              )
             );
           } else {
             const restoredDeletedLogPhase = activeResume.store.isPhaseComplete(
@@ -317,7 +355,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             );
             const cacheStateBeforeDeletedLog = restoredDeletedLogPhase
               ? null
-              : await activeCacheService.getCacheState();
+              : await awaitWhileSyncLockHeld(lockLoss, () => activeCacheService.getCacheState());
             if (restoredDeletedLogPhase) {
               console.error('Skipping deleted-log phase: full-resume checkpoint already complete');
             } else {
@@ -334,29 +372,34 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             try {
               deletedResult = restoredDeletedLogPhase
                 ? activeResume.store.getPhaseResult(activeResume.checkpoint, 'deleted-log')
-                : await deletedLogSync.sync({
-                    onProgressEvent,
-                    includeItemDeletes: false,
-                  });
+                : await awaitWhileSyncLockHeld(lockLoss, () =>
+                    deletedLogSync.sync({
+                      onProgressEvent,
+                      includeItemDeletes: false,
+                    })
+                  );
               recordIssues = reconcileDeletedDocumentWarnings(
                 indexedRecordIssues,
                 deletedResult.documentTombstones
               );
-              const previousPaymentStatus = await finalizeResolvedInvoicePaymentStatus(
-                activeCacheService,
-                result.type,
-                indexedRecordIssues,
-                recordIssues,
-                (status) => {
-                  paymentStatusBeforeFinalization = status;
-                }
+              const previousPaymentStatus = await awaitWhileSyncLockHeld(lockLoss, () =>
+                finalizeResolvedInvoicePaymentStatus(
+                  activeCacheService,
+                  result.type,
+                  indexedRecordIssues,
+                  recordIssues,
+                  (status) => {
+                    paymentStatusBeforeFinalization = status;
+                  }
+                )
               );
               if (!restoredDeletedLogPhase || previousPaymentStatus) {
+                const snapshot = await awaitWhileSyncLockHeld(lockLoss, captureCheckpointSnapshot);
                 activeResume.store.markPhaseComplete(
                   activeResume.checkpoint,
                   'deleted-log',
                   deletedResult,
-                  await captureCheckpointSnapshot()
+                  snapshot
                 );
               }
             } catch (error) {
@@ -392,8 +435,22 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           const hasWarnings = recordIssues.length > 0;
           const cloudSyncFinishedAt = Math.floor(Date.now() / 1000);
 
-          const finalState = await cacheService.getCacheState();
-          const categoryMeta = await cacheService.getCategoryCacheMeta();
+          const finalState = await awaitWhileSyncLockHeld(lockLoss, () =>
+            activeCacheService.getCacheState()
+          );
+          const categoryMeta = await awaitWhileSyncLockHeld(lockLoss, () =>
+            activeCacheService.getCategoryCacheMeta()
+          );
+          const [documentCount, itemDocumentCount, itemCount, categoryCount, stockLocationCount] =
+            await awaitWhileSyncLockHeld(lockLoss, () =>
+              Promise.all([
+                activeCacheService.getDocumentCount(),
+                activeCacheService.getItemDocumentCount(),
+                activeCacheService.getItemCount(),
+                activeCacheService.getCategoryCount(),
+                activeCacheService.getStockLocationCount(),
+              ])
+            );
           const baseState = finalState ?? {
             accountName,
             schemaVersion: CACHE_SCHEMA_VERSION,
@@ -402,26 +459,28 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             lastSync: 0,
             lastFullSync: 0,
           };
-          await cacheService.setCacheState({
-            ...baseState,
-            // Warning runs retain the last clean global watermarks so unresolved
-            // records are reconsidered on the next attempt.
-            ...(hasWarnings
-              ? {}
-              : {
-                  lastSync: cloudSyncFinishedAt,
-                  ...(effectiveFull ? { lastFullSync: cloudSyncFinishedAt } : {}),
-                }),
-            lastSyncAttempt: cloudSyncFinishedAt,
-            documentCount: await cacheService.getDocumentCount(),
-            itemDocumentCount: await cacheService.getItemDocumentCount(),
-            accountName,
-            schemaVersion: CACHE_SCHEMA_VERSION,
-            itemCount: await cacheService.getItemCount(),
-            categoryCount: await cacheService.getCategoryCount(),
-            lastCategorySync: categoryMeta?.completedAt ?? finalState?.lastCategorySync,
-            stockLocationCount: await cacheService.getStockLocationCount(),
-          });
+          await awaitWhileSyncLockHeld(lockLoss, () =>
+            activeCacheService.setCacheState({
+              ...baseState,
+              // Warning runs retain the last clean global watermarks so unresolved
+              // records are reconsidered on the next attempt.
+              ...(hasWarnings
+                ? {}
+                : {
+                    lastSync: cloudSyncFinishedAt,
+                    ...(effectiveFull ? { lastFullSync: cloudSyncFinishedAt } : {}),
+                  }),
+              lastSyncAttempt: cloudSyncFinishedAt,
+              documentCount,
+              itemDocumentCount,
+              accountName,
+              schemaVersion: CACHE_SCHEMA_VERSION,
+              itemCount,
+              categoryCount,
+              lastCategorySync: categoryMeta?.completedAt ?? finalState?.lastCategorySync,
+              stockLocationCount,
+            })
+          );
 
           // If we synced to PG, also pull PG → SQLite
           let pullInfo: {
@@ -445,6 +504,8 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             stockRowsProcessed: itemResult.stockRowsProcessed,
             deletedRecordsProcessed: deletedResult.deletedRecordsProcessed,
           };
+          const terminalSyncTarget = syncTarget;
+          if (!terminalSyncTarget) throw new Error('Cache sync target is not initialized.');
           const recordCheckpointFailure = (error: unknown): void => {
             if (!checkpointStore || !checkpoint) return;
             checkpointFailureRecorded = true;
@@ -469,19 +530,42 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
               recordsTotal: recordIssues.length,
               indeterminate: false,
             });
-            if (hasWarnings) {
-              await syncReporter.markSuccessWithWarnings(terminalSummary, recordIssues);
-            } else {
-              await syncReporter.markSuccess(terminalSummary);
-            }
-            terminalRequested = true;
+            const failedAt = Math.max(Math.floor(Date.now() / 1000), startedAtSeconds);
+            postSuccessFailureStatus = {
+              status: 'failed',
+              runId: currentSyncRunId,
+              accountName,
+              syncTarget: terminalSyncTarget,
+              startedAt: startedAtSeconds,
+              updatedAt: failedAt,
+              finishedAt: failedAt,
+              syncType: effectiveFull ? 'full' : 'delta',
+              message: 'Sync failed',
+              error: 'Cache sync failed.',
+            };
+            await awaitWhileSyncLockHeld(lockLoss, async () => {
+              await (hasWarnings
+                ? syncReporter.markSuccessWithWarnings(terminalSummary, recordIssues)
+                : syncReporter.markSuccess(terminalSummary));
+              terminalRequested = true;
+            });
           };
           const markFailedTerminal = async (error: unknown): Promise<void> => {
             recordCheckpointFailure(error);
+            if (postSuccessFailureStatus) {
+              postSuccessFailureAttempted = true;
+              terminalRequested = true;
+              await activeCacheService.setSyncStatus(postSuccessFailureStatus);
+              return;
+            }
             await syncReporter.markFailure(error, { message: 'Sync failed' });
             terminalRequested = true;
           };
           if (pgService && dbUrl && options.pull) {
+            const inheritedLockLoss = lockLoss;
+            if (!inheritedLockLoss) {
+              throw new Error('PostgreSQL sync lock guard is not initialized.');
+            }
             syncProgress.onProgressEvent({
               phase: 'pg-to-sqlite-pull',
               event: 'phase_started',
@@ -489,17 +573,20 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
               recordsTotal: null,
               indeterminate: true,
             });
-            await syncReporter.flush();
+            await awaitWhileSyncLockHeld(lockLoss, () => syncReporter.flush());
             // Keep the outer PostgreSQL writer lock continuously held. The pull
             // service locks SQLite but reuses this run's PG lock ownership.
             console.error('Pulling PostgreSQL → SQLite...');
+            inheritedLockLoss.assertHeld();
             await pullFromPostgres(dbUrl, accountName, undefined, accountBinding, {
               pgLockAlreadyHeld: true,
+              lockLossSignal: inheritedLockLoss.signal,
               onSettledWhileLocked: async (settlement) => {
                 if (settlement.status === 'failed') {
                   await markFailedTerminal(settlement.error);
                   return;
                 }
+                inheritedLockLoss.assertHeld();
                 const pullResult = settlement.result;
                 pullInfo = {
                   pulled: true,
@@ -524,7 +611,9 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
                 });
                 await markSuccessfulTerminal();
               },
+              onPostSuccessFailureWhileLocked: markFailedTerminal,
             });
+            inheritedLockLoss.assertHeld();
           } else {
             await markSuccessfulTerminal();
           }
@@ -586,10 +675,12 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
               : `Sync complete: ${result.documentsProcessed} documents, ${categoryResult.categoriesProcessed} categories, ${itemResult.itemsProcessed} items in ${duration}`,
           };
 
+          lockLoss?.assertHeld();
           syncProgress.finish();
           console.log(formatJson(output));
           if (options.fullResume && checkpointStore) {
             try {
+              lockLoss?.assertHeld();
               checkpointStore.removeAfterSuccess();
             } catch {
               console.error(
@@ -608,7 +699,15 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             }
           }
           try {
-            if (progressReporter && !terminalRequested) {
+            if (cacheService && postSuccessFailureStatus && !postSuccessFailureAttempted) {
+              postSuccessFailureAttempted = true;
+              terminalRequested = true;
+              try {
+                await cacheService.setSyncStatus(postSuccessFailureStatus);
+              } catch {
+                // Same-run compensation is best-effort and must not mask the pull failure.
+              }
+            } else if (progressReporter && !terminalRequested) {
               await progressReporter.markFailure(safeError, { message: 'Sync failed' });
               terminalRequested = true;
             }
@@ -648,6 +747,7 @@ Next sync will perform a full resync.`
       let cacheService: CacheService | null = null;
       let lockKey: string | null = null;
       let lockAcquired = false;
+      let lockLoss: SyncLockLossGuard | null = null;
 
       try {
         const dbUrl = process.env.SALESBINDER_DB_URL;
@@ -666,12 +766,17 @@ Next sync will perform a full resync.`
           await pgCache.ensureSchema();
           await pgCache.ensureAccountBinding(accountBinding);
           lockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
-          lockAcquired = await pgCache.tryAcquireSyncLock(lockKey);
+          const activeLockLoss = createSyncLockLossGuard();
+          const activeLockKey = lockKey;
+          lockLoss = activeLockLoss;
+          lockAcquired = await awaitWhileSyncLockHeld(activeLockLoss, () =>
+            pgCache.tryAcquireSyncLock(activeLockKey, { onLost: activeLockLoss.onLost })
+          );
           if (!lockAcquired) {
             throw new Error('Another cache sync is already running for this account.');
           }
-          await pgCache.truncateAll();
-
+          await awaitWhileSyncLockHeld(lockLoss, () => pgCache.truncateAll());
+          activeLockLoss.assertHeld();
           console.log(
             formatJson({
               success: true,
@@ -744,7 +849,7 @@ Next sync will perform a full resync.`
           );
         }
       } catch (error) {
-        console.error(formatError(error as Error));
+        console.error(formatError(lockLoss?.safeError(error) ?? (error as Error)));
         process.exitCode = 1;
       } finally {
         await releaseCacheWriterLockAndClose(cacheService, lockKey, lockAcquired);
@@ -770,8 +875,10 @@ No historical SalesBinder API requests are made.`
     .action(async (directory: string, options: { dryRun?: boolean; target?: string }) => {
       let cacheService: CacheService | null = null;
       let ensurePostgresSchema: (() => Promise<void>) | null = null;
+      let postgresCacheService: PostgresSyncLockService | null = null;
       let lockKey: string | null = null;
       let lockAcquired = false;
+      let lockLoss: SyncLockLossGuard | null = null;
 
       try {
         const {
@@ -798,6 +905,7 @@ No historical SalesBinder API requests are made.`
             );
           const pgCache = new PostgresCacheService(dbUrl);
           cacheService = pgCache;
+          postgresCacheService = pgCache;
           ensurePostgresSchema = () => pgCache.ensureSchema();
         } else {
           cacheService = new SQLiteCacheService(accountName);
@@ -805,23 +913,39 @@ No historical SalesBinder API requests are made.`
 
         if (!options.dryRun) {
           if (ensurePostgresSchema) await ensurePostgresSchema();
-          await cacheService.ensureAccountBinding(accountBinding);
+          const activeCacheService = cacheService;
+          await activeCacheService.ensureAccountBinding(accountBinding);
           lockKey = `salesbinder-cache-sync:${accountBinding.accountIdentity}`;
-          lockAcquired = await cacheService.tryAcquireSyncLock(lockKey);
+          if (postgresCacheService) {
+            const activePostgresCacheService = postgresCacheService;
+            const activeLockLoss = createSyncLockLossGuard();
+            const activeLockKey = lockKey;
+            lockLoss = activeLockLoss;
+            lockAcquired = await awaitWhileSyncLockHeld(activeLockLoss, () =>
+              activePostgresCacheService.tryAcquireSyncLock(activeLockKey, {
+                onLost: activeLockLoss.onLost,
+              })
+            );
+          } else {
+            lockAcquired = await activeCacheService.tryAcquireSyncLock(lockKey);
+          }
           if (!lockAcquired) {
             throw new Error('Another cache sync is already running for this account.');
           }
         }
         console.error(`${options.dryRun ? 'Validating' : 'Importing'} CSV exports -> ${target}...`);
-        const importer = new CsvCacheImportService(cacheService);
-        const result = await importer.importDirectory(directory, {
-          dryRun: options.dryRun,
-          accountName,
-        });
-
+        const activeCacheService = cacheService;
+        const importer = new CsvCacheImportService(activeCacheService);
+        const result = await awaitWhileSyncLockHeld(lockLoss, () =>
+          importer.importDirectory(directory, {
+            dryRun: options.dryRun,
+            accountName,
+          })
+        );
+        lockLoss?.assertHeld();
         console.log(formatJson({ ...result, backend: target }));
       } catch (error) {
-        console.error(formatError(error as Error));
+        console.error(formatError(lockLoss?.safeError(error) ?? (error as Error)));
         process.exitCode = 1;
       } finally {
         await releaseCacheWriterLockAndClose(cacheService, lockKey, lockAcquired);
@@ -1427,6 +1551,9 @@ function safeOutputNumber(value: unknown): number | undefined {
 }
 
 function toSafeCacheSyncError(error: unknown, syncStarted: boolean): Error {
+  if (error instanceof Error && error.name === 'PostgresSyncLockLostError') {
+    return new Error('PostgreSQL sync lock lost.');
+  }
   if (error instanceof Error && error.name === 'RateLimitWaitExceededError') {
     return new Error('SalesBinder rate-limit wait exceeded the 15-minute safety ceiling.');
   }

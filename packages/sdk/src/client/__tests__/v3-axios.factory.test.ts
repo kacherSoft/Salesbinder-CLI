@@ -1,4 +1,4 @@
-import { AxiosError, type AxiosAdapter, type AxiosResponse } from 'axios';
+import { AxiosError, type AxiosAdapter, type AxiosResponse, type GenericAbortSignal } from 'axios';
 import { loadConfig } from '../../config/config.loader.js';
 import { SalesBinderV3Client } from '../../index.js';
 import { createV3AxiosClient } from '../v3-axios.factory.js';
@@ -45,6 +45,76 @@ describe('createV3AxiosClient', () => {
     expect(() => createV3AxiosClient({ ...account, v3ApiKey: undefined })).toThrow(
       'SalesBinder API v3 key is not configured for this account'
     );
+  });
+
+  it('uses the runtime signal for defaults and cancels active or queued work without retrying', async () => {
+    const activeController = new AbortController();
+    const activeLimiter = new SalesBinderRateLimiter({
+      now: () => 0,
+      wallNow: () => 0,
+      random: () => 0,
+    });
+    const activeClient = createV3AxiosClient(account, {
+      rateLimiterRegistry: activeLimiter,
+      signal: activeController.signal,
+    });
+    let markActiveStarted!: () => void;
+    const activeStarted = new Promise<void>((resolve) => {
+      markActiveStarted = resolve;
+    });
+    const activeAdapter = createAbortableAdapter(markActiveStarted);
+    activeClient.defaults.adapter = activeAdapter;
+
+    expect(activeClient.defaults.signal).toBe(activeController.signal);
+
+    const active = activeClient.get('/items/active');
+    await activeStarted;
+    activeController.abort();
+    const activeError = await active.then(
+      () => undefined,
+      (caught: AxiosError) => caught
+    );
+
+    expect(activeError?.code).toBe(AxiosError.ERR_CANCELED);
+    expect(activeAdapter).toHaveBeenCalledTimes(1);
+
+    const queueController = new AbortController();
+    let limiterNow = 0;
+    const queueLimiter = new SalesBinderRateLimiter({
+      now: () => limiterNow,
+      wallNow: () => limiterNow,
+      random: () => 0,
+      sleep: (_delayMs, signal) => waitForAbort(signal),
+    });
+    const queueClient = createV3AxiosClient(account, {
+      rateLimiterRegistry: queueLimiter,
+      signal: queueController.signal,
+    });
+    const queueAdapter = jest.fn<ReturnType<AxiosAdapter>, Parameters<AxiosAdapter>>(
+      async (config) => ({
+        data: {},
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        config,
+      })
+    );
+    queueClient.defaults.adapter = queueAdapter;
+
+    expect(queueClient.defaults.signal).toBe(queueController.signal);
+
+    for (let request = 0; request < 100; request++) await queueClient.get(`/items/${request}`);
+
+    const queued = queueClient.get('/items/queued-runtime-signal');
+    await Promise.resolve();
+    queueController.abort();
+    const queuedError = await queued.then(
+      () => undefined,
+      (caught: Error) => caught
+    );
+
+    expect(queuedError?.name).toBe('AbortError');
+    expect(queueAdapter).toHaveBeenCalledTimes(100);
   });
 
   it('retries the same transient statuses as the v2 client', async () => {
@@ -269,4 +339,32 @@ function immediateTimeouts(): jest.SpyInstance {
     callback();
     return 0 as unknown as NodeJS.Timeout;
   }) as typeof setTimeout);
+}
+
+function createAbortableAdapter(markStarted: () => void) {
+  return jest.fn<ReturnType<AxiosAdapter>, Parameters<AxiosAdapter>>(
+    (config) =>
+      new Promise<AxiosResponse>((_resolve, reject) => {
+        const onAbort = () => {
+          config.signal?.removeEventListener?.('abort', onAbort);
+          reject(new AxiosError('Request aborted', AxiosError.ERR_CANCELED, config));
+        };
+        config.signal?.addEventListener?.('abort', onAbort, { once: true });
+        markStarted();
+        if (config.signal?.aborted) onAbort();
+      })
+  );
+}
+
+function waitForAbort(signal?: GenericAbortSignal): Promise<void> {
+  return new Promise<void>((_resolve, reject) => {
+    const onAbort = () => {
+      signal?.removeEventListener?.('abort', onAbort);
+      const error = new Error('aborted');
+      error.name = 'AbortError';
+      reject(error);
+    };
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 }

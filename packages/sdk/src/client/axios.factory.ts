@@ -26,6 +26,7 @@ export function createAxiosClient(
   const client = axios.create({
     baseURL: `https://${account.subdomain}.salesbinder.com/api/${account.apiVersion}`,
     timeout: account.timeout || 30000,
+    signal: runtimeOptions.signal,
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json',
