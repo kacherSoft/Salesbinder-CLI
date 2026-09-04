@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+coverage
+data
+node_modules
+packages/*/node_modules
+packages/*/dist
+plans
+*.log
+*.local.json

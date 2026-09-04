@@ -11,7 +11,7 @@
     "clean": "rm -rf node_modules packages/*/node_modules",
     "build": "pnpm -r --filter './packages/**' build",
     "dev": "pnpm --filter './packages/cli' dev",
-    "test": "pnpm -r --filter './packages/**' test",
+    "test": "node --test scripts/*.test.mjs && pnpm -r --filter './packages/**' test",
     "test:coverage": "pnpm -r --filter './packages/**' test:coverage",
     "lint": "pnpm -r --filter './packages/**' lint",
     "lint:fix": "pnpm -r --filter './packages/**' lint:fix",
