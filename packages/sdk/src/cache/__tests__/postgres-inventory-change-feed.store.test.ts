@@ -1,12 +1,14 @@
 import { PostgresInventoryChangeFeedStore } from '../postgres-inventory-change-feed.store.js';
 import {
   CACHE_SCHEMA_VERSION,
+  InventoryBaselineProofError,
   createInventoryBaselineRootFingerprint,
   createInventoryEventReceiptId,
   createInventoryItemBundleFingerprint,
   createInventorySnapshotFingerprint,
   type CacheState,
   type InventoryBaselineRun,
+  type InventoryCacheMeta,
   type InventoryChangeFeedBinding,
   type InventoryEventReceipt,
   type InventoryEventReceiptInput,
@@ -68,6 +70,78 @@ describe('PostgresInventoryChangeFeedStore', () => {
     ).resolves.toEqual(state);
   });
 
+  it('distinguishes an uninitialized baseline from a corrupt persisted baseline binding', async () => {
+    const { store, harness } = createHarness();
+    await store.ensureInventoryChangeFeedState(binding, 100);
+
+    await expect(
+      store.getVerifiedInventoryBaselineProofByConsumer(
+        binding.accountIdentity,
+        binding.consumerName
+      )
+    ).resolves.toBeNull();
+
+    harness.orphanBaselineGeneration('orphaned-generation');
+    await expect(
+      store.getVerifiedInventoryBaselineProofByConsumer(
+        binding.accountIdentity,
+        binding.consumerName
+      )
+    ).rejects.toMatchObject({
+      name: 'InventoryBaselineProofError',
+      code: 'missing_promoted_run',
+      sanitized: true,
+      message: 'Verified inventory baseline proof is invalid.',
+    } satisfies Partial<InventoryBaselineProofError>);
+  });
+
+  it.each([
+    ['legacy v1 metadata', (meta: InventoryCacheMeta) => toLegacyInventoryMeta(meta)],
+    [
+      'warning metadata with an omitted item',
+      (meta: InventoryCacheMeta) => ({
+        ...meta,
+        status: 'complete_with_warnings',
+        omittedItemCount: 1,
+        warningCount: 1,
+        lastCompleteAt: null,
+      }),
+    ],
+    [
+      'warning metadata with a preserved item',
+      (meta: InventoryCacheMeta) => ({
+        ...meta,
+        status: 'complete_with_warnings',
+        itemCount: 1,
+        freshItemCount: 0,
+        preservedItemCount: 1,
+        warningCount: 1,
+        lastCompleteAt: null,
+      }),
+    ],
+  ])('rejects parse-valid promoted proof with %s', async (_label, mutate) => {
+    const { store, harness } = createHarness();
+    await store.ensureInventoryChangeFeedState(binding, 100);
+    await promoteEmptyBaseline(store, '10');
+    const proof = await store.getVerifiedInventoryBaselineProofByConsumer(
+      binding.accountIdentity,
+      binding.consumerName
+    );
+    if (!proof) throw new Error('Expected fake promoted baseline proof.');
+    harness.replacePromotedMeta(mutate(proof.meta) as InventoryCacheMeta);
+
+    await expect(
+      store.getVerifiedInventoryBaselineProofByConsumer(
+        binding.accountIdentity,
+        binding.consumerName
+      )
+    ).rejects.toMatchObject({
+      name: 'InventoryBaselineProofError',
+      code: 'invalid_promoted_meta',
+      sanitized: true,
+    });
+  });
+
   it('applies item bundles atomically, returns deterministic receipts, and replays idempotently', async () => {
     const { store, harness } = createHarness();
     await store.ensureInventoryChangeFeedState(binding, 100);
@@ -93,6 +167,16 @@ describe('PostgresInventoryChangeFeedStore', () => {
       observedThroughEventSeq: '12',
       highestAppliedEventSeq: '12',
       appliedThroughEventSeq: '10',
+    });
+    await expect(
+      store.getVerifiedInventoryBaselineProofByConsumer(
+        binding.accountIdentity,
+        binding.consumerName
+      )
+    ).resolves.toMatchObject({
+      ...binding,
+      baselineGeneration: 'generation-1',
+      meta: { generation: 'generation-1', itemCount: 0, stockRowCount: 0 },
     });
   });
 
@@ -159,6 +243,16 @@ describe('PostgresInventoryChangeFeedStore', () => {
     ]);
     expect(harness.sql()).toContain('DELETE FROM item_stock_locations WHERE item_id = $1');
     expect(harness.sql()).toContain('DELETE FROM items WHERE item_id = $1');
+    await expect(
+      store.getVerifiedInventoryBaselineProofByConsumer(
+        binding.accountIdentity,
+        binding.consumerName
+      )
+    ).resolves.toMatchObject({
+      ...binding,
+      baselineGeneration: 'generation-1',
+      meta: { generation: 'generation-1' },
+    });
   });
 
   it('keeps ordered root manifests, pending IDs, failures, and idempotent baseline promotion', async () => {
@@ -280,6 +374,8 @@ function createHarness(): {
     sql: () => string;
     liveMutationCount: () => number;
     liveInventoryItems: () => ItemRow[];
+    orphanBaselineGeneration: (generation: string) => void;
+    replacePromotedMeta: (meta: InventoryCacheMeta) => void;
   };
 } {
   const data: HarnessData = {
@@ -319,12 +415,51 @@ function createHarness(): {
           )
         ).length,
       liveInventoryItems: () => data.liveItems,
+      orphanBaselineGeneration: (generation) => {
+        requireFeed(data, bindingValuesForTest(binding)).baseline_generation = generation;
+      },
+      replacePromotedMeta: (meta) => {
+        const run = data.runs.find((candidate) => candidate.status === 'promoted');
+        if (!run) throw new Error('Missing fake promoted baseline run.');
+        run.promoted_meta = meta;
+      },
     },
   };
 }
 
 function query(data: HarnessData, sql: string, params: unknown[] = []): QueryResult {
   if (sql.includes('CREATE TABLE IF NOT EXISTS')) return { rows: [] };
+  if (sql.includes('JOIN inventory_baseline_runs AS baseline')) {
+    const feed = data.states.find(
+      (row: FeedStateRow) => row.account_identity === params[0] && row.consumer_name === params[1]
+    );
+    const baseline = feed
+      ? data.runs.find(
+          (row: BaselineRunRow) =>
+            matchesBinding(row, [
+              feed.account_identity,
+              feed.ledger_database_id,
+              feed.consumer_name,
+            ]) &&
+            row.generation === feed.baseline_generation &&
+            row.status === 'promoted'
+        )
+      : undefined;
+    return feed
+      ? {
+          rows: [
+            {
+              account_identity: feed.account_identity,
+              ledger_database_id: feed.ledger_database_id,
+              consumer_name: feed.consumer_name,
+              baseline_generation: feed.baseline_generation,
+              baseline_status: baseline?.status ?? null,
+              promoted_meta: baseline?.promoted_meta ?? null,
+            },
+          ],
+        }
+      : { rows: [] };
+  }
   if (
     sql.includes('FROM inventory_change_feed_state') &&
     sql.includes('account_identity=$1 AND consumer_name=$2')
@@ -681,6 +816,23 @@ function matchesBinding(
 
 function matchesRun(row: { run_id: string }, params: unknown[]): boolean {
   return row.run_id === params[3];
+}
+
+function bindingValuesForTest(value: InventoryChangeFeedBinding): unknown[] {
+  return [value.accountIdentity, value.ledgerDatabaseId, value.consumerName];
+}
+
+function toLegacyInventoryMeta(meta: InventoryCacheMeta): InventoryCacheMeta {
+  if (meta.version !== 2) return meta;
+  const {
+    freshItemCount: _freshItemCount,
+    preservedItemCount: _preservedItemCount,
+    omittedItemCount: _omittedItemCount,
+    warningCount: _warningCount,
+    lastCompleteAt: _lastCompleteAt,
+    ...legacy
+  } = meta;
+  return { ...legacy, version: 1, status: 'complete' };
 }
 
 function upsertProgress(data: HarnessData, next: StagingProgressRow): void {

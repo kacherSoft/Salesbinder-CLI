@@ -42,7 +42,12 @@ describe('V3InventoryBaselineService', () => {
     await harness.service.sync();
 
     expect(harness.order).toEqual(
-      expect.arrayContaining(['ledger.preflight', 'ledger.beginSyncRun', 'items.list', 'items.getMany'])
+      expect.arrayContaining([
+        'ledger.preflight',
+        'ledger.beginSyncRun',
+        'items.list',
+        'items.getMany',
+      ])
     );
     expect(harness.order.indexOf('ledger.preflight')).toBeLessThan(
       harness.order.indexOf('ledger.beginSyncRun')
@@ -83,8 +88,7 @@ describe('V3InventoryBaselineService', () => {
 
     expect(result).toMatchObject({ status: 'success', itemsProcessed: 51, stockRowsProcessed: 51 });
     expect(harness.client.items.getMany.mock.calls.map(([requested]) => requested.length)).toEqual([
-      50,
-      1,
+      50, 1,
     ]);
   });
 
@@ -109,7 +113,7 @@ describe('V3InventoryBaselineService', () => {
     const ids = [itemId(1)];
     const previousFailure = stagingFailure(baselineRun({ rootItemIds: ids }), ids[0], 4);
     const harness = createHarness({
-      rootPages: [ids, ids],
+      rootPages: [ids, ids, ids, ids],
       itemIds: ids,
       omittedItemIds: new Set(ids),
       failures: [previousFailure],
@@ -131,9 +135,41 @@ describe('V3InventoryBaselineService', () => {
         totalAttemptCount: 6,
       },
     ]);
+    expect(harness.client.items.list).toHaveBeenCalledTimes(4);
     expect(harness.client.items.getMany).toHaveBeenCalledTimes(2);
+    expect(harness.cache.deleteInventoryBaselineRun).not.toHaveBeenCalled();
     expect(harness.cache.promoteInventoryBaselineRun).not.toHaveBeenCalled();
     expect(harness.ledger.verifyBaseline).not.toHaveBeenCalled();
+  });
+
+  it('restarts a stale root once when missing baseline items disappear from a fresh root scan', async () => {
+    const originalIds = [itemId(1), itemId(2)];
+    const refreshedIds = [itemId(1)];
+    const harness = createHarness({
+      rootPages: [originalIds, originalIds, refreshedIds, refreshedIds, refreshedIds, refreshedIds],
+      itemIds: originalIds,
+      omittedItemIds: new Set([itemId(2)]),
+      rootRetryDelayMs: 0,
+    });
+
+    const result = await harness.service.sync();
+
+    expect(result).toMatchObject({
+      status: 'success',
+      itemsProcessed: 1,
+      baselinePromoted: true,
+      ledgerPromoted: true,
+    });
+    expect(harness.client.items.getMany.mock.calls.map(([ids]) => ids)).toEqual([
+      originalIds,
+      [itemId(2)],
+      refreshedIds,
+    ]);
+    expect(harness.cache.deleteInventoryBaselineRun).toHaveBeenCalledWith(
+      binding,
+      'baseline-run-1'
+    );
+    expect(harness.stagedItemIds()).toEqual(refreshedIds);
   });
 
   it('promotes a clean cache receipt, replays the S-to-T interval, and promotes the ledger run', async () => {
@@ -343,7 +379,11 @@ describe('V3InventoryBaselineService', () => {
     const controller = new AbortController();
     controller.abort(new Error('cancelled before baseline'));
     const ids = [itemId(1)];
-    const harness = createHarness({ rootPages: [ids, ids], itemIds: ids, signal: controller.signal });
+    const harness = createHarness({
+      rootPages: [ids, ids],
+      itemIds: ids,
+      signal: controller.signal,
+    });
 
     await expect(harness.service.sync()).rejects.toThrow('cancelled before baseline');
 
@@ -353,27 +393,31 @@ describe('V3InventoryBaselineService', () => {
   });
 });
 
-function createHarness(options: {
-  rootPages?: string[][];
-  itemIds?: string[];
-  activeRun?: ActiveChangeFeedSyncRun | null;
-  existingRuns?: InventoryBaselineRun[];
-  stagedBundles?: InventoryStagedItemBundle[];
-  failures?: InventoryStagingFailure[];
-  omittedItemIds?: Set<string>;
-  targetEventSeq?: string | null;
-  replayResult?: ReplayResult;
-  progress?: ChangeFeedProgress;
-  rootRetryDelayMs?: number;
-  assertWriterLockHeld?: jest.Mock<Promise<void>, []>;
-  signal?: AbortSignal;
-} = {}) {
+function createHarness(
+  options: {
+    rootPages?: string[][];
+    itemIds?: string[];
+    activeRun?: ActiveChangeFeedSyncRun | null;
+    existingRuns?: InventoryBaselineRun[];
+    stagedBundles?: InventoryStagedItemBundle[];
+    failures?: InventoryStagingFailure[];
+    omittedItemIds?: Set<string>;
+    targetEventSeq?: string | null;
+    replayResult?: ReplayResult;
+    progress?: ChangeFeedProgress;
+    rootRetryDelayMs?: number;
+    assertWriterLockHeld?: jest.Mock<Promise<void>, []>;
+    signal?: AbortSignal;
+  } = {}
+) {
   const order: string[] = [];
   const rootPages = [...(options.rootPages ?? [])];
   const knownItemIds = options.itemIds ?? options.rootPages?.flat() ?? [];
   const runs = new Map<string, InventoryBaselineRun>(
-    options.existingRuns?.map((run) => [run.runId, { ...run, rootItemIds: [...run.rootItemIds] }]) ??
-      []
+    options.existingRuns?.map((run) => [
+      run.runId,
+      { ...run, rootItemIds: [...run.rootItemIds] },
+    ]) ?? []
   );
   const staged = new Map<string, InventoryStagedItemBundle>();
   for (const bundle of options.stagedBundles ?? []) staged.set(bundle.item.item_id, bundle);
@@ -491,8 +535,9 @@ function createHarness(options: {
       runId: run.runId,
       expectedItemCount: run.expectedItemCount,
       stagedItemCount: completedItemIds.length,
-      failedItemCount: [...failures.values()].filter((failure) => pendingItemIds.includes(failure.itemId))
-        .length,
+      failedItemCount: [...failures.values()].filter((failure) =>
+        pendingItemIds.includes(failure.itemId)
+      ).length,
       completedItemIds,
       pendingItemIds,
       failures: [...failures.values()].map((failure) => ({
@@ -529,10 +574,12 @@ function createHarness(options: {
       const run = runs.get(runId);
       return run ? { ...run, rootItemIds: [...run.rootItemIds] } : null;
     }),
-    getInventoryStagingProgress: jest.fn(async (_bound: InventoryChangeFeedBinding, runId: string) => {
-      const run = runs.get(runId);
-      return run ? stagingProgress(run) : null;
-    }),
+    getInventoryStagingProgress: jest.fn(
+      async (_bound: InventoryChangeFeedBinding, runId: string) => {
+        const run = runs.get(runId);
+        return run ? stagingProgress(run) : null;
+      }
+    ),
     stageInventoryBaselineItem: jest.fn(async (bundle: InventoryStagedItemBundle) => {
       staged.set(bundle.item.item_id, bundle);
     }),
@@ -541,6 +588,13 @@ function createHarness(options: {
     }),
     promoteInventoryBaselineRun: jest.fn(async (promotion: InventoryBaselinePromotion) =>
       promote(promotion)
+    ),
+    deleteInventoryBaselineRun: jest.fn(
+      async (_bound: InventoryChangeFeedBinding, runId: string) => {
+        runs.delete(runId);
+        staged.clear();
+        failures.clear();
+      }
     ),
   };
   const ledger = {

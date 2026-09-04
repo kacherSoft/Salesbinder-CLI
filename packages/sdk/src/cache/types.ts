@@ -682,6 +682,22 @@ export interface InventoryChangeFeedState extends InventoryChangeFeedBinding {
   updatedAt: number;
 }
 
+/** Immutable proof that a clean baseline was promoted for one exact feed binding. */
+export interface InventoryVerifiedBaselineProof extends InventoryChangeFeedBinding {
+  baselineGeneration: string;
+  meta: InventoryCacheMeta;
+}
+
+/** Sanitized cache-integrity failure for a persisted promoted-baseline proof. */
+export class InventoryBaselineProofError extends Error {
+  readonly sanitized = true as const;
+
+  constructor(readonly code: 'missing_promoted_run' | 'invalid_promoted_meta') {
+    super('Verified inventory baseline proof is invalid.');
+    this.name = 'InventoryBaselineProofError';
+  }
+}
+
 export interface InventoryChangeFeedStateUpdate extends InventoryChangeFeedBinding {
   baselineGeneration?: string | null;
   observedThroughEventSeq?: InventoryEventSequence | null;

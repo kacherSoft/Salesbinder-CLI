@@ -18,6 +18,7 @@ import type {
   InventoryStagingFailure,
   InventoryStagingProgress,
   InventoryTombstoneApplication,
+  InventoryVerifiedBaselineProof,
   InventorySnapshot,
   ItemRow,
   ItemStockLocationRow,
@@ -25,6 +26,7 @@ import type {
 import {
   CACHE_SCHEMA_VERSION,
   INVENTORY_SNAPSHOT_META_KEY,
+  InventoryBaselineProofError,
   createInventoryBaselineRootFingerprint,
   createInventoryEventReceiptId,
   createInventoryItemBundleFingerprint,
@@ -418,6 +420,66 @@ export class PostgresInventoryChangeFeedStore implements InventoryChangeFeedCach
         throw new Error('Inventory change-feed consumer binding is ambiguous.');
       }
       return result.rows[0] ? mapFeedState(result.rows[0]) : null;
+    });
+  }
+
+  async getVerifiedInventoryBaselineProofByConsumer(
+    accountIdentity: string,
+    consumerName: string
+  ): Promise<InventoryVerifiedBaselineProof | null> {
+    assertNonEmptyText(accountIdentity, 'accountIdentity');
+    assertConsumerName(consumerName);
+    return this.options.withReadOnlyTransaction(async (client) => {
+      const result = await client.query<VerifiedBaselineProofRow>(
+        `SELECT feed.account_identity, feed.ledger_database_id::TEXT, feed.consumer_name,
+                feed.baseline_generation, baseline.status AS baseline_status,
+                baseline.promoted_meta
+         FROM inventory_change_feed_state AS feed
+         LEFT JOIN inventory_baseline_runs AS baseline
+           ON baseline.account_identity=feed.account_identity
+          AND baseline.ledger_database_id=feed.ledger_database_id
+          AND baseline.consumer_name=feed.consumer_name
+          AND baseline.generation=feed.baseline_generation
+          AND baseline.status='promoted'
+         WHERE feed.account_identity=$1 AND feed.consumer_name=$2`,
+        [accountIdentity, consumerName]
+      );
+      if (result.rows.length > 1) {
+        throw new Error('Verified inventory baseline proof is ambiguous.');
+      }
+      const row = result.rows[0];
+      if (!row?.baseline_generation) return null;
+      if (row.baseline_status !== 'promoted') {
+        throw new InventoryBaselineProofError('missing_promoted_run');
+      }
+      let meta: InventoryCacheMeta | null = null;
+      try {
+        const value = row.promoted_meta;
+        meta = parseInventoryCacheMeta(typeof value === 'string' ? JSON.parse(value) : value);
+      } catch {
+        meta = null;
+      }
+      if (
+        !meta ||
+        meta.version !== 2 ||
+        meta.status !== 'complete' ||
+        meta.warningCount !== 0 ||
+        meta.omittedItemCount !== 0 ||
+        meta.preservedItemCount !== 0 ||
+        meta.lastCompleteAt !== meta.completedAt ||
+        meta.accountIdentity !== row.account_identity ||
+        meta.generation !== row.baseline_generation ||
+        meta.schemaVersion !== CACHE_SCHEMA_VERSION
+      ) {
+        throw new InventoryBaselineProofError('invalid_promoted_meta');
+      }
+      return {
+        accountIdentity: row.account_identity,
+        ledgerDatabaseId: row.ledger_database_id,
+        consumerName: row.consumer_name,
+        baselineGeneration: row.baseline_generation,
+        meta,
+      };
     });
   }
 
@@ -1315,6 +1377,15 @@ interface FeedStateRow {
   highest_applied_event_seq: string | null;
   blocked_by_event_seq: string | null;
   updated_at: string | number;
+}
+
+interface VerifiedBaselineProofRow {
+  account_identity: string;
+  ledger_database_id: string;
+  consumer_name: string;
+  baseline_generation: string | null;
+  baseline_status: string | null;
+  promoted_meta: InventoryCacheMeta | string | null;
 }
 
 interface ReceiptRow {

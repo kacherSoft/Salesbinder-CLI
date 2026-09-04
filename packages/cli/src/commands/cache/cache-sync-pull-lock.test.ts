@@ -697,6 +697,7 @@ describe('PostgreSQL sync lock loss guard', () => {
 
 describe('cache sync --pull lock ordering', () => {
   const originalDatabaseUrl = process.env.SALESBINDER_DB_URL;
+  const originalChangeFeedDatabaseUrl = process.env.SALESBINDER_CHANGE_FEED_DB_URL;
   const originalExitCode = process.exitCode;
 
   beforeEach(() => {
@@ -704,6 +705,7 @@ describe('cache sync --pull lock ordering', () => {
       .requireActual<typeof import('fs')>('fs')
       .rmSync(mockHomeDirectory, { recursive: true, force: true });
     process.env.SALESBINDER_DB_URL = 'postgres://example.test/salesbinder';
+    delete process.env.SALESBINDER_CHANGE_FEED_DB_URL;
     process.exitCode = undefined;
     outerPgLockHeld = false;
     phaseOrder = [];
@@ -768,6 +770,9 @@ describe('cache sync --pull lock ordering', () => {
   afterAll(() => {
     if (originalDatabaseUrl === undefined) delete process.env.SALESBINDER_DB_URL;
     else process.env.SALESBINDER_DB_URL = originalDatabaseUrl;
+    if (originalChangeFeedDatabaseUrl === undefined)
+      delete process.env.SALESBINDER_CHANGE_FEED_DB_URL;
+    else process.env.SALESBINDER_CHANGE_FEED_DB_URL = originalChangeFeedDatabaseUrl;
     process.exitCode = originalExitCode;
     jest
       .requireActual<typeof import('fs')>('fs')
@@ -1275,7 +1280,7 @@ describe('cache sync --pull lock ordering', () => {
     expect(outerPgService.setPaymentSyncStatus).not.toHaveBeenCalled();
   });
 
-  it('rejects exact duplicate warnings instead of hiding them during final aggregation', async () => {
+  it('deduplicates item warnings during final aggregation', async () => {
     const duplicate = {
       resource: 'item',
       id: 'item-duplicate',
@@ -1288,13 +1293,22 @@ describe('cache sync --pull lock ordering', () => {
 
     await runExplicitPull();
 
-    expect(process.exitCode).toBe(1);
-    expect(pullFromPostgres).not.toHaveBeenCalled();
-    expect(console.log).not.toHaveBeenCalled();
+    expect(process.exitCode).toBeUndefined();
+    expect(pullFromPostgres).toHaveBeenCalledTimes(1);
+    expect(console.log).toHaveBeenCalledTimes(1);
+    const output = JSON.parse((console.log as jest.Mock).mock.calls[0][0]) as {
+      failed_items: Array<{ id: string; message: string }>;
+    };
+    expect(output.failed_items).toEqual([
+      { ...duplicate, message: 'Item unavailable during refresh' },
+    ]);
     expect(outerPgService.setSyncStatus).toHaveBeenLastCalledWith(
-      expect.objectContaining({ status: 'failed', error: 'Cache sync failed.' })
+      expect.objectContaining({
+        status: 'success_with_warnings',
+        recordIssues: [{ ...duplicate, message: 'Item unavailable during refresh' }],
+      })
     );
-    expect(JSON.stringify((console.error as jest.Mock).mock.calls)).toContain('Cache sync failed.');
+    expect(console.error).not.toHaveBeenCalledWith(expect.stringContaining('Cache sync failed.'));
     expect(JSON.stringify((console.error as jest.Mock).mock.calls)).not.toMatch(
       /duplicate-secret|private\.example|Authorization/
     );

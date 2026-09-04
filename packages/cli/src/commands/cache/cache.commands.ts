@@ -1151,6 +1151,11 @@ function collectSyncRecordIssues(...results: object[]): SyncRecordIssue[] {
       const key = `${issue.resource}:${issue.id}`;
       const previous = unique.get(key);
       if (previous) {
+        const merged = mergeDuplicateSyncRecordIssue(previous, issue);
+        if (merged) {
+          unique.set(key, merged);
+          continue;
+        }
         if (JSON.stringify(previous) !== JSON.stringify(issue)) {
           throw new Error(`Cache indexer returned conflicting warnings for ${key}.`);
         }
@@ -1165,6 +1170,35 @@ function collectSyncRecordIssues(...results: object[]): SyncRecordIssue[] {
       (left.context_id ?? -1) - (right.context_id ?? -1) ||
       compareUtf16CodeUnits(left.id, right.id)
   );
+}
+
+function mergeDuplicateSyncRecordIssue(
+  previous: SyncRecordIssue,
+  next: SyncRecordIssue
+): SyncRecordIssue | null {
+  if (previous.resource !== 'item' || next.resource !== 'item') return null;
+  return compareItemRecordIssueSeverity(next, previous) < 0 ? next : previous;
+}
+
+function compareItemRecordIssueSeverity(
+  left: Extract<SyncRecordIssue, { resource: 'item' }>,
+  right: Extract<SyncRecordIssue, { resource: 'item' }>
+): number {
+  return (
+    itemOutcomePriority(right.outcome) - itemOutcomePriority(left.outcome) ||
+    itemIssueCodePriority(right.code) - itemIssueCodePriority(left.code) ||
+    compareUtf16CodeUnits(left.message, right.message)
+  );
+}
+
+function itemOutcomePriority(outcome: SyncRecordIssue['outcome']): number {
+  return outcome === 'preserved_last_known_good' ? 1 : 0;
+}
+
+function itemIssueCodePriority(
+  code: Extract<SyncRecordIssue, { resource: 'item' }>['code']
+): number {
+  return { not_found: 0, content_changed: 1, invalid_variations: 2, invalid_record: 3 }[code];
 }
 
 function reconcileDeletedDocumentWarnings(

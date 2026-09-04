@@ -9,8 +9,7 @@ export interface InventoryChangeFeedIssue {
   attempts?: number;
 }
 
-const CANONICAL_UUID =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MAX_REASON_LENGTH = 200;
 const PRIVATE_DETAIL =
   /(?:https?:\/\/|postgres(?:ql)?:\/\/|authorization\b|bearer\b|password\b|api[-_ ]?key\b|token\b|secret\b|private[-_ ]?key\b|stack\b|\{[^}]*\}|\[[^\]]*\])/i;
@@ -28,17 +27,35 @@ export function formatInventoryChangeFeedIssues(
   if (!Array.isArray(issues)) {
     throw new Error('Inventory change-feed issues must be an array.');
   }
-  const projected = issues.map(projectIssue).sort(compareIssues);
-  return projected.filter((issue, index) => projected[index - 1]?.itemId !== issue.itemId);
+  const byItemId = new Map<string, InventoryChangeFeedIssue>();
+  for (const issue of issues.map(projectIssue)) {
+    const previous = byItemId.get(issue.itemId);
+    if (!previous || compareIssueSeverity(issue, previous) < 0) {
+      byItemId.set(issue.itemId, issue);
+    }
+  }
+  return [...byItemId.values()].sort(compareIssues);
 }
 
 function compareIssues(left: InventoryChangeFeedIssue, right: InventoryChangeFeedIssue): number {
   return (
     compareText(left.itemId, right.itemId) ||
-    compareEventSequences(left.eventSeq, right.eventSeq) ||
     issueStatePriority(right.state) - issueStatePriority(left.state) ||
+    compareEventSequences(right.eventSeq, left.eventSeq) ||
     compareText(left.reason, right.reason) ||
     (right.attempts ?? 0) - (left.attempts ?? 0)
+  );
+}
+
+function compareIssueSeverity(
+  left: InventoryChangeFeedIssue,
+  right: InventoryChangeFeedIssue
+): number {
+  return (
+    issueStatePriority(right.state) - issueStatePriority(left.state) ||
+    compareEventSequences(right.eventSeq, left.eventSeq) ||
+    (right.attempts ?? 0) - (left.attempts ?? 0) ||
+    compareText(left.reason, right.reason)
   );
 }
 

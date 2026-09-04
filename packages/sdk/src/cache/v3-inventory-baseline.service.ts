@@ -1,19 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import type { CacheService } from './cache.interface.js';
 import type { InventoryChangeFeedCache } from './change-feed-cache.interface.js';
-import type {
-  CacheSyncProgress,
-  CacheSyncProgressCallback,
-} from './cache-sync-progress.types.js';
+import type { CacheSyncProgress, CacheSyncProgressCallback } from './cache-sync-progress.types.js';
 import type {
   ActiveChangeFeedSyncRunStatus,
   ChangeFeedRepository,
   ChangeFeedSyncKind,
 } from '../change-feed/change-feed.types.js';
-import type {
-  InventoryBaselineRun,
-  InventoryChangeFeedBinding,
-} from './types.js';
+import type { InventoryBaselineRun, InventoryChangeFeedBinding } from './types.js';
 import { CACHE_SCHEMA_VERSION, createInventoryBaselineRootFingerprint } from './types.js';
 import type { V3ExactItemHydratorClient } from './v3-exact-item-hydrator.service.js';
 import {
@@ -34,6 +28,7 @@ import {
 } from './v3-inventory-root-discovery.js';
 
 const DEFAULT_LEDGER_LOCK_TIMEOUT_MS = 5_000;
+const DEFAULT_STALE_ROOT_REFRESH_LIMIT = 1;
 
 type BaselineCache = CacheService & InventoryChangeFeedCache;
 
@@ -101,8 +96,7 @@ export class V3InventoryBaselineService {
       dependencies.rootDiscovery ?? new V3InventoryRootDiscovery(dependencies.client);
     this.now = dependencies.now ?? nowSeconds;
     this.createGeneration = dependencies.createGeneration ?? randomUUID;
-    this.ledgerLockTimeoutMs =
-      dependencies.ledgerLockTimeoutMs ?? DEFAULT_LEDGER_LOCK_TIMEOUT_MS;
+    this.ledgerLockTimeoutMs = dependencies.ledgerLockTimeoutMs ?? DEFAULT_LEDGER_LOCK_TIMEOUT_MS;
     const guarded = <T>(operation: () => Promise<T>) => this.checkedBoundary(operation);
     this.hydration = new V3InventoryBaselineHydration(
       dependencies.client,
@@ -135,74 +129,108 @@ export class V3InventoryBaselineService {
     await this.assertCacheSchema();
     await this.cacheBoundary(() => this.dependencies.cache.ensureInventoryChangeFeedState(binding));
 
-    const barrier = await this.beginOrResumeLedgerRun();
-    const startEventSeq = normalizeBarrier(barrier.eventSeq);
-    this.emit('phase_started', 0, null);
-    let run = await this.cacheBoundary(() =>
-      this.dependencies.cache.getInventoryBaselineRun(binding, barrier.syncRunId)
-    );
-    if (!run) run = await this.beginCacheRun(binding, barrier, startEventSeq);
-    assertRunMatches(run, binding, barrier.syncRunId, startEventSeq);
-    if (barrier.status !== 'running' && barrier.status !== 'new' && run.status !== 'promoted') {
-      throw new Error('Ledger baseline state is ahead of the cache baseline receipt');
-    }
-
-    if (run.status === 'active') {
-      const categorySnapshot = await this.cacheBoundary(() =>
-        this.dependencies.cache.getCategorySnapshot()
+    let staleRootRefreshes = 0;
+    for (;;) {
+      const barrier = await this.beginOrResumeLedgerRun();
+      const startEventSeq = normalizeBarrier(barrier.eventSeq);
+      this.emit('phase_started', 0, null);
+      let run = await this.cacheBoundary(() =>
+        this.dependencies.cache.getInventoryBaselineRun(binding, barrier.syncRunId)
       );
-      const categoryNames = categorySnapshot
-        ? new Map(categorySnapshot.rows.map((row) => [row.category_id, row.name]))
-        : null;
-      const warnings = await this.hydration.hydratePending(run, binding, categoryNames);
-      if (warnings.length > 0) {
-        this.emit(
-          'phase_completed',
-          run.expectedItemCount - warnings.length,
-          run.expectedItemCount
-        );
-        return warningResult(run, warnings);
+      if (!run) run = await this.beginCacheRun(binding, barrier, startEventSeq);
+      assertRunMatches(run, binding, barrier.syncRunId, startEventSeq);
+      if (barrier.status !== 'running' && barrier.status !== 'new' && run.status !== 'promoted') {
+        throw new Error('Ledger baseline state is ahead of the cache baseline receipt');
       }
-    }
 
-    const promotion = await this.cacheBoundary(() =>
-      this.dependencies.cache.promoteInventoryBaselineRun({
-        ...binding,
-        runId: run.runId,
-        promotedAt: this.now(),
-      })
-    );
-    const cutover = await this.cutover.complete(binding, promotion.run, promotion, {
-      targetCaptured: barrier.status === 'replaying',
-      targetEventSeq: barrier.cutoverTargetEventSeq,
-      baselineReceiptId: barrier.baselineReceiptId,
-      baselineCacheGeneration: barrier.baselineCacheGeneration,
-    });
-    if (!cutover.ledgerPromoted) {
-      this.emit('blocker_observed', promotion.meta.itemCount, promotion.meta.itemCount, {
-        targetEventSeq: normalizeBarrier(cutover.targetEventSeq),
-        observedThroughEventSeq: cutover.replay.observedThroughEventSeq ?? undefined,
-        appliedThroughEventSeq: cutover.replay.appliedThroughEventSeq ?? undefined,
-        blockedByEventSeq: cutover.replay.blockedByEventSeq,
+      if (run.status === 'active') {
+        const categorySnapshot = await this.cacheBoundary(() =>
+          this.dependencies.cache.getCategorySnapshot()
+        );
+        const categoryNames = categorySnapshot
+          ? new Map(categorySnapshot.rows.map((row) => [row.category_id, row.name]))
+          : null;
+        const warnings = await this.hydration.hydratePending(run, binding, categoryNames);
+        if (warnings.length > 0) {
+          this.emit(
+            'phase_completed',
+            run.expectedItemCount - warnings.length,
+            run.expectedItemCount
+          );
+          if (
+            staleRootRefreshes < DEFAULT_STALE_ROOT_REFRESH_LIMIT &&
+            (await this.shouldRefreshStaleRoot(run, binding, warnings))
+          ) {
+            staleRootRefreshes++;
+            await this.cacheBoundary(() =>
+              this.dependencies.cache.deleteInventoryBaselineRun(binding, run.runId)
+            );
+            this.emit('checkpoint_saved', 0, null);
+            continue;
+          }
+          return warningResult(run, warnings);
+        }
+      }
+
+      const promotion = await this.cacheBoundary(() =>
+        this.dependencies.cache.promoteInventoryBaselineRun({
+          ...binding,
+          runId: run.runId,
+          promotedAt: this.now(),
+        })
+      );
+      const cutover = await this.cutover.complete(binding, promotion.run, promotion, {
+        targetCaptured: barrier.status === 'replaying',
+        targetEventSeq: barrier.cutoverTargetEventSeq,
+        baselineReceiptId: barrier.baselineReceiptId,
+        baselineCacheGeneration: barrier.baselineCacheGeneration,
       });
-    }
-    this.emit('phase_completed', promotion.meta.itemCount, promotion.meta.itemCount, {
-      targetEventSeq: normalizeBarrier(cutover.targetEventSeq),
-    });
+      if (!cutover.ledgerPromoted) {
+        this.emit('blocker_observed', promotion.meta.itemCount, promotion.meta.itemCount, {
+          targetEventSeq: normalizeBarrier(cutover.targetEventSeq),
+          observedThroughEventSeq: cutover.replay.observedThroughEventSeq ?? undefined,
+          appliedThroughEventSeq: cutover.replay.appliedThroughEventSeq ?? undefined,
+          blockedByEventSeq: cutover.replay.blockedByEventSeq,
+        });
+      }
+      this.emit('phase_completed', promotion.meta.itemCount, promotion.meta.itemCount, {
+        targetEventSeq: normalizeBarrier(cutover.targetEventSeq),
+      });
 
-    return {
-      status: cutover.ledgerPromoted ? 'success' : 'success_with_warnings',
-      syncRunId: run.runId,
-      generation: promotion.meta.generation,
-      startEventSeq,
-      targetEventSeq: cutover.targetEventSeq,
-      itemsProcessed: promotion.meta.itemCount,
-      stockRowsProcessed: promotion.meta.stockRowCount,
-      warnings: [],
-      replayIssues: cutover.replay.issues,
-      baselinePromoted: true,
-      ledgerPromoted: cutover.ledgerPromoted,
-    };
+      return {
+        status: cutover.ledgerPromoted ? 'success' : 'success_with_warnings',
+        syncRunId: run.runId,
+        generation: promotion.meta.generation,
+        startEventSeq,
+        targetEventSeq: cutover.targetEventSeq,
+        itemsProcessed: promotion.meta.itemCount,
+        stockRowsProcessed: promotion.meta.stockRowCount,
+        warnings: [],
+        replayIssues: cutover.replay.issues,
+        baselinePromoted: true,
+        ledgerPromoted: cutover.ledgerPromoted,
+      };
+    }
+  }
+
+  private async shouldRefreshStaleRoot(
+    run: InventoryBaselineRun,
+    binding: InventoryChangeFeedBinding,
+    warnings: V3InventoryBaselineWarning[]
+  ): Promise<boolean> {
+    if (warnings.length === 0 || warnings.some((warning) => warning.code !== 'not_found')) {
+      return false;
+    }
+    const missingIds = new Set(warnings.map((warning) => warning.id));
+    const refreshed = await this.rootDiscovery.discover({
+      accountIdentity: binding.accountIdentity,
+      signal: this.dependencies.signal,
+      assertWriterLockHeld: this.dependencies.assertWriterLockHeld,
+    });
+    return (
+      refreshed.fingerprint !== run.rootFingerprint &&
+      [...missingIds].every((itemId) => !refreshed.itemIds.includes(itemId))
+    );
   }
 
   private async beginOrResumeLedgerRun(): Promise<LedgerRunBarrier> {

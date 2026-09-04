@@ -33,6 +33,7 @@ import type {
   InventoryStagingFailure,
   InventoryStagingProgress,
   InventoryTombstoneApplication,
+  InventoryVerifiedBaselineProof,
   ItemDocumentRow,
   ItemRow,
   ItemSalesByPeriodRow,
@@ -1517,6 +1518,20 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
       throw new Error('Inventory change-feed account does not match the PostgreSQL cache binding.');
     }
     return this.changeFeedStore().getInventoryChangeFeedStateByConsumer(
+      accountIdentity,
+      consumerName
+    );
+  }
+
+  async getVerifiedInventoryBaselineProofByConsumer(
+    accountIdentity: string,
+    consumerName: string
+  ): Promise<InventoryVerifiedBaselineProof | null> {
+    const expected = this.requireExpectedBinding();
+    if (accountIdentity !== expected.accountIdentity) {
+      throw new Error('Inventory baseline account does not match the PostgreSQL cache binding.');
+    }
+    return this.changeFeedStore().getVerifiedInventoryBaselineProofByConsumer(
       accountIdentity,
       consumerName
     );

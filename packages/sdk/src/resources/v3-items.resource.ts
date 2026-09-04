@@ -35,10 +35,11 @@ export class V3ItemsResource {
   async getMany(ids: readonly string[]): Promise<V3ItemGetManyResult> {
     validateExactItemIds(ids);
 
-    const response = await this.list({ ids, archived: 'all' });
+    const response = await this.list({ page: 1, limit: ids.length, ids, archived: 'all' });
     if (
       response.has_more ||
       response.pagination.page !== 1 ||
+      response.pagination.per_page !== ids.length ||
       response.pagination.total_pages > 1 ||
       response.pagination.total_records !== response.data.length
     ) {

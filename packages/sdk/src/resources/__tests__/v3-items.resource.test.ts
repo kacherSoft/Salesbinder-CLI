@@ -55,30 +55,36 @@ describe('V3ItemsResource', () => {
     expect(get).toHaveBeenCalledWith('/items/item-1');
   });
 
-  it.each([1, 50])('serializes %i exact item IDs in one archived v3 request', async (count) => {
-    const ids = Array.from({ length: count }, (_, index) => canonicalId(index + 1));
-    const get = jest.fn().mockResolvedValue({
-      data: listEnvelope(
-        ids.map((id) => v3Item(id)),
-        '/api/v3/items'
-      ),
-    });
-    const resource = createResource(get);
+  it.each([1, 21, 50])(
+    'serializes %i exact item IDs in one explicitly bounded archived v3 request',
+    async (count) => {
+      const ids = Array.from({ length: count }, (_, index) => canonicalId(index + 1));
+      const get = jest.fn().mockResolvedValue({
+        data: listEnvelope(
+          ids.map((id) => v3Item(id)),
+          '/api/v3/items',
+          { per_page: count }
+        ),
+      });
+      const resource = createResource(get);
 
-    const result = await resource.getMany(ids);
+      const result = await resource.getMany(ids);
 
-    expect(result.items.map(({ id }) => id)).toEqual(ids);
-    expect(result.omittedIds).toEqual([]);
-    expect(get).toHaveBeenCalledTimes(1);
-    expect(get).toHaveBeenCalledWith('/items', {
-      params: { ids: ids.join(','), archived: 'all' },
-    });
-  });
+      expect(result.items.map(({ id }) => id)).toEqual(ids);
+      expect(result.omittedIds).toEqual([]);
+      expect(get).toHaveBeenCalledTimes(1);
+      expect(get).toHaveBeenCalledWith('/items', {
+        params: { page: 1, limit: count, ids: ids.join(','), archived: 'all' },
+      });
+    }
+  );
 
   it('preserves caller order when the exact-ID response returns items in a different order', async () => {
     const ids = [canonicalId(1), canonicalId(2), canonicalId(3)];
     const get = jest.fn().mockResolvedValue({
-      data: listEnvelope([v3Item(ids[2]), v3Item(ids[0]), v3Item(ids[1])], '/api/v3/items'),
+      data: listEnvelope([v3Item(ids[2]), v3Item(ids[0]), v3Item(ids[1])], '/api/v3/items', {
+        per_page: ids.length,
+      }),
     });
     const resource = createResource(get);
 
@@ -91,7 +97,7 @@ describe('V3ItemsResource', () => {
   it('reports omitted exact IDs without issuing a fallback lookup', async () => {
     const ids = [canonicalId(1), canonicalId(2), canonicalId(3)];
     const get = jest.fn().mockResolvedValue({
-      data: listEnvelope([v3Item(ids[1])], '/api/v3/items'),
+      data: listEnvelope([v3Item(ids[1])], '/api/v3/items', { per_page: ids.length }),
     });
     const resource = createResource(get);
 
@@ -101,14 +107,14 @@ describe('V3ItemsResource', () => {
     expect(result.omittedIds).toEqual([ids[0], ids[2]]);
     expect(get).toHaveBeenCalledTimes(1);
     expect(get).toHaveBeenCalledWith('/items', {
-      params: { ids: ids.join(','), archived: 'all' },
+      params: { page: 1, limit: ids.length, ids: ids.join(','), archived: 'all' },
     });
   });
 
   it('passes through archived exact-ID results', async () => {
     const id = canonicalId(1);
     const get = jest.fn().mockResolvedValue({
-      data: listEnvelope([v3Item(id, { archived: true })], '/api/v3/items'),
+      data: listEnvelope([v3Item(id, { archived: true })], '/api/v3/items', { per_page: 1 }),
     });
     const resource = createResource(get);
 
@@ -142,19 +148,20 @@ describe('V3ItemsResource', () => {
 
   it('rejects unexpected exact-ID response identities', async () => {
     const get = jest.fn().mockResolvedValue({
-      data: listEnvelope([v3Item(canonicalId(2))], '/api/v3/items'),
+      data: listEnvelope([v3Item(canonicalId(2))], '/api/v3/items', { per_page: 1 }),
     });
     const resource = createResource(get);
 
-    await expect(resource.getMany([canonicalId(1)])).rejects.toThrow(
-      ApiResponseValidationError
-    );
+    await expect(resource.getMany([canonicalId(1)])).rejects.toThrow(ApiResponseValidationError);
   });
 
   it('rejects duplicate exact-ID response identities', async () => {
     const id = canonicalId(1);
     const get = jest.fn().mockResolvedValue({
-      data: listEnvelope([v3Item(id), v3Item(id)], '/api/v3/items'),
+      data: listEnvelope([v3Item(id), v3Item(id)], '/api/v3/items', {
+        per_page: 1,
+        total_records: 2,
+      }),
     });
     const resource = createResource(get);
 
@@ -174,11 +181,30 @@ describe('V3ItemsResource', () => {
     },
   ])('rejects $label in exact-ID responses', async ({ data, message }) => {
     const get = jest.fn().mockResolvedValue({
-      data: listEnvelope(data, '/api/v3/items'),
+      data: listEnvelope(data, '/api/v3/items', { per_page: 1 }),
     });
     const resource = createResource(get);
 
     await expect(resource.getMany([canonicalId(1)])).rejects.toThrow(message);
+  });
+
+  it.each([
+    { label: 'a continuation flag', pagination: {}, hasMore: true },
+    { label: 'a later page', pagination: { page: 2 }, hasMore: false },
+    { label: 'multiple pages', pagination: { total_pages: 2 }, hasMore: false },
+    { label: 'a server page-size override', pagination: { per_page: 20 }, hasMore: false },
+    { label: 'an inconsistent total', pagination: { total_records: 2 }, hasMore: false },
+  ])('rejects an exact-ID response with $label', async ({ pagination, hasMore }) => {
+    const ids = [canonicalId(1), canonicalId(2), canonicalId(3)];
+    const response = listEnvelope([v3Item(ids[0])], '/api/v3/items', {
+      per_page: ids.length,
+      ...pagination,
+    });
+    const resource = createResource(
+      jest.fn().mockResolvedValue({ data: { ...response, has_more: hasMore } })
+    );
+
+    await expect(resource.getMany(ids)).rejects.toThrow('expected one complete result page');
   });
 
   it('lists variations with locations and preserves the location row id', async () => {
@@ -276,13 +302,28 @@ function createResource(get: jest.Mock): V3ItemsResource {
   return new V3ItemsResource({ get } as unknown as AxiosInstance);
 }
 
-function listEnvelope(data: unknown[], url: string) {
+function listEnvelope(
+  data: unknown[],
+  url: string,
+  pagination: Partial<{
+    page: number;
+    per_page: number;
+    total_pages: number;
+    total_records: number;
+  }> = {}
+) {
   return {
     object: 'list',
     url,
     has_more: false,
     data,
-    pagination: { page: 1, per_page: 100, total_pages: 1, total_records: data.length },
+    pagination: {
+      page: 1,
+      per_page: 100,
+      total_pages: 1,
+      total_records: data.length,
+      ...pagination,
+    },
   };
 }
 

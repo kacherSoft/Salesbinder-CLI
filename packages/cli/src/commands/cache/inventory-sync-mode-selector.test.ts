@@ -5,6 +5,7 @@ import type {
 import type {
   InventoryCacheMeta,
   InventoryChangeFeedState,
+  InventoryVerifiedBaselineProof,
 } from '../../../../sdk/src/cache/types.js';
 import type { ChangeFeedConfig } from './change-feed-config.js';
 import {
@@ -71,13 +72,20 @@ describe('selectInventorySyncMode', () => {
       selectInventorySyncMode(input({ cacheSchemaVersion: CACHE_SCHEMA_VERSION - 1 })),
       'cache_schema_mismatch'
     );
-    expectFatal(selectInventorySyncMode(input({ ledgerPreflight: null })), 'ledger_preflight_required');
+    expectFatal(
+      selectInventorySyncMode(input({ ledgerPreflight: null })),
+      'ledger_preflight_required'
+    );
   });
 
   it.each([
     ['contract version', { contractVersion: 1 }, 'ledger_schema_mismatch'],
     ['event type prefix', { eventTypePrefix: 'stock.' }, 'ledger_schema_mismatch'],
-    ['missing subscribed type', { subscribedEventTypes: INVENTORY_CHANGE_FEED_EVENT_TYPES.slice(1) }, 'ledger_schema_mismatch'],
+    [
+      'missing subscribed type',
+      { subscribedEventTypes: INVENTORY_CHANGE_FEED_EVENT_TYPES.slice(1) },
+      'ledger_schema_mismatch',
+    ],
     [
       'duplicate subscribed type replacing one required type',
       {
@@ -145,7 +153,9 @@ describe('selectInventorySyncMode', () => {
     );
     expectFatal(
       selectInventorySyncMode(
-        input({ feedBinding: feedState({ ledgerDatabaseId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' }) })
+        input({
+          feedBinding: feedState({ ledgerDatabaseId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' }),
+        })
       ),
       'ledger_binding_mismatch'
     );
@@ -153,22 +163,55 @@ describe('selectInventorySyncMode', () => {
       selectInventorySyncMode(input({ feedConfig: config('other-consumer') })),
       'consumer_binding_mismatch'
     );
+    expectFatal(
+      selectInventorySyncMode(
+        input({ baselineProof: baselineProof({}, { accountIdentity: 'other-account' }) })
+      ),
+      'account_binding_mismatch'
+    );
+    expectFatal(
+      selectInventorySyncMode(
+        input({ baselineProof: baselineProof({}, { consumerName: 'other-consumer' }) })
+      ),
+      'consumer_binding_mismatch'
+    );
+    expectFatal(
+      selectInventorySyncMode(
+        input({
+          baselineProof: baselineProof(
+            {},
+            { ledgerDatabaseId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' }
+          ),
+        })
+      ),
+      'ledger_binding_mismatch'
+    );
+    expectFatal(
+      selectInventorySyncMode(
+        input({
+          baselineProof: baselineProof({}, { baselineGeneration: 'different-generation' }),
+        })
+      ),
+      'verified_baseline_mismatch'
+    );
   });
 
   it('starts or resumes baseline and replay work from active ledger runs', () => {
-    expect(selectInventorySyncMode(input({ activeRun: activeRun({ status: 'running' }) }))).toEqual({
-      kind: 'selected',
-      mode: 'baseline_resume',
-      runKind: 'initial_full_sync',
-      syncRunId: SYNC_RUN_ID,
-      baselineGeneration: null,
-    });
+    expect(selectInventorySyncMode(input({ activeRun: activeRun({ status: 'running' }) }))).toEqual(
+      {
+        kind: 'selected',
+        mode: 'baseline_resume',
+        runKind: 'initial_full_sync',
+        syncRunId: SYNC_RUN_ID,
+        baselineGeneration: null,
+      }
+    );
 
     expect(
       selectInventorySyncMode(
         input({
           feedBinding: feedState({ baselineGeneration: BASELINE_GENERATION }),
-          baseline: baseline(),
+          baselineProof: baselineProof(),
           activeRun: activeRun({
             status: 'baseline_succeeded',
             baselineCacheGeneration: BASELINE_GENERATION,
@@ -187,7 +230,7 @@ describe('selectInventorySyncMode', () => {
       selectInventorySyncMode(
         input({
           feedBinding: feedState({ baselineGeneration: BASELINE_GENERATION }),
-          baseline: baseline(),
+          baselineProof: baselineProof(),
           activeRun: activeRun({
             runKind: 'reconciliation',
             status: 'replaying',
@@ -204,7 +247,9 @@ describe('selectInventorySyncMode', () => {
 
   it('rejects active runs with incompatible bindings or unverified replay baselines', () => {
     expectFatal(
-      selectInventorySyncMode(input({ activeRun: activeRun({ accountIdentity: 'other-account' }) })),
+      selectInventorySyncMode(
+        input({ activeRun: activeRun({ accountIdentity: 'other-account' }) })
+      ),
       'account_binding_mismatch'
     );
     expectFatal(
@@ -221,7 +266,7 @@ describe('selectInventorySyncMode', () => {
       selectInventorySyncMode(
         input({
           feedBinding: feedState({ baselineGeneration: BASELINE_GENERATION }),
-          baseline: baseline({ generation: 'different-generation' }),
+          baselineProof: baselineProof({ generation: 'different-generation' }),
           activeRun: activeRun({
             status: 'baseline_succeeded',
             baselineCacheGeneration: BASELINE_GENERATION,
@@ -243,7 +288,7 @@ describe('selectInventorySyncMode', () => {
       selectInventorySyncMode(
         input({
           feedBinding: feedState({ baselineGeneration: BASELINE_GENERATION }),
-          baseline: baseline(),
+          baselineProof: baselineProof(),
         })
       )
     ).toEqual({
@@ -263,6 +308,23 @@ describe('selectInventorySyncMode', () => {
     });
   });
 
+  it('keeps a feed-backed cache incremental after live rows diverge from the baseline snapshot', () => {
+    const selectorInput = {
+      ...input({
+        feedBinding: feedState({ baselineGeneration: BASELINE_GENERATION }),
+      }),
+      baselineProof: baselineProof(),
+    } as InventorySyncModeSelectorInput;
+
+    expect(selectInventorySyncMode(selectorInput)).toEqual({
+      kind: 'selected',
+      mode: 'incremental',
+      runKind: null,
+      syncRunId: null,
+      baselineGeneration: BASELINE_GENERATION,
+    });
+  });
+
   it.each([
     ['warning baseline', { warningCount: 1, status: 'complete_with_warnings' }],
     ['omitted baseline', { omittedItemCount: 1 }],
@@ -274,21 +336,23 @@ describe('selectInventorySyncMode', () => {
       selectInventorySyncMode(
         input({
           feedBinding: feedState({ baselineGeneration: BASELINE_GENERATION }),
-          baseline: baseline(baselineOverrides as Partial<InventoryCacheMeta>),
+          baselineProof: baselineProof(baselineOverrides as Partial<InventoryCacheMeta>),
         })
       )
     ).toMatchObject({ kind: 'selected', mode: 'baseline_start', runKind: 'initial_full_sync' });
   });
 });
 
-function input(overrides: Partial<InventorySyncModeSelectorInput> = {}): InventorySyncModeSelectorInput {
+function input(
+  overrides: Partial<InventorySyncModeSelectorInput> = {}
+): InventorySyncModeSelectorInput {
   return {
     backend: 'postgresql',
     feedConfig: config(),
     accountIdentity: ACCOUNT,
     cacheSchemaVersion: CACHE_SCHEMA_VERSION,
     feedBinding: null,
-    baseline: null,
+    baselineProof: null,
     ledgerPreflight: preflight(),
     activeRun: null,
     forceFull: false,
@@ -303,7 +367,9 @@ function config(consumerName: string = SALESBINDER_CLI_INVENTORY_CONSUMER): Chan
   };
 }
 
-function preflight(overrides: Partial<ChangeFeedContractPreflight> = {}): ChangeFeedContractPreflight {
+function preflight(
+  overrides: Partial<ChangeFeedContractPreflight> = {}
+): ChangeFeedContractPreflight {
   return {
     contractVersion: 2,
     ledgerDatabaseId: LEDGER_ID,
@@ -350,6 +416,20 @@ function baseline(overrides: Partial<InventoryCacheMeta> = {}): InventoryCacheMe
     lastCompleteAt: 1_000,
     ...overrides,
   } as InventoryCacheMeta;
+}
+
+function baselineProof(
+  metaOverrides: Partial<InventoryCacheMeta> = {},
+  proofOverrides: Partial<InventoryVerifiedBaselineProof> = {}
+): InventoryVerifiedBaselineProof {
+  return {
+    accountIdentity: ACCOUNT,
+    ledgerDatabaseId: LEDGER_ID,
+    consumerName: SALESBINDER_CLI_INVENTORY_CONSUMER,
+    baselineGeneration: BASELINE_GENERATION,
+    meta: baseline(metaOverrides),
+    ...proofOverrides,
+  };
 }
 
 function activeRun(overrides: Partial<ActiveChangeFeedSyncRun> = {}): ActiveChangeFeedSyncRun {

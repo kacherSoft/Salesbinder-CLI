@@ -13,6 +13,7 @@ import {
   type InventoryChangeFeedCache,
   type InventoryChangeFeedState,
   type InventoryChangeFeedSyncIssue,
+  type InventoryVerifiedBaselineProof,
   type SyncRecordIssue,
   type V3InventoryBaselineClient,
   type V3InventoryClient,
@@ -97,16 +98,32 @@ export async function prepareInventorySync(input: {
       preflight = await guarded(input.assertWriterLockHeld, () => activeLedger.preflight());
       activeRun = await guarded(input.assertWriterLockHeld, () => activeLedger.getActiveSyncRun());
     }
-    const baseline = await guarded(input.assertWriterLockHeld, () =>
-      input.cache.getInventoryCacheMeta()
-    );
+    let baselineProof: InventoryVerifiedBaselineProof | null = null;
+    try {
+      baselineProof = feedCache
+        ? await guarded(input.assertWriterLockHeld, () =>
+            feedCache.getVerifiedInventoryBaselineProofByConsumer(
+              input.accountIdentity,
+              SALESBINDER_CLI_INVENTORY_CONSUMER
+            )
+          )
+        : null;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'InventoryBaselineProofError') {
+        throw new InventorySyncModeError(
+          'verified_baseline_mismatch',
+          'Verified inventory baseline proof is invalid.'
+        );
+      }
+      throw error;
+    }
     const selection = selectInventorySyncMode({
       backend: input.backend,
       feedConfig: config,
       accountIdentity: input.accountIdentity,
       cacheSchemaVersion: cacheState?.schemaVersion ?? CACHE_SCHEMA_VERSION,
       feedBinding: feedState,
-      baseline,
+      baselineProof,
       ledgerPreflight: preflight,
       activeRun,
       forceFull: input.forceFull,
@@ -341,8 +358,9 @@ function requireFeedCache(cache: CacheService): FeedCache {
 }
 
 function asFeedCache(cache: CacheService): FeedCache | null {
-  const candidate = cache as Partial<InventoryChangeFeedCache>;
+  const candidate = cache as Partial<FeedCache>;
   return typeof candidate.getInventoryChangeFeedStateByConsumer === 'function' &&
+    typeof candidate.getVerifiedInventoryBaselineProofByConsumer === 'function' &&
     typeof candidate.applyInventoryItemBundle === 'function' &&
     typeof candidate.promoteInventoryBaselineRun === 'function'
     ? (cache as FeedCache)

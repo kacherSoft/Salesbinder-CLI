@@ -6,6 +6,7 @@ import type {
   InventoryChangeFeedBinding,
   InventoryChangeFeedState,
   InventoryChangeFeedStateUpdate,
+  InventoryVerifiedBaselineProof,
   InventoryEventReceipt,
   InventoryEventSequence,
   InventoryItemBundleApplication,
@@ -29,6 +30,10 @@ export interface InventoryChangeFeedCache {
     accountIdentity: string,
     consumerName: string
   ): Promise<InventoryChangeFeedState | null>;
+  getVerifiedInventoryBaselineProofByConsumer(
+    accountIdentity: string,
+    consumerName: string
+  ): Promise<InventoryVerifiedBaselineProof | null>;
   updateInventoryChangeFeedState(
     update: InventoryChangeFeedStateUpdate
   ): Promise<InventoryChangeFeedState>;
