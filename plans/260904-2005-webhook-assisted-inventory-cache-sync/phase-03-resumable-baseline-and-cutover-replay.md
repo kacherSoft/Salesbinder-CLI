@@ -1,7 +1,7 @@
 ---
 phase: 3
 title: 'Resumable Baseline and Cutover Replay'
-status: pending
+status: implemented
 priority: P1
 effort: '2.5d'
 dependencies: [1, 2]
@@ -90,11 +90,11 @@ acquire cache lock
 
 ## Todo
 
-- [ ] Split root stability from detail hydration.
-- [ ] Add DB-backed item checkpoint/staging.
-- [ ] Add clean-only baseline promotion and receipt.
-- [ ] Add start/target barrier replay.
-- [ ] Add safe reset/resume semantics.
+- [x] Split root stability from detail hydration.
+- [x] Add DB-backed item checkpoint/staging.
+- [x] Add clean-only baseline promotion and receipt.
+- [x] Add start/target barrier replay.
+- [x] Add safe reset/resume semantics.
 
 ## Success Criteria
 

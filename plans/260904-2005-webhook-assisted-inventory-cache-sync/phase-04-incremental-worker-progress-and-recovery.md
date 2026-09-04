@@ -1,7 +1,7 @@
 ---
 phase: 4
 title: 'Incremental Worker, Progress and Recovery'
-status: pending
+status: implemented
 priority: P1
 effort: '2d'
 dependencies: [1, 2, 3]
@@ -85,11 +85,11 @@ Omitted IDs on create/update/low-stock are retryable/blocked, never deletion. Un
 
 ## Todo
 
-- [ ] Add ledger repository and config preflight.
-- [ ] Add deterministic incremental/replay engine.
-- [ ] Add coalescing, lease renewal and failure classification.
-- [ ] Integrate command mode selection.
-- [ ] Extend progress/status/warning output.
+- [x] Add ledger repository and config preflight.
+- [x] Add deterministic incremental/replay engine.
+- [x] Add coalescing, lease renewal and failure classification.
+- [x] Integrate command mode selection.
+- [x] Extend progress/status/warning output.
 
 ## Success Criteria
 

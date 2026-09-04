@@ -1,7 +1,7 @@
 ---
 phase: 1
 title: 'Resource-Scoped Ledger Contract'
-status: in_progress
+status: implemented_external_prerequisite
 priority: P1
 effort: '1.5d'
 dependencies: []
@@ -82,11 +82,11 @@ No SalesBinder CLI source file changes in this phase.
 
 ## Todo
 
-- [ ] Add stream-scoped schema and functions.
-- [ ] Add fenced lease renewal and active-run recovery.
-- [ ] Add privilege, migration and multi-consumer tests.
-- [ ] Deploy contract v2 and provision worker login.
-- [ ] Confirm unrelated events do not block inventory progress.
+- [x] Add stream-scoped schema and functions.
+- [x] Add fenced lease renewal and active-run recovery.
+- [x] Add privilege, migration and multi-consumer tests.
+- [x] Deploy contract v2 and provision worker login.
+- [x] Confirm unrelated events do not block inventory progress.
 
 ## Success Criteria
 

@@ -1,7 +1,7 @@
 ---
 phase: 2
 title: 'Exact-ID Hydration and Cache Receipts'
-status: pending
+status: implemented
 priority: P1
 effort: '2d'
 dependencies: [1]
@@ -91,11 +91,11 @@ Schema v8 additions:
 
 ## Todo
 
-- [ ] Add V3 exact-ID resource contract.
-- [ ] Extract exact-item hydrator.
-- [ ] Add V8 schema and narrow PostgreSQL writer capability.
-- [ ] Add atomic bundle/tombstone + receipt operations.
-- [ ] Preserve mirror correctness and V7 pre-cutover compatibility.
+- [x] Add V3 exact-ID resource contract.
+- [x] Extract exact-item hydrator.
+- [x] Add V8 schema and narrow PostgreSQL writer capability.
+- [x] Add atomic bundle/tombstone + receipt operations.
+- [x] Preserve mirror correctness and V7 pre-cutover compatibility.
 
 ## Success Criteria
 

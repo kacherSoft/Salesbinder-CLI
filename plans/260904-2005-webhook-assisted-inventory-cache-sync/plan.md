@@ -1,14 +1,12 @@
 ---
 title: 'Webhook-Assisted Inventory Cache Sync'
 description: 'Replace repeated full V3 item hydration with resumable baselines plus receipt-backed inventory change-feed replay.'
-status: in_progress
+status: deployed_disabled_pending_credentials_and_live_canary
 priority: P1
 effort: 10d
-issue: null
 branch: main
 tags: [feature, backend, database, api, critical]
 blockedBy: []
-blocks: []
 created: 2026-09-04
 ---
 
@@ -16,7 +14,7 @@ created: 2026-09-04
 
 ## Overview
 
-Current `cache sync` always performs a complete V3 item membership scan and hydrates every item/variation twice. Any root membership or pagination drift after bounded retries aborts inventory publication and wastes the long hydration work. The replacement uses the separately deployed webhook ledger as the change-discovery source, exact V3 `ids` hydration as the canonical read, and resumable PostgreSQL staging for full baselines.
+Before this update, `cache sync` always performed a complete V3 item membership scan and hydrated every item/variation twice. Any root membership or pagination drift after bounded retries aborted inventory publication and wasted the long hydration work. The implemented replacement uses the separately deployed webhook ledger as the change-discovery source, exact V3 `ids` hydration as the canonical read, and resumable PostgreSQL staging for full baselines.
 
 ## Decisions
 
@@ -35,17 +33,17 @@ Current `cache sync` always performs a complete V3 item membership scan and hydr
 
 ## Phases
 
-| Phase | Name                                                                                                | Status  | Depends on |
-| ----- | --------------------------------------------------------------------------------------------------- | ------- | ---------- |
-| 1     | [Resource-Scoped Ledger Contract](./phase-01-start.md)                                              | In Progress | —          |
-| 2     | [Exact-ID Hydration and Cache Receipts](./phase-02-exact-id-hydration-and-cache-receipts.md)        | Pending | 1          |
-| 3     | [Resumable Baseline and Cutover Replay](./phase-03-resumable-baseline-and-cutover-replay.md)        | Pending | 1, 2       |
-| 4     | [Incremental Worker, Progress and Recovery](./phase-04-incremental-worker-progress-and-recovery.md) | Pending | 1, 2, 3    |
-| 5     | [Integration Validation and Rollout](./phase-05-integration-validation-and-rollout.md)              | Pending | 1–4        |
+| Phase | Name                                                                                                | Status                                   | Depends on |
+| ----- | --------------------------------------------------------------------------------------------------- | ---------------------------------------- | ---------- |
+| 1     | [Resource-Scoped Ledger Contract](./phase-01-start.md)                                              | Implemented externally                   | —          |
+| 2     | [Exact-ID Hydration and Cache Receipts](./phase-02-exact-id-hydration-and-cache-receipts.md)        | Implemented                              | 1          |
+| 3     | [Resumable Baseline and Cutover Replay](./phase-03-resumable-baseline-and-cutover-replay.md)        | Implemented                              | 1, 2       |
+| 4     | [Incremental Worker, Progress and Recovery](./phase-04-incremental-worker-progress-and-recovery.md) | Implemented                              | 1, 2, 3    |
+| 5     | [Integration Validation and Rollout](./phase-05-integration-validation-and-rollout.md)              | Runner deployed disabled; canary pending | 1–4        |
 
 ## Runtime Result Matrix
 
-| Case                              | Current                                       | Planned                                                      |
+| Case                              | Legacy behavior                               | Implemented design                                           |
 | --------------------------------- | --------------------------------------------- | ------------------------------------------------------------ |
 | Normal sync                       | Full item snapshot twice                      | Drain inventory events to fixed target                       |
 | First/forced full                 | Full detail twice; no durable item progress   | Stable root IDs, one detail pass, resumable staging, replay  |
@@ -75,6 +73,6 @@ Current `cache sync` always performs a complete V3 item membership scan and hydr
 - Full test/lint/build gates and two-database PostgreSQL integration/chaos suite pass.
 - Live canary reaches a fixed ledger target with zero blocker at or below that target.
 
-## Unresolved Questions
+## Remaining Input
 
-None. The plan intentionally chooses resource-scoped ledger consumers and a PostgreSQL-only writer path.
+Add a durable read-only `SALESBINDER_V3_API_KEY`; authorize or directly configure V2 and least-privilege database credentials; choose a supported task interface because Coolify `4.0.0-beta.463` returns `404` for application task REST routes.

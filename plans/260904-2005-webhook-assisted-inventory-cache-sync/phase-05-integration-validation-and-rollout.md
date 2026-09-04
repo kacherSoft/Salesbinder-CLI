@@ -1,7 +1,7 @@
 ---
 phase: 5
 title: 'Integration Validation and Rollout'
-status: pending
+status: runner_deployed_disabled_pending_credentials_and_live_canary
 priority: P1
 effort: '2d'
 dependencies: [1, 2, 3, 4]
@@ -18,7 +18,7 @@ dependencies: [1, 2, 3, 4]
 
 ## Overview
 
-Validate the complete two-database handoff, production mutation behavior, operational monitoring and rollback. Cutover is not complete until a real event reaches the cache through receiver → ledger → CLI → receipt → ledger completion.
+Validate the complete two-database handoff, production event behavior, operational monitoring and rollback. Cutover is not complete until a real event reaches the cache through receiver → ledger → CLI → receipt → ledger completion.
 
 ## Test Matrix
 
@@ -53,8 +53,8 @@ Validate the complete two-database handoff, production mutation behavior, operat
 
 ### Live Canary
 
-- Use one uniquely marked disposable item with explicit write authorization.
-- Exercise create, update, archive/unarchive, quantity/variation-location change where permitted, and delete/cleanup.
+- Prefer an existing real inventory event with the read-only V3 credential. Use a uniquely marked disposable item only with separate explicit write authorization.
+- If mutation is authorized, exercise create, update, archive/unarchive, quantity/variation-location change where permitted, and delete/cleanup.
 - Capture start `S` and target `T`; verify cache item/stock rows, cache receipts, ledger completion and zero blocker at/below `T`.
 - Verify unrelated document events do not enter or block the inventory stream.
 - Never print API keys, worker DB URLs, webhook secrets or business payloads.
@@ -63,9 +63,9 @@ Validate the complete two-database handoff, production mutation behavior, operat
 
 1. Back up ledger and cache databases; record current V7 inventory generation/counts.
 2. Deploy Phase 1 ledger migration and worker login; receiver remains on least-privilege ingest role.
-3. Deploy CLI code with change feed configured but cutover disabled; run contract/binding preflight.
+3. Deploy CLI code with `SALESBINDER_SCHEDULER_DISABLED=true`; run container runtime verification before credential/cutover preflight.
 4. Run initial resumable baseline and bounded replay; do not set feed-bound state until clean promotion.
-5. Enable normal event drain every minute through the existing scheduler/service runner.
+5. Enable normal event drain every 15 minutes through the existing scheduler/service runner.
 6. Schedule full reconciliation weekly initially; adjust only after observed webhook coverage proves safe.
 7. Alert on receiver inactivity, queue age, retry/dead-letter, blocker cursor, repeated 429, sync lock loss and baseline age.
 
@@ -89,17 +89,17 @@ Validate the complete two-database handoff, production mutation behavior, operat
 2. Run failure matrix; fix behavior rather than weakening assertions.
 3. Run a read-only production preflight for account IDs, V3 exact-ID capability, scopes and ledger contract.
 4. Take backups, deploy ledger contract, provision worker role and deploy CLI canary.
-5. Perform authorized disposable-item mutation matrix and verify exact database evidence.
+5. Verify an existing real inventory event; perform the disposable-item mutation matrix only with separate write authorization.
 6. Run two code reviews, security/redaction scan, lint, tests and build.
 7. Enable scheduler, observe at least one normal production event and one clean fixed-target drain.
 8. Update durable docs and record rollback evidence.
 
 ## Todo
 
-- [ ] Pass unit, integration, chaos, lint and build gates.
-- [ ] Complete two independent code reviews.
-- [ ] Complete live disposable-item canary.
-- [ ] Back up and deploy in ordered rollout.
+- [x] Pass unit, integration, chaos, lint and build gates.
+- [x] Complete two independent code reviews.
+- [x] Verify backups and deploy the reviewed runner in explicit disabled mode.
+- [ ] Configure credentials and complete a read-only real-event canary.
 - [ ] Verify monitoring, reconciliation schedule and rollback.
 
 ## Success Criteria
@@ -120,6 +120,14 @@ Validate the complete two-database handoff, production mutation behavior, operat
 - Backups, logs and reports must exclude credentials and raw payloads.
 - Worker, receiver, operator and migration roles remain separate throughout rollout and recovery.
 
+## Current Deployment Evidence
+
+- Cache and ledger backup executions succeeded before deployment.
+- Coolify application `s0gcsk404kso88sc48s88wok` built and runs commit `f41159cb1fceed772b60eb7a43bdbdf37ac331b7` from the repository Dockerfile.
+- Runtime startup verified compiled CLI/SDK resolution and a native in-memory SQLite query.
+- The runner remains intentionally disabled; no production sync or database mutation has run from it.
+- Coolify `4.0.0-beta.463` returns `404` for application scheduled-task REST routes, so task activation needs a supported interface or separately authorized server upgrade.
+
 ## Next Steps
 
-After acceptance, mark the plan complete and treat feed status plus periodic reconciliation as the production freshness contract.
+Add the V3 credential and authorize/configure the remaining secrets, restart with the scheduler enabled, run the real-event canary, then enable incremental and reconciliation tasks. After acceptance, mark the plan complete and treat feed status plus periodic reconciliation as the production freshness contract.
