@@ -49,6 +49,7 @@ COPY package.json ./package.json
 COPY packages/cli/package.json ./packages/cli/package.json
 COPY packages/sdk/package.json ./packages/sdk/package.json
 COPY scripts/bootstrap-container-config.mjs ./scripts/bootstrap-container-config.mjs
+COPY scripts/verify-container-runtime.mjs ./scripts/verify-container-runtime.mjs
 
 USER node
-CMD ["sh", "-c", "node scripts/bootstrap-container-config.mjs && exec tail -f /dev/null"]
+CMD ["sh", "-c", "node scripts/verify-container-runtime.mjs && node scripts/bootstrap-container-config.mjs && exec tail -f /dev/null"]
