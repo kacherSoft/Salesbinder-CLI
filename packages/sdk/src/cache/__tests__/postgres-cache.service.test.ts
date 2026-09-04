@@ -14,6 +14,7 @@ import type {
   ItemRow,
   ItemStockLocationRow,
 } from '../types.js';
+import { CACHE_SCHEMA_VERSION } from '../types.js';
 import type { PaymentTransactionRow } from '../payment-sync.types.js';
 
 const binding: CacheAccountBinding = {
@@ -22,7 +23,7 @@ const binding: CacheAccountBinding = {
   createdAt: 100,
 };
 
-const state = (schemaVersion = 7): CacheState => ({
+const state = (schemaVersion = CACHE_SCHEMA_VERSION): CacheState => ({
   lastSync: 1,
   lastFullSync: 1,
   documentCount: 0,
@@ -73,7 +74,7 @@ const snapshot = (): CategorySnapshot => {
     pages: 1,
     sourceRowCount: 2,
     storedRowCount: 2,
-    schemaVersion: 7,
+    schemaVersion: CACHE_SCHEMA_VERSION,
     sourceApiVersion: '3',
     generation: 'generation-1',
   } satisfies Omit<CategoryCacheMeta, 'fingerprint'>;
@@ -81,7 +82,7 @@ const snapshot = (): CategorySnapshot => {
     rows,
     meta: {
       ...meta,
-      fingerprint: createCategoryFingerprint(meta, rows, 7),
+      fingerprint: createCategoryFingerprint(meta, rows, CACHE_SCHEMA_VERSION),
     },
   };
 };
@@ -90,7 +91,7 @@ const refreshCategoryFingerprint = (categorySnapshot: CategorySnapshot): void =>
   categorySnapshot.meta.fingerprint = createCategoryFingerprint(
     categorySnapshot.meta,
     categorySnapshot.rows,
-    7
+    categorySnapshot.meta.schemaVersion
   );
 };
 
@@ -135,7 +136,7 @@ const inventorySnapshot = (): InventorySnapshot => {
       completedAt: 30,
       itemCount: 1,
       stockRowCount: 1,
-      schemaVersion: 7,
+      schemaVersion: CACHE_SCHEMA_VERSION,
       sourceApiVersion: '3',
       generation,
       fingerprint: createInventorySnapshotFingerprint(
@@ -656,6 +657,7 @@ describe('PostgresCacheService sync lock owner-session loss', () => {
     const handler: EventedClientHandler = async (client, sql, params) => {
       if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
       if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('FROM pg_locks')) return { rows: [{ held: true }] };
       if (sql.includes("VALUES ('sync_status'")) {
         const status = JSON.parse(String(params?.[0])) as CacheSyncStatus;
         statusInsertOrder.push(`${client.label}:${status.message ?? status.runId}`);
@@ -1000,7 +1002,7 @@ describe('PostgresCacheService sync lock owner-session loss', () => {
   });
 });
 
-describe('PostgresCacheService v7 schema and binding', () => {
+describe('PostgresCacheService schema and binding', () => {
   it('repairs exact category and binding schemas transactionally and idempotently', async () => {
     const { service, query } = makeService(async (sql) => ({
       rows: sql.includes('SELECT account_identity') ? [bindingRow()] : [],
@@ -1189,7 +1191,7 @@ describe('PostgresCacheService v7 schema and binding', () => {
   });
 });
 
-describe('PostgresCacheService v7 inventory authority', () => {
+describe('PostgresCacheService inventory authority', () => {
   it('preserves SQL NULL on stock writes and reads instead of coercing it to zero', async () => {
     const source = inventorySnapshot().stockRows[0];
     const { service, query } = makeService(async (sql) => {
@@ -1285,7 +1287,7 @@ describe('PostgresCacheService v7 inventory authority', () => {
     );
     expect(JSON.parse(String(stateWrite?.[1]?.[0]))).toEqual(
       expect.objectContaining({
-        schemaVersion: 7,
+        schemaVersion: CACHE_SCHEMA_VERSION,
         itemCount: 2,
         stockLocationCount: 2,
         inventorySourceApiVersion: '3',
@@ -2413,7 +2415,7 @@ describe('PostgresCacheService atomic document bundles', () => {
   });
 });
 
-describe('PostgresCacheService v7 category authority', () => {
+describe('PostgresCacheService category authority', () => {
   it('rejects a wrong category fingerprint before any category, metadata, or inventory mutation', async () => {
     const invalid = snapshot();
     invalid.rows[0].name = 'Renamed parent';
@@ -2723,7 +2725,7 @@ describe('PostgresCacheService v7 category authority', () => {
     expect(query.mock.calls.map(([sql]) => String(sql))).not.toContain('COMMIT');
   });
 
-  it('invalidates stale authority only on the serialized non-v7 to v7 state transition', async () => {
+  it('invalidates stale authority only on the serialized unsupported to current state transition', async () => {
     let persistedVersion = 6;
     const { service, query } = makeService(async (sql, params) => {
       if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
@@ -2735,7 +2737,7 @@ describe('PostgresCacheService v7 category authority', () => {
       return { rows: [] };
     });
 
-    await service.setCacheState(state(7));
+    await service.setCacheState(state(CACHE_SCHEMA_VERSION));
     const firstDeletes = query.mock.calls.filter(
       ([sql, params]) =>
         String(sql).startsWith('DELETE FROM cache_meta') &&
@@ -2744,7 +2746,7 @@ describe('PostgresCacheService v7 category authority', () => {
     expect(firstDeletes).toHaveLength(1);
 
     query.mockClear();
-    await service.setCacheState({ ...state(7), lastSync: 2 });
+    await service.setCacheState({ ...state(CACHE_SCHEMA_VERSION), lastSync: 2 });
     expect(query.mock.calls.some(([sql]) => String(sql).startsWith('DELETE FROM cache_meta'))).toBe(
       false
     );

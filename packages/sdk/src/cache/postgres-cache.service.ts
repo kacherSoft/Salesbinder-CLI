@@ -5,6 +5,7 @@
 import pg, { type PoolClient } from 'pg';
 import { randomUUID } from 'node:crypto';
 import type { CacheService } from './cache.interface.js';
+import type { InventoryChangeFeedCache } from './change-feed-cache.interface.js';
 import type {
   AccountRow,
   CacheAccountBinding,
@@ -16,7 +17,22 @@ import type {
   CustomerSalesData,
   DocumentRow,
   InventoryCacheMeta,
+  InventoryBaselineFailure,
+  InventoryBaselinePromotion,
+  InventoryBaselinePromotionResult,
+  InventoryBaselineRun,
+  InventoryChangeFeedBinding,
+  InventoryChangeFeedState,
+  InventoryChangeFeedStateUpdate,
+  InventoryEventReceipt,
+  InventoryEventSequence,
+  InventoryItemBundleApplication,
+  InventoryReceiptApplicationResult,
   InventorySnapshot,
+  InventoryStagedItemBundle,
+  InventoryStagingFailure,
+  InventoryStagingProgress,
+  InventoryTombstoneApplication,
   ItemDocumentRow,
   ItemRow,
   ItemSalesByPeriodRow,
@@ -31,6 +47,7 @@ import {
   createInventorySnapshotFingerprint,
   createSalesBinderAccountBinding,
   inventorySnapshotFingerprintMatches,
+  isSupportedSnapshotSchemaVersion,
   parseInventoryCacheMeta,
 } from './types.js';
 import { PAYMENT_SYNC_STATUS_KEY, PAYMENT_TRANSACTION_COLUMNS } from './payment-cache.constants.js';
@@ -42,6 +59,7 @@ import {
 import { createCategoryFingerprint } from './category-indexer.service.js';
 import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
 import { assertCanonicalV3SourceId } from './v3-inventory-source-validation.js';
+import { PostgresInventoryChangeFeedStore } from './postgres-inventory-change-feed.store.js';
 
 const { Pool } = pg;
 
@@ -240,7 +258,7 @@ type HeldPostgresSyncLock = {
   onLost?: (error: Error) => void | Promise<void>;
 };
 
-export class PostgresCacheService implements CacheService {
+export class PostgresCacheService implements CacheService, InventoryChangeFeedCache {
   private pool: InstanceType<typeof Pool>;
   private opened = true;
   private readonly syncLockClients = new Map<string, HeldPostgresSyncLock>();
@@ -249,10 +267,12 @@ export class PostgresCacheService implements CacheService {
   private closePromise?: Promise<void>;
   private readonly connectionString: string;
   private expectedBinding: CacheAccountBinding | null = null;
+  private inventoryChangeFeedStore?: PostgresInventoryChangeFeedStore;
 
   constructor(connectionString: string) {
     this.connectionString = connectionString;
     this.pool = new Pool({ connectionString });
+    this.changeFeedStore();
     // node-postgres emits pool-level errors when an idle connection drops.
     // Handle them here so a transient idle-client failure does not become an
     // uncaught EventEmitter error. Never include the connection string.
@@ -432,6 +452,19 @@ export class PostgresCacheService implements CacheService {
     await this.migrateItemDocumentColumns(client);
     await this.repairCategorySchema(client);
     await this.createIndexes(client);
+    await this.changeFeedStore().ensureSchema(client);
+    await this.migrateCacheStateToV8(client);
+  }
+
+  private async migrateCacheStateToV8(client: PoolClient): Promise<void> {
+    const result = await client.query<{ value: string }>(
+      `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`
+    );
+    const state = this.parseCacheState(result.rows[0]?.value);
+    if (state?.schemaVersion !== 7) return;
+    await client.query(`UPDATE cache_meta SET value = $1 WHERE key = 'state'`, [
+      JSON.stringify({ ...state, schemaVersion: CACHE_SCHEMA_VERSION }),
+    ]);
   }
 
   private async migrateDocumentColumns(client: PoolClient): Promise<void> {
@@ -1460,6 +1493,123 @@ export class PostgresCacheService implements CacheService {
     );
   }
 
+  async ensureInventoryChangeFeedState(
+    binding: InventoryChangeFeedBinding,
+    updatedAt?: number
+  ): Promise<InventoryChangeFeedState> {
+    this.assertChangeFeedBinding(binding);
+    return this.changeFeedStore().ensureInventoryChangeFeedState(binding, updatedAt);
+  }
+
+  async getInventoryChangeFeedState(
+    binding: InventoryChangeFeedBinding
+  ): Promise<InventoryChangeFeedState | null> {
+    this.assertChangeFeedBinding(binding);
+    return this.changeFeedStore().getInventoryChangeFeedState(binding);
+  }
+
+  async getInventoryChangeFeedStateByConsumer(
+    accountIdentity: string,
+    consumerName: string
+  ): Promise<InventoryChangeFeedState | null> {
+    const expected = this.requireExpectedBinding();
+    if (accountIdentity !== expected.accountIdentity) {
+      throw new Error('Inventory change-feed account does not match the PostgreSQL cache binding.');
+    }
+    return this.changeFeedStore().getInventoryChangeFeedStateByConsumer(
+      accountIdentity,
+      consumerName
+    );
+  }
+
+  async updateInventoryChangeFeedState(
+    update: InventoryChangeFeedStateUpdate
+  ): Promise<InventoryChangeFeedState> {
+    this.assertChangeFeedBinding(update);
+    return this.changeFeedStore().updateInventoryChangeFeedState(update);
+  }
+
+  async getInventoryEventReceipt(
+    binding: InventoryChangeFeedBinding,
+    eventSeq: InventoryEventSequence
+  ): Promise<InventoryEventReceipt | null> {
+    this.assertChangeFeedBinding(binding);
+    return this.changeFeedStore().getInventoryEventReceipt(binding, eventSeq);
+  }
+
+  async getInventoryEventReceipts(
+    binding: InventoryChangeFeedBinding,
+    eventSeqs: InventoryEventSequence[]
+  ): Promise<InventoryEventReceipt[]> {
+    this.assertChangeFeedBinding(binding);
+    return this.changeFeedStore().getInventoryEventReceipts(binding, eventSeqs);
+  }
+
+  async applyInventoryItemBundle(
+    application: InventoryItemBundleApplication
+  ): Promise<InventoryReceiptApplicationResult> {
+    this.assertChangeFeedBinding(application);
+    return this.changeFeedStore().applyInventoryItemBundle(application);
+  }
+
+  async applyInventoryTombstone(
+    application: InventoryTombstoneApplication
+  ): Promise<InventoryReceiptApplicationResult> {
+    this.assertChangeFeedBinding(application);
+    return this.changeFeedStore().applyInventoryTombstone(application);
+  }
+
+  async beginInventoryBaselineRun(run: InventoryBaselineRun): Promise<InventoryBaselineRun> {
+    this.assertChangeFeedBinding(run);
+    return this.changeFeedStore().beginInventoryBaselineRun(run);
+  }
+
+  async getInventoryBaselineRun(
+    binding: InventoryChangeFeedBinding,
+    runId: string
+  ): Promise<InventoryBaselineRun | null> {
+    this.assertChangeFeedBinding(binding);
+    return this.changeFeedStore().getInventoryBaselineRun(binding, runId);
+  }
+
+  async stageInventoryBaselineItem(bundle: InventoryStagedItemBundle): Promise<void> {
+    this.assertChangeFeedBinding(bundle);
+    await this.changeFeedStore().stageInventoryBaselineItem(bundle);
+  }
+
+  async recordInventoryStagingFailure(failure: InventoryStagingFailure): Promise<void> {
+    this.assertChangeFeedBinding(failure);
+    await this.changeFeedStore().recordInventoryStagingFailure(failure);
+  }
+
+  async getInventoryStagingProgress(
+    binding: InventoryChangeFeedBinding,
+    runId: string
+  ): Promise<InventoryStagingProgress | null> {
+    this.assertChangeFeedBinding(binding);
+    return this.changeFeedStore().getInventoryStagingProgress(binding, runId);
+  }
+
+  async promoteInventoryBaselineRun(
+    promotion: InventoryBaselinePromotion
+  ): Promise<InventoryBaselinePromotionResult> {
+    this.assertChangeFeedBinding(promotion);
+    return this.changeFeedStore().promoteInventoryBaselineRun(promotion);
+  }
+
+  async failInventoryBaselineRun(failure: InventoryBaselineFailure): Promise<InventoryBaselineRun> {
+    this.assertChangeFeedBinding(failure);
+    return this.changeFeedStore().failInventoryBaselineRun(failure);
+  }
+
+  async deleteInventoryBaselineRun(
+    binding: InventoryChangeFeedBinding,
+    runId: string
+  ): Promise<void> {
+    this.assertChangeFeedBinding(binding);
+    await this.changeFeedStore().deleteInventoryBaselineRun(binding, runId);
+  }
+
   async getItemDocumentsForPeriod(
     itemId: string,
     startDate: string,
@@ -1615,7 +1765,7 @@ export class PostgresCacheService implements CacheService {
       const persisted = this.parseCacheState(persistedResult.rows[0]?.value);
       if (
         state.schemaVersion === CACHE_SCHEMA_VERSION &&
-        persisted?.schemaVersion !== CACHE_SCHEMA_VERSION
+        !isSupportedSnapshotSchemaVersion(persisted?.schemaVersion)
       ) {
         await client.query(`DELETE FROM cache_meta WHERE key = $1`, [CATEGORY_GENERATION_META_KEY]);
         await client.query(`DELETE FROM cache_meta WHERE key = $1`, [INVENTORY_SNAPSHOT_META_KEY]);
@@ -1827,7 +1977,10 @@ export class PostgresCacheService implements CacheService {
   async truncateAll(): Promise<void> {
     await this.withVerifiedWrite(async (client) => {
       await client.query(`
-        TRUNCATE TABLE payment_transactions, item_stock_locations, item_documents,
+        TRUNCATE TABLE inventory_staging_stock_locations, inventory_staging_progress,
+          inventory_staging_items, inventory_baseline_root_items, inventory_baseline_runs,
+          inventory_event_receipts,
+          inventory_change_feed_state, payment_transactions, item_stock_locations, item_documents,
           items, documents, accounts, categories, category_cache_meta, cache_meta
           RESTART IDENTITY CASCADE
       `);
@@ -1879,18 +2032,28 @@ export class PostgresCacheService implements CacheService {
     );
   }
 
-  private async withVerifiedWrite<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
+  private async withVerifiedWrite<T>(
+    run: (client: PoolClient) => Promise<T>,
+    operationSignal?: AbortSignal
+  ): Promise<T> {
     const binding = this.requireExpectedBinding();
     const lockKey = this.syncLockKey(binding);
     const lease = this.syncLockClients.get(lockKey);
     if (lease) {
-      return this.runWithSyncLockLease(lease, async (client) => {
-        this.assertMatchingBinding(await this.readBinding(client, true), binding);
-        return run(client);
-      });
+      return this.runWithSyncLockLease(
+        lease,
+        async (client) => {
+          this.assertMatchingBinding(await this.readBinding(client, true), binding);
+          return run(client);
+        },
+        operationSignal
+      );
     }
     const lostError = this.getLostSyncLockError(binding);
     if (lostError) throw lostError;
+    // Change-feed operations carrying a cancellation signal are fenced writer
+    // work and are never allowed to fall back to an unfenced pooled transaction.
+    if (operationSignal) throw new PostgresSyncLockLostError();
     return this.withDatabaseTransaction(async (client) => {
       this.assertMatchingBinding(await this.readBinding(client, true), binding);
       return run(client);
@@ -1908,7 +2071,7 @@ export class PostgresCacheService implements CacheService {
       'BEGIN',
       async (transactionClient) => {
         await this.acquireDatabaseWriteLock(transactionClient);
-        if (lease?.lostError) throw lease.lostError;
+        if (lease) await this.assertSyncLockHeldByBackend(transactionClient, lease);
         return run(transactionClient);
       },
       lease,
@@ -1934,6 +2097,7 @@ export class PostgresCacheService implements CacheService {
       if (lease?.lostError) throw lease.lostError;
       const result = await run(client);
       if (lease?.lostError) throw lease.lostError;
+      if (lease) await this.assertSyncLockHeldByBackend(client, lease);
       transactionBoundaryPending = true;
       await client.query('COMMIT');
       transactionBoundaryPending = false;
@@ -1959,7 +2123,8 @@ export class PostgresCacheService implements CacheService {
 
   private runWithSyncLockLease<T>(
     lease: HeldPostgresSyncLock,
-    run: (client: PoolClient) => Promise<T>
+    run: (client: PoolClient) => Promise<T>,
+    operationSignal?: AbortSignal
   ): Promise<T> {
     if (lease.lostError || lease.releaseStarted) {
       return Promise.reject(lease.lostError ?? new PostgresSyncLockLostError());
@@ -1967,7 +2132,17 @@ export class PostgresCacheService implements CacheService {
 
     const operation = lease.queue.then(async () => {
       if (lease.lostError) throw lease.lostError;
-      return this.runDatabaseTransaction(lease.client, run, lease);
+      if (operationSignal?.aborted) {
+        this.markSyncLockLost(lease);
+        throw lease.lostError ?? new PostgresSyncLockLostError();
+      }
+      const cancel = (): void => this.markSyncLockLost(lease);
+      operationSignal?.addEventListener('abort', cancel, { once: true });
+      try {
+        return await this.runDatabaseTransaction(lease.client, run, lease);
+      } finally {
+        operationSignal?.removeEventListener('abort', cancel);
+      }
     });
     lease.queue = operation.then(
       () => undefined,
@@ -2121,6 +2296,31 @@ export class PostgresCacheService implements CacheService {
     ]);
   }
 
+  /**
+   * The retained advisory lock is the cache writer fence. Verify ownership on
+   * the same backend at transaction entry and immediately before COMMIT so a
+   * process-local boolean can never authorize a database mutation by itself.
+   */
+  private async assertSyncLockHeldByBackend(
+    client: PoolClient,
+    lease: HeldPostgresSyncLock
+  ): Promise<void> {
+    if (lease.lostError) throw lease.lostError;
+    const result = await client.query<{ held: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pg_locks
+         WHERE locktype='advisory' AND pid=pg_backend_pid() AND granted
+           AND classid=CASE WHEN hashtext($1) < 0 THEN 4294967295::oid ELSE 0::oid END
+           AND objid=hashtext($1)::oid AND objsubid=1
+       ) AS held`,
+      [lease.lockKey]
+    );
+    if (result.rows[0]?.held !== true) {
+      this.markSyncLockLost(lease);
+      throw lease.lostError ?? new PostgresSyncLockLostError();
+    }
+  }
+
   private requireExpectedBinding(): CacheAccountBinding {
     if (!this.expectedBinding) {
       throw new Error(
@@ -2129,6 +2329,29 @@ export class PostgresCacheService implements CacheService {
       );
     }
     return this.expectedBinding;
+  }
+
+  private assertChangeFeedBinding(binding: InventoryChangeFeedBinding): void {
+    const expected = this.requireExpectedBinding();
+    if (binding.accountIdentity !== expected.accountIdentity) {
+      throw new Error('Inventory change-feed account does not match the PostgreSQL cache binding.');
+    }
+  }
+
+  private changeFeedStore(): PostgresInventoryChangeFeedStore {
+    return (this.inventoryChangeFeedStore ??= new PostgresInventoryChangeFeedStore({
+      withVerifiedWrite: (run, operationSignal) =>
+        this.withVerifiedWrite(run, operationSignal),
+      withReadOnlyTransaction: (run) => this.withReadOnlyTransaction(run),
+      assertItemBundle: (item, stockRows) => {
+        const issue = inventorySnapshotRowsIssue([item], stockRows);
+        if (issue !== null) throw new Error(`Inventory item bundle is invalid: ${issue}.`);
+      },
+      assertInventorySnapshot: (snapshot) => {
+        const binding = this.requireExpectedBinding();
+        this.assertValidInventorySnapshot(snapshot, binding.accountIdentity);
+      },
+    }));
   }
 
   private syncLockKey(binding: CacheAccountBinding): string {
@@ -2169,6 +2392,13 @@ export class PostgresCacheService implements CacheService {
       'categories',
       'category_cache_meta',
       'cache_meta',
+      'inventory_change_feed_state',
+      'inventory_event_receipts',
+      'inventory_baseline_runs',
+      'inventory_baseline_root_items',
+      'inventory_staging_items',
+      'inventory_staging_stock_locations',
+      'inventory_staging_progress',
     ] as const;
     for (const table of payloadTables) {
       const relation = await executor.query<{ relation: string | null }>(
@@ -2231,7 +2461,7 @@ export class PostgresCacheService implements CacheService {
     const state = this.parseCacheState(row.state_value);
     if (
       !meta ||
-      state?.schemaVersion !== CACHE_SCHEMA_VERSION ||
+      !isSupportedSnapshotSchemaVersion(state?.schemaVersion) ||
       row.marker_value !== meta.generation ||
       row.account_identity !== meta.accountIdentity ||
       (this.expectedBinding && row.account_identity !== this.expectedBinding.accountIdentity)
@@ -2253,7 +2483,7 @@ export class PostgresCacheService implements CacheService {
     ).rows.map((row) => this.coerceCategory(row));
     return rows.length === meta.storedRowCount &&
       this.categorySnapshotRowsIssue(rows, meta.sourceApiVersion) === null &&
-      createCategoryFingerprint(meta, rows, CACHE_SCHEMA_VERSION) === meta.fingerprint
+      createCategoryFingerprint(meta, rows, meta.schemaVersion) === meta.fingerprint
       ? { rows, meta }
       : null;
   }
@@ -2296,7 +2526,7 @@ export class PostgresCacheService implements CacheService {
     const state = this.parseCacheState(row.state_value);
     if (
       !meta ||
-      state?.schemaVersion !== CACHE_SCHEMA_VERSION ||
+      !isSupportedSnapshotSchemaVersion(state?.schemaVersion) ||
       state.inventorySourceApiVersion !== '3' ||
       row.account_identity !== meta.accountIdentity ||
       (this.expectedBinding && row.account_identity !== this.expectedBinding.accountIdentity) ||
@@ -2391,7 +2621,7 @@ export class PostgresCacheService implements CacheService {
         !this.hasExactKeys(parsed, exactKeys) ||
         parsed.version !== 1 ||
         parsed.status !== 'complete' ||
-        parsed.schemaVersion !== CACHE_SCHEMA_VERSION ||
+        !isSupportedSnapshotSchemaVersion(parsed.schemaVersion) ||
         (parsed.sourceApiVersion !== '2.0' && parsed.sourceApiVersion !== '3') ||
         !isNonEmptyText(parsed.accountIdentity) ||
         !isNonEmptyText(parsed.generation) ||
@@ -2443,7 +2673,7 @@ export class PostgresCacheService implements CacheService {
         'Category snapshot parent names must be derived from the same validated snapshot.'
       );
     }
-    if (createCategoryFingerprint(meta, snapshot.rows, CACHE_SCHEMA_VERSION) !== meta.fingerprint) {
+    if (createCategoryFingerprint(meta, snapshot.rows, meta.schemaVersion) !== meta.fingerprint) {
       throw new Error('Category snapshot fingerprint does not match its validated rows.');
     }
   }

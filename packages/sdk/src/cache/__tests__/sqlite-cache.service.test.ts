@@ -93,7 +93,7 @@ describe('SQLiteCacheService', () => {
       }
     });
 
-    it('creates the v7 inventory and category columns with nullable source-correct stock fields', () => {
+    it('creates the current inventory and category columns with nullable source-correct stock fields', () => {
       const db = new Database(testDbPath, { readonly: true });
       try {
         const stockColumns = db.pragma('table_info(item_stock_locations)') as Array<{
@@ -131,7 +131,7 @@ describe('SQLiteCacheService', () => {
       }
     });
 
-    it('migrates a genuine v6 stock table to v7 while nulling only API-fabricated fields', async () => {
+    it('migrates a genuine v6 stock table to the current schema while nulling only API-fabricated fields', async () => {
       await service.close();
       rmSync(testDbPath, { force: true });
       createLegacyV6InventoryDatabase(testDbPath);
@@ -140,7 +140,7 @@ describe('SQLiteCacheService', () => {
 
       const db = new Database(testDbPath, { readonly: true });
       try {
-        expect(db.pragma('user_version', { simple: true })).toBe(7);
+        expect(db.pragma('user_version', { simple: true })).toBe(CACHE_SCHEMA_VERSION);
         const columns = db.pragma('table_info(item_stock_locations)') as Array<{
           name: string;
           notnull: number;
@@ -663,7 +663,7 @@ describe('SQLiteCacheService', () => {
     });
   });
 
-  describe('Inventory schema v7 snapshots', () => {
+  describe('Inventory snapshot authority', () => {
     const publishRawInventorySnapshot = async (snapshot: InventorySnapshot): Promise<void> => {
       await service.batchInsertItems(snapshot.items);
       await service.batchInsertItemStockLocations(snapshot.stockRows);
@@ -673,7 +673,7 @@ describe('SQLiteCacheService', () => {
         documentCount: 0,
         itemDocumentCount: 0,
         accountName: 'test-account',
-        schemaVersion: 7,
+        schemaVersion: CACHE_SCHEMA_VERSION,
         itemCount: snapshot.items.length,
         stockLocationCount: snapshot.stockRows.length,
         inventorySourceApiVersion: '3',
@@ -782,7 +782,7 @@ describe('SQLiteCacheService', () => {
         snapshot.meta.accountIdentity
       );
       expect(await service.getCacheState()).toMatchObject({
-        schemaVersion: 7,
+        schemaVersion: CACHE_SCHEMA_VERSION,
         itemCount: 2,
         stockLocationCount: 2,
         lastItemSync: snapshot.meta.completedAt,
@@ -1502,7 +1502,7 @@ describe('SQLiteCacheService', () => {
         documentCount: 0,
         itemDocumentCount: 0,
         accountName: 'source',
-        schemaVersion: 7,
+        schemaVersion: CACHE_SCHEMA_VERSION,
         itemCount: 2,
         stockLocationCount: 2,
         inventorySourceApiVersion: '3',
@@ -1701,7 +1701,7 @@ describe('SQLiteCacheService', () => {
         documentCount: 0,
         itemDocumentCount: 0,
         accountName: 'source',
-        schemaVersion: 7,
+        schemaVersion: CACHE_SCHEMA_VERSION,
         inventorySourceApiVersion: '3',
       };
 
@@ -3170,7 +3170,7 @@ function categorySnapshotFixture(
     pages: 1,
     sourceRowCount: rows.length,
     storedRowCount: rows.length,
-    schemaVersion: 7,
+    schemaVersion: CACHE_SCHEMA_VERSION,
     sourceApiVersion: '3',
     generation,
   } satisfies Omit<CategoryCacheMeta, 'fingerprint'>;
@@ -3220,7 +3220,7 @@ function inventorySnapshot(
       stockRowCount: stockRows.filter(
         (row) => row.cache_source === 'api' && row.source_api_version === '3'
       ).length,
-      schemaVersion: 7,
+      schemaVersion: CACHE_SCHEMA_VERSION,
       sourceApiVersion: '3',
       generation,
       fingerprint: createInventorySnapshotFingerprint(
@@ -3310,7 +3310,7 @@ function historicalV1InventorySnapshot(
       completedAt: 2,
       itemCount: items.length,
       stockRowCount: stockRows.length,
-      schemaVersion: 7,
+      schemaVersion: CACHE_SCHEMA_VERSION,
       sourceApiVersion: '3',
       generation,
       fingerprint: `sha256:${createHash('sha256').update(JSON.stringify(canonical)).digest('hex')}`,

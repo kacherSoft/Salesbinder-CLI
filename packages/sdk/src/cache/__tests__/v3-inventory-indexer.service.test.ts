@@ -3,6 +3,7 @@ import { ApiResponseValidationError } from '../../resources/api-response-validat
 import type { V3Item, V3ItemVariation, V3ListResponse } from '../../types/items.types.js';
 import type { CacheService } from '../cache.interface.js';
 import type { CacheSyncProgress } from '../cache-sync-progress.types.js';
+import { CACHE_SCHEMA_VERSION } from '../types.js';
 import {
   V3InventoryIndexerService,
   type V3InventoryClient,
@@ -85,7 +86,7 @@ describe('V3InventoryIndexerService', () => {
       omittedItemCount: 0,
       warningCount: 0,
       lastCompleteAt: expect.any(Number),
-      schemaVersion: 7,
+      schemaVersion: CACHE_SCHEMA_VERSION,
     });
     expect(get).not.toHaveBeenCalled();
   });
@@ -2341,7 +2342,7 @@ function fakeCache(overrides: Record<string, unknown>): CacheService {
       documentCount: 0,
       itemDocumentCount: 0,
       accountName: 'default',
-      schemaVersion: 7,
+      schemaVersion: CACHE_SCHEMA_VERSION,
     })),
     getCategorySnapshot: jest.fn(async () => null),
     getInventorySnapshot: jest.fn(async () => null),

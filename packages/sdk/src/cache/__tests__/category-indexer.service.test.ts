@@ -3,7 +3,7 @@ import { CategoryIndexerService, createCategoryFingerprint } from '../category-i
 import type { CacheService } from '../cache.interface.js';
 import type { CacheSyncProgress } from '../cache-sync-progress.types.js';
 import type { CategoryCacheRow, CategorySnapshot } from '../types.js';
-import { MAX_CATEGORY_COUNT, MAX_CATEGORY_PAGES } from '../types.js';
+import { CACHE_SCHEMA_VERSION, MAX_CATEGORY_COUNT, MAX_CATEGORY_PAGES } from '../types.js';
 import { ItemIndexerService } from '../item-indexer.service.js';
 
 const category = (id: string, name = id, parentId: string | null = null) => ({
@@ -99,7 +99,7 @@ describe('CategoryIndexerService', () => {
     }));
     const replace = jest.fn(async () => undefined);
     const cache = {
-      getCacheState: jest.fn(async () => ({ schemaVersion: 7 })),
+      getCacheState: jest.fn(async () => ({ schemaVersion: CACHE_SCHEMA_VERSION })),
       replaceCategorySnapshot: replace,
     } as unknown as CacheService;
 
@@ -138,7 +138,7 @@ describe('CategoryIndexerService', () => {
     }));
     const replace = jest.fn(async () => undefined);
     const cache = {
-      getCacheState: jest.fn(async () => ({ schemaVersion: 7 })),
+      getCacheState: jest.fn(async () => ({ schemaVersion: CACHE_SCHEMA_VERSION })),
       replaceCategorySnapshot: replace,
     } as unknown as CacheService;
     const service = new CategoryIndexerService({ categories: { list } }, cache, 'acme', '3');
@@ -194,7 +194,7 @@ describe('CategoryIndexerService', () => {
       .mockResolvedValueOnce({ count: 1, page: 1, pages: 1, categories: [v3Category('second')] });
     const replace = jest.fn(async () => undefined);
     const cache = {
-      getCacheState: jest.fn(async () => ({ schemaVersion: 7 })),
+      getCacheState: jest.fn(async () => ({ schemaVersion: CACHE_SCHEMA_VERSION })),
       replaceCategorySnapshot: replace,
     } as unknown as CacheService;
     const service = new CategoryIndexerService({ categories: { list } }, cache, 'acme', '3');
@@ -215,7 +215,7 @@ describe('CategoryIndexerService', () => {
       .mockResolvedValueOnce({ count: 3, page: 1, pages: 1, categories: [...firstPass].reverse() });
     const replace = jest.fn(async () => undefined);
     const cache = {
-      getCacheState: jest.fn(async () => ({ schemaVersion: 7 })),
+      getCacheState: jest.fn(async () => ({ schemaVersion: CACHE_SCHEMA_VERSION })),
       replaceCategorySnapshot: replace,
     } as unknown as CacheService;
     const service = new CategoryIndexerService({ categories: { list } }, cache, 'acme', '3');
@@ -263,7 +263,7 @@ describe('CategoryIndexerService', () => {
     }));
     const replace = jest.fn(async () => undefined);
     const cache = {
-      getCacheState: jest.fn(async () => ({ schemaVersion: 7 })),
+      getCacheState: jest.fn(async () => ({ schemaVersion: CACHE_SCHEMA_VERSION })),
       replaceCategorySnapshot: replace,
     } as unknown as CacheService;
     const service = new CategoryIndexerService(
@@ -298,7 +298,7 @@ describe('CategoryIndexerService', () => {
     }));
     const replace = jest.fn(async () => undefined);
     const cache = {
-      getCacheState: jest.fn(async () => ({ schemaVersion: 7 })),
+      getCacheState: jest.fn(async () => ({ schemaVersion: CACHE_SCHEMA_VERSION })),
       replaceCategorySnapshot: replace,
     } as unknown as CacheService;
 
@@ -425,7 +425,7 @@ describe('CategoryIndexerService', () => {
     expect(replace).not.toHaveBeenCalled();
   });
 
-  it('rejects a non-v7 cache state before fetching or writing', async () => {
+  it('rejects a non-current cache state before fetching or writing', async () => {
     const list = jest.fn();
     const replace = jest.fn();
     const client = { categories: { list } } as unknown as SalesBinderClient;
@@ -435,7 +435,7 @@ describe('CategoryIndexerService', () => {
     } as unknown as CacheService;
 
     await expect(new CategoryIndexerService(client, cache, 'acme').sync()).rejects.toThrow(
-      'requires cache state schema version 7'
+      `requires cache state schema version ${CACHE_SCHEMA_VERSION}`
     );
     expect(list).not.toHaveBeenCalled();
     expect(replace).not.toHaveBeenCalled();
@@ -507,7 +507,7 @@ function setup(responses: unknown[]) {
 function createService(list: jest.Mock, replace: jest.Mock): CategoryIndexerService {
   const client = { categories: { list } } as unknown as SalesBinderClient;
   const cache = {
-    getCacheState: jest.fn(async () => ({ schemaVersion: 7 })),
+    getCacheState: jest.fn(async () => ({ schemaVersion: CACHE_SCHEMA_VERSION })),
     replaceCategorySnapshot: replace,
   } as unknown as CacheService;
   return new CategoryIndexerService(client, cache, 'acme');

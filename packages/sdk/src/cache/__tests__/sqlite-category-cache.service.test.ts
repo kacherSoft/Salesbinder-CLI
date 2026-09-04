@@ -12,7 +12,7 @@ import type {
   CategorySnapshot,
 } from '../types.js';
 
-describe('SQLite category cache v7', () => {
+describe('SQLite category cache', () => {
   let path: string;
   let cache: SQLiteCacheService;
 
@@ -29,7 +29,7 @@ describe('SQLite category cache v7', () => {
     for (const suffix of ['', '-wal', '-shm']) rmSync(`${path}${suffix}`, { force: true });
   });
 
-  it('creates the exact unseeded v7 category schemas', () => {
+  it('creates the exact unseeded current category schemas', () => {
     const db = new Database(path, { readonly: true });
     try {
       expect(db.pragma('user_version', { simple: true })).toBe(CACHE_SCHEMA_VERSION);
@@ -72,7 +72,7 @@ describe('SQLite category cache v7', () => {
 
     cache = new SQLiteCacheService('local-account', path);
     const migrated = new Database(path, { readonly: true });
-    expect(migrated.pragma('user_version', { simple: true })).toBe(7);
+    expect(migrated.pragma('user_version', { simple: true })).toBe(CACHE_SCHEMA_VERSION);
     migrated.close();
     await cache.close();
 
@@ -144,7 +144,7 @@ describe('SQLite category cache v7', () => {
       ['missing-stock', null],
       ['weak-stock', 'display-only'],
     ]);
-    expect((await cache.getCacheState())?.schemaVersion).toBe(7);
+    expect((await cache.getCacheState())?.schemaVersion).toBe(CACHE_SCHEMA_VERSION);
     await cache.setCacheState({ ...(await cache.getCacheState())!, lastSync: 2 });
     expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBe('gen-1');
   });
@@ -198,7 +198,7 @@ describe('SQLite category cache v7', () => {
     expect(await cache.getCategorySnapshot()).toBeNull();
   });
 
-  it('fails closed without mutating stale authority, then invalidates it on the v7 state transition', async () => {
+  it('fails closed without mutating stale authority, then invalidates it on the current state transition', async () => {
     await cache.replaceCategorySnapshot(snapshot('stale-generation', [category('old', 'Old')]));
     const db = new Database(path);
     db.prepare(`UPDATE cache_meta SET value = ? WHERE key = 'state'`).run(JSON.stringify(state(5)));
@@ -212,10 +212,10 @@ describe('SQLite category cache v7', () => {
     expect(await cache.getCategoryCount()).toBe(0);
     expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBe('stale-generation');
 
-    await cache.setCacheState(state(7));
+    await cache.setCacheState(state(CACHE_SCHEMA_VERSION));
     expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBeUndefined();
     expect(await cache.getCategorySnapshot()).toBeNull();
-    await cache.setCacheState({ ...state(7), lastSync: 2 });
+    await cache.setCacheState({ ...state(CACHE_SCHEMA_VERSION), lastSync: 2 });
     expect(rawMeta(path, CATEGORY_GENERATION_META_KEY)).toBeUndefined();
   });
 
@@ -415,7 +415,7 @@ const snapshot = (generation: string, rows: CategoryCacheRow[]): CategorySnapsho
     pages: rows.length ? 1 : 0,
     sourceRowCount: rows.length,
     storedRowCount: rows.length,
-    schemaVersion: 7,
+    schemaVersion: CACHE_SCHEMA_VERSION,
     sourceApiVersion: '2.0',
     generation,
   } satisfies Omit<CategoryCacheMeta, 'fingerprint'>;

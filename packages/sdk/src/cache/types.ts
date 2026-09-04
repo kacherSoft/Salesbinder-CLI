@@ -202,7 +202,7 @@ export interface CategoryCacheMeta {
   pages: number;
   sourceRowCount: number;
   storedRowCount: number;
-  schemaVersion: 7;
+  schemaVersion: number;
   sourceApiVersion: ApiSourceVersion;
   generation: string;
   fingerprint: string;
@@ -241,13 +241,28 @@ export function createInventorySnapshotFingerprint(
   return hashInventorySnapshot(canonical);
 }
 
+/** Deterministic proof for one canonical item and its complete stock subtree. */
+export function createInventoryItemBundleFingerprint(
+  accountIdentity: string,
+  item: ItemRow,
+  stockRows: ItemStockLocationRow[]
+): string {
+  return hashInventorySnapshot({
+    accountIdentity,
+    item: canonicalInventoryItem(item),
+    stockRows: [...stockRows]
+      .sort((left, right) => compareCodeUnitStrings(left.stock_row_id, right.stock_row_id))
+      .map(canonicalInventoryStockRow),
+  });
+}
+
 interface InventoryCacheMetaBase {
   accountIdentity: string;
   startedAt: number;
   completedAt: number;
   itemCount: number;
   stockRowCount: number;
-  schemaVersion: 7;
+  schemaVersion: number;
   sourceApiVersion: '3';
   generation: string;
   fingerprint: string;
@@ -348,7 +363,7 @@ export function parseInventoryCacheMeta(value: unknown): InventoryCacheMeta | nu
     completedAt >= startedAt &&
     isNonNegativeInteger(itemCount) &&
     isNonNegativeInteger(stockRowCount) &&
-    schemaVersion === CACHE_SCHEMA_VERSION &&
+    isSupportedSnapshotSchemaVersion(schemaVersion) &&
     sourceApiVersion === '3' &&
     isNonEmptyString(generation) &&
     isNonEmptyString(fingerprint);
@@ -636,8 +651,219 @@ export function createSalesBinderAccountBinding(subdomain: string): CacheAccount
   };
 }
 
-/** Cache sync state metadata */
-export const CACHE_SCHEMA_VERSION = 7;
+/** Current physical and logical cache schema. */
+export const CACHE_SCHEMA_VERSION = 8;
+/** Named PostgreSQL alias used by change-feed schema checks. */
+export const POSTGRES_CACHE_SCHEMA_VERSION = CACHE_SCHEMA_VERSION;
+/** Snapshot metadata v7 remains readable during the v8 feed cutover. */
+export type SupportedSnapshotSchemaVersion = 7 | typeof CACHE_SCHEMA_VERSION;
+
+export function isSupportedSnapshotSchemaVersion(
+  value: unknown
+): value is SupportedSnapshotSchemaVersion {
+  return value === 7 || value === CACHE_SCHEMA_VERSION;
+}
+
+/** PostgreSQL BIGINT sequence transported without JavaScript number coercion. */
+export type InventoryEventSequence = string;
+
+export interface InventoryChangeFeedBinding {
+  accountIdentity: string;
+  ledgerDatabaseId: string;
+  consumerName: string;
+}
+
+export interface InventoryChangeFeedState extends InventoryChangeFeedBinding {
+  baselineGeneration: string | null;
+  observedThroughEventSeq: InventoryEventSequence | null;
+  appliedThroughEventSeq: InventoryEventSequence | null;
+  highestAppliedEventSeq: InventoryEventSequence | null;
+  blockedByEventSeq: InventoryEventSequence | null;
+  updatedAt: number;
+}
+
+export interface InventoryChangeFeedStateUpdate extends InventoryChangeFeedBinding {
+  baselineGeneration?: string | null;
+  observedThroughEventSeq?: InventoryEventSequence | null;
+  appliedThroughEventSeq?: InventoryEventSequence | null;
+  highestAppliedEventSeq?: InventoryEventSequence | null;
+  blockedByEventSeq?: InventoryEventSequence | null;
+  updatedAt: number;
+  /** Cancels the PostgreSQL transaction if this sync operation loses its fence. */
+  operationSignal?: AbortSignal;
+}
+
+export type InventoryReceiptAppliedAction = 'upsert' | 'tombstone' | 'fenced_noop';
+export type InventoryHydrationOutcome = 'found_current' | 'found_archived' | 'expected_tombstone';
+export type InventoryMaterializationOutcome = 'upserted' | 'tombstoned' | 'superseded';
+
+export interface InventoryEventReceipt extends InventoryChangeFeedBinding {
+  receiptId: string;
+  eventSeq: InventoryEventSequence;
+  eventType: InventoryChangeFeedEventType;
+  objectId: string;
+  appliedAction: InventoryReceiptAppliedAction;
+  hydrationOutcome: InventoryHydrationOutcome;
+  materializationOutcome: InventoryMaterializationOutcome;
+  cacheGeneration: string;
+  sourceFingerprint: string | null;
+  committedAt: number;
+}
+
+export type InventoryChangeFeedEventType =
+  | 'inventory.item_created'
+  | 'inventory.item_updated'
+  | 'inventory.low_stock'
+  | 'inventory.item_deleted';
+
+export interface InventoryEventReceiptInput {
+  eventSeq: InventoryEventSequence;
+  eventType: InventoryChangeFeedEventType;
+  objectId: string;
+}
+
+export interface InventoryItemBundleApplication extends InventoryChangeFeedBinding {
+  cacheGeneration: string;
+  item: ItemRow;
+  stockRows: ItemStockLocationRow[];
+  events: InventoryEventReceiptInput[];
+  hydrationOutcome: 'found_current' | 'found_archived';
+  sourceFingerprint?: string;
+  expectedHighestAppliedEventSeq: InventoryEventSequence | null;
+  observedThroughEventSeq?: InventoryEventSequence | null;
+  appliedThroughEventSeq?: InventoryEventSequence | null;
+  blockedByEventSeq?: InventoryEventSequence | null;
+  committedAt: number;
+  /** Cancels the PostgreSQL transaction if this sync operation loses its fence. */
+  operationSignal?: AbortSignal;
+}
+
+export interface InventoryTombstoneProof {
+  deleteEventSeq: InventoryEventSequence;
+  confirmation: 'v3_exact_404';
+  confirmedMissingAt: number;
+}
+
+export interface InventoryTombstoneApplication extends InventoryChangeFeedBinding {
+  cacheGeneration: string;
+  objectId: string;
+  events: InventoryEventReceiptInput[];
+  proof: InventoryTombstoneProof;
+  expectedHighestAppliedEventSeq: InventoryEventSequence | null;
+  observedThroughEventSeq?: InventoryEventSequence | null;
+  appliedThroughEventSeq?: InventoryEventSequence | null;
+  blockedByEventSeq?: InventoryEventSequence | null;
+  committedAt: number;
+  /** Cancels the PostgreSQL transaction if this sync operation loses its fence. */
+  operationSignal?: AbortSignal;
+}
+
+export interface InventoryReceiptApplicationResult {
+  duplicate: boolean;
+  materialized: boolean;
+  receipts: InventoryEventReceipt[];
+}
+
+export type InventoryBaselineRunStatus = 'active' | 'promoted' | 'failed';
+
+export interface InventoryBaselineRun extends InventoryChangeFeedBinding {
+  runId: string;
+  generation: string;
+  startEventSeq: InventoryEventSequence;
+  rootFingerprint: string;
+  rootItemIds: string[];
+  expectedItemCount: number;
+  status: InventoryBaselineRunStatus;
+  startedAt: number;
+  updatedAt: number;
+  promotedAt: number | null;
+  failureCode: string | null;
+}
+
+export interface InventoryStagedItemBundle extends InventoryChangeFeedBinding {
+  runId: string;
+  item: ItemRow;
+  stockRows: ItemStockLocationRow[];
+  stagedAt: number;
+}
+
+export interface InventoryStagingFailure extends InventoryChangeFeedBinding {
+  runId: string;
+  itemId: string;
+  attemptCount: number;
+  errorCode: string;
+  errorMessage: string;
+  updatedAt: number;
+}
+
+export interface InventoryStagingProgress extends InventoryChangeFeedBinding {
+  runId: string;
+  expectedItemCount: number;
+  stagedItemCount: number;
+  failedItemCount: number;
+  completedItemIds: string[];
+  pendingItemIds: string[];
+  failures: Array<{
+    itemId: string;
+    attemptCount: number;
+    errorCode: string;
+    errorMessage: string;
+    updatedAt: number;
+  }>;
+}
+
+export interface InventoryBaselinePromotion extends InventoryChangeFeedBinding {
+  runId: string;
+  promotedAt: number;
+}
+
+export interface InventoryBaselinePromotionResult {
+  run: InventoryBaselineRun;
+  meta: InventoryCacheMeta;
+}
+
+export interface InventoryBaselineFailure extends InventoryChangeFeedBinding {
+  runId: string;
+  failureCode: string;
+  failedAt: number;
+}
+
+/** Validate the canonical unsigned decimal representation accepted by PostgreSQL BIGINT. */
+export function isInventoryEventSequence(value: unknown): value is InventoryEventSequence {
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) return false;
+  try {
+    return BigInt(value) <= 9_223_372_036_854_775_807n;
+  } catch {
+    return false;
+  }
+}
+
+/** Stable ledger-verification identifier for one immutable cache receipt. */
+export function createInventoryEventReceiptId(
+  binding: InventoryChangeFeedBinding,
+  eventSeq: InventoryEventSequence
+): string {
+  if (!isInventoryEventSequence(eventSeq) || eventSeq === '0') {
+    throw new Error('Inventory receipt event sequence is invalid.');
+  }
+  const canonical = [
+    binding.accountIdentity,
+    binding.ledgerDatabaseId.toLowerCase(),
+    binding.consumerName,
+    eventSeq,
+  ];
+  return `sha256:${createHash('sha256').update(JSON.stringify(canonical)).digest('hex')}`;
+}
+
+/** Canonical membership proof stored with a resumable inventory baseline. */
+export function createInventoryBaselineRootFingerprint(
+  accountIdentity: string,
+  rootItemIds: string[]
+): string {
+  return `sha256:${createHash('sha256')
+    .update(JSON.stringify([accountIdentity, [...rootItemIds].sort(compareCodeUnitStrings)]))
+    .digest('hex')}`;
+}
 
 export interface CacheState {
   lastSync: number; // Unix timestamp

@@ -46,6 +46,7 @@ import {
   createInventorySnapshotFingerprint,
   createSalesBinderAccountBinding,
   isInventoryCacheMeta,
+  isSupportedSnapshotSchemaVersion,
   inventorySnapshotFingerprintMatches,
 } from './types.js';
 import { PAYMENT_SYNC_STATUS_KEY, PAYMENT_TRANSACTION_COLUMNS } from './payment-cache.constants.js';
@@ -496,8 +497,17 @@ export class SQLiteCacheService implements CacheService {
       this.nullLegacyApiInventoryValues();
       this.rebuildStockLocationsForVersion7();
     }
+    if (fromVersion < 8) this.migrateCacheStateToVersion8();
     // Current indexes may refer to columns introduced by any prior migration.
     this.createIndexes();
+  }
+
+  private migrateCacheStateToVersion8(): void {
+    const state = this.readCacheState();
+    if (state?.schemaVersion !== 7) return;
+    this.db
+      .prepare(`UPDATE cache_meta SET value = ? WHERE key = 'state'`)
+      .run(JSON.stringify({ ...state, schemaVersion: CACHE_SCHEMA_VERSION }));
   }
 
   private nullLegacyApiInventoryValues(): void {
@@ -971,7 +981,8 @@ export class SQLiteCacheService implements CacheService {
   replaceCategorySnapshot(snapshot: CategorySnapshot): Promise<void> {
     this.assertCategorySnapshot(snapshot);
     this.assertSnapshotAccountMatchesBinding(snapshot.meta.accountIdentity);
-    const tx = this.db.transaction(() => this.replaceCategorySnapshotInTransaction(snapshot));
+    const localSnapshot = this.categorySnapshotForCurrentSchema(snapshot);
+    const tx = this.db.transaction(() => this.replaceCategorySnapshotInTransaction(localSnapshot));
     tx.immediate();
     return Promise.resolve();
   }
@@ -1120,6 +1131,10 @@ export class SQLiteCacheService implements CacheService {
   replaceInventorySnapshot(snapshot: InventorySnapshot): Promise<void> {
     this.assertInventorySnapshot(snapshot);
     this.assertSnapshotAccountMatchesBinding(snapshot.meta.accountIdentity);
+    const localSnapshot: InventorySnapshot = {
+      ...snapshot,
+      meta: { ...snapshot.meta, schemaVersion: CACHE_SCHEMA_VERSION },
+    };
     const tx = this.db.transaction(() => {
       const itemInsert = this.db.prepare(this.upsertSql('items', ITEM_COLUMNS, 'item_id'));
       const stockInsert = this.db.prepare(
@@ -1136,13 +1151,13 @@ export class SQLiteCacheService implements CacheService {
           );
       `);
       this.db.prepare(`DELETE FROM items WHERE cache_source = 'api'`).run();
-      for (const item of snapshot.items) {
+      for (const item of localSnapshot.items) {
         itemInsert.run(...this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item)));
       }
-      for (const row of snapshot.stockRows) {
+      for (const row of localSnapshot.stockRows) {
         stockInsert.run(...this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row)));
       }
-      this.writeInventoryMetaInTransaction(snapshot.meta);
+      this.writeInventoryMetaInTransaction(localSnapshot.meta);
 
       const currentState = this.readCacheState();
       this.db.prepare(`INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('state', ?)`).run(
@@ -1157,9 +1172,9 @@ export class SQLiteCacheService implements CacheService {
           schemaVersion: CACHE_SCHEMA_VERSION,
           itemCount: this.count('items'),
           stockLocationCount: this.count('item_stock_locations'),
-          lastItemSync: snapshot.meta.completedAt,
-          lastFullItemSync: snapshot.meta.completedAt,
-          lastSyncAttempt: snapshot.meta.completedAt,
+          lastItemSync: localSnapshot.meta.completedAt,
+          lastFullItemSync: localSnapshot.meta.completedAt,
+          lastSyncAttempt: localSnapshot.meta.completedAt,
           inventorySourceApiVersion: '3',
         } satisfies CacheState)
       );
@@ -1407,6 +1422,12 @@ export class SQLiteCacheService implements CacheService {
   /** Replace the complete local mirror without exposing a partially-written snapshot. */
   replaceMirror(snapshot: SQLiteMirrorSnapshot): Promise<void> {
     assertUniquePaymentTransactionIds(snapshot.paymentTransactions);
+    const localCategorySnapshot = snapshot.categorySnapshot
+      ? this.categorySnapshotForCurrentSchema(snapshot.categorySnapshot)
+      : null;
+    const localInventoryCacheMeta: InventoryCacheMeta | null = snapshot.inventoryCacheMeta
+      ? { ...snapshot.inventoryCacheMeta, schemaVersion: CACHE_SCHEMA_VERSION }
+      : null;
     if (snapshot.categorySnapshot) {
       this.assertCategorySnapshot(snapshot.categorySnapshot);
       this.assertSnapshotAccountMatchesBinding(snapshot.categorySnapshot.meta.accountIdentity);
@@ -1439,10 +1460,15 @@ export class SQLiteCacheService implements CacheService {
       void this.batchInsertDocuments(snapshot.documents);
       void this.batchInsertItemDocuments(snapshot.itemDocuments);
       void this.batchInsertPaymentTransactions(snapshot.paymentTransactions);
-      if (snapshot.cacheState) this.setCacheStateInTransaction(snapshot.cacheState);
-      if (snapshot.categorySnapshot)
-        this.replaceCategorySnapshotInTransaction(snapshot.categorySnapshot, true);
-      if (snapshot.inventoryCacheMeta) {
+      if (snapshot.cacheState) {
+        this.setCacheStateInTransaction({
+          ...snapshot.cacheState,
+          schemaVersion: CACHE_SCHEMA_VERSION,
+        });
+      }
+      if (localCategorySnapshot)
+        this.replaceCategorySnapshotInTransaction(localCategorySnapshot, true);
+      if (localInventoryCacheMeta) {
         const storedItems = this.db.prepare('SELECT * FROM items').all() as ItemRow[];
         const storedStockRows = this.db
           .prepare('SELECT * FROM item_stock_locations')
@@ -1451,17 +1477,13 @@ export class SQLiteCacheService implements CacheService {
           storedItems.filter(isV3ApiRow),
           storedStockRows.filter(isV3ApiRow)
         );
-        this.assertInventoryMetaMatchesRows(
-          snapshot.inventoryCacheMeta,
-          storedItems,
-          storedStockRows
-        );
+        this.assertInventoryMetaMatchesRows(localInventoryCacheMeta, storedItems, storedStockRows);
         this.assertInventoryFingerprintMatches(
-          snapshot.inventoryCacheMeta,
+          localInventoryCacheMeta,
           storedItems,
           storedStockRows
         );
-        this.writeInventoryMetaInTransaction(snapshot.inventoryCacheMeta);
+        this.writeInventoryMetaInTransaction(localInventoryCacheMeta);
         const currentState = this.readCacheState() ?? {
           lastSync: 0,
           lastFullSync: 0,
@@ -1473,6 +1495,8 @@ export class SQLiteCacheService implements CacheService {
         this.setCacheStateInTransaction({
           ...currentState,
           schemaVersion: CACHE_SCHEMA_VERSION,
+          itemCount: this.count('items'),
+          stockLocationCount: this.count('item_stock_locations'),
           inventorySourceApiVersion: '3',
         });
       } else {
@@ -1692,6 +1716,7 @@ export class SQLiteCacheService implements CacheService {
       const generation = randomUUID();
       this.writeInventoryMetaInTransaction({
         ...inventoryMeta,
+        schemaVersion: CACHE_SCHEMA_VERSION,
         generation,
         fingerprint: createInventorySnapshotFingerprint(
           inventoryMeta.accountIdentity,
@@ -1705,9 +1730,24 @@ export class SQLiteCacheService implements CacheService {
     }
   }
 
+  private categorySnapshotForCurrentSchema(snapshot: CategorySnapshot): CategorySnapshot {
+    if (snapshot.meta.schemaVersion === CACHE_SCHEMA_VERSION) return snapshot;
+    const meta: CategoryCacheMeta = {
+      ...snapshot.meta,
+      schemaVersion: CACHE_SCHEMA_VERSION,
+    };
+    return {
+      rows: snapshot.rows,
+      meta: {
+        ...meta,
+        fingerprint: createCategoryFingerprint(meta, snapshot.rows, CACHE_SCHEMA_VERSION),
+      },
+    };
+  }
+
   private readAuthoritativeCategoryMeta(): CategoryCacheMeta | null {
     const state = this.readCacheState();
-    if (state?.schemaVersion !== CACHE_SCHEMA_VERSION) return null;
+    if (!isSupportedSnapshotSchemaVersion(state?.schemaVersion)) return null;
     const marker = this.db
       .prepare('SELECT value FROM cache_meta WHERE key = ?')
       .get(CATEGORY_GENERATION_META_KEY) as CacheMetaRow | undefined;
@@ -1734,14 +1774,17 @@ export class SQLiteCacheService implements CacheService {
     const rows = this.getAllCategoryRows();
     return rows.length === meta.storedRowCount &&
       categorySnapshotRowsIssue(rows, meta.sourceApiVersion) === null &&
-      createCategoryFingerprint(meta, rows, CACHE_SCHEMA_VERSION) === meta.fingerprint
+      createCategoryFingerprint(meta, rows, meta.schemaVersion) === meta.fingerprint
       ? { rows, meta }
       : null;
   }
 
   private readAuthoritativeInventoryMeta(): InventoryCacheMeta | null {
     const state = this.readCacheState();
-    if (state?.schemaVersion !== CACHE_SCHEMA_VERSION || state.inventorySourceApiVersion !== '3')
+    if (
+      !isSupportedSnapshotSchemaVersion(state?.schemaVersion) ||
+      state.inventorySourceApiVersion !== '3'
+    )
       return null;
     const row = this.db
       .prepare('SELECT value FROM cache_meta WHERE key = ?')
@@ -2040,7 +2083,7 @@ export class SQLiteCacheService implements CacheService {
       throw new Error('Category snapshot parent names must be derived from the same snapshot.');
     }
     if (
-      createCategoryFingerprint(snapshot.meta, snapshot.rows, CACHE_SCHEMA_VERSION) !==
+      createCategoryFingerprint(snapshot.meta, snapshot.rows, snapshot.meta.schemaVersion) !==
       snapshot.meta.fingerprint
     ) {
       throw new Error('Category snapshot fingerprint does not match its validated rows.');
@@ -2063,7 +2106,7 @@ export class SQLiteCacheService implements CacheService {
     const persistedState = this.readCacheState();
     if (
       state.schemaVersion === CACHE_SCHEMA_VERSION &&
-      persistedState?.schemaVersion !== CACHE_SCHEMA_VERSION
+      !isSupportedSnapshotSchemaVersion(persistedState?.schemaVersion)
     ) {
       this.db.prepare('DELETE FROM cache_meta WHERE key = ?').run(CATEGORY_GENERATION_META_KEY);
       this.db
@@ -2248,7 +2291,7 @@ const isCategoryCacheMeta = (value: unknown): value is CategoryCacheMeta => {
     isNonNegativeInteger(value.pages) &&
     isNonNegativeInteger(value.sourceRowCount) &&
     isNonNegativeInteger(value.storedRowCount) &&
-    value.schemaVersion === CACHE_SCHEMA_VERSION &&
+    isSupportedSnapshotSchemaVersion(value.schemaVersion) &&
     isApiSourceVersion(value.sourceApiVersion) &&
     isNonEmptyString(value.generation) &&
     isNonEmptyString(value.fingerprint) &&

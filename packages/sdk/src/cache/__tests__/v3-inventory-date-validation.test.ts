@@ -1,6 +1,7 @@
 import { ApiResponseValidationError } from '../../resources/api-response-validation.error.js';
 import type { V3Item, V3ListResponse } from '../../types/items.types.js';
 import type { CacheService } from '../cache.interface.js';
+import { CACHE_SCHEMA_VERSION } from '../types.js';
 import { V3InventoryIndexerService } from '../v3-inventory-indexer.service.js';
 import { normalizeV3InventoryItem } from '../v3-inventory-normalizer.js';
 
@@ -197,7 +198,7 @@ function fakeCache(overrides: Record<string, unknown>): CacheService {
       documentCount: 0,
       itemDocumentCount: 0,
       accountName: 'default',
-      schemaVersion: 7,
+      schemaVersion: CACHE_SCHEMA_VERSION,
     })),
     getCategorySnapshot: jest.fn(async () => null),
     getInventorySnapshot: jest.fn(async () => null),

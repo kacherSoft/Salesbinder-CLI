@@ -18,11 +18,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'crypto';
 import { registerCachePaymentSyncCommand } from './cache-payment-sync.command.js';
-import {
-  CacheSyncProgressController,
-  deriveCacheSyncHealth,
-  projectCacheSyncProgress,
-} from './cache-sync-progress-controller.js';
+import { CacheSyncProgressController } from './cache-sync-progress-controller.js';
 import {
   FullResumeCheckpointStore,
   buildFullResumeCacheIdentity,
@@ -41,6 +37,14 @@ import {
   createSyncLockLossGuard,
   type SyncLockLossGuard,
 } from './postgres-sync-lock-loss.guard.js';
+import {
+  closePreparedInventorySync,
+  normalizeCompatibilityInventorySyncResult,
+  prepareInventorySync,
+  runPreparedInventorySync,
+  type PreparedInventorySync,
+} from './cache-sync-orchestrator.js';
+import { registerCacheStatusCommand } from './cache-status.command.js';
 
 type ActiveFullResume = {
   checkpoint: FullResumeCheckpoint;
@@ -106,6 +110,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
         let lockLoss: SyncLockLossGuard | null = null;
         let postSuccessFailureStatus: CacheSyncStatus | null = null;
         let postSuccessFailureAttempted = false;
+        let preparedInventorySync: PreparedInventorySync | null = null;
 
         try {
           const {
@@ -114,7 +119,6 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             AccountIndexerService,
             CategoryIndexerService,
             DocumentIndexerService,
-            V3InventoryIndexerService,
             DeletedLogSyncService,
             CacheSyncProgressReporter,
             createPostgresCacheService,
@@ -200,6 +204,15 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             }
           }
 
+          preparedInventorySync = await prepareInventorySync({
+            backend: syncTarget,
+            cache: activeCacheService,
+            accountIdentity: accountBinding.accountIdentity,
+            forceFull: Boolean(options.full),
+            assertWriterLockHeld: () => lockLoss?.assertHeld(),
+          });
+          const activePreparedInventorySync = preparedInventorySync;
+
           const syncStartedAtMs = Date.now();
           const currentSyncRunId = `sync-${syncStartedAtMs}-${randomUUID()}`;
           const startedAtSeconds = Math.floor(syncStartedAtMs / 1000);
@@ -252,12 +265,6 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             prefs?.cacheStaleSeconds,
             syncLookbackSeconds,
             { deferGlobalWatermark: true }
-          );
-          const itemIndexer = new V3InventoryIndexerService(
-            v3Client,
-            cacheService,
-            accountName,
-            accountBinding.accountIdentity
           );
           const deletedLogSync = new DeletedLogSyncService(
             client,
@@ -322,9 +329,26 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             })
           );
 
-          const itemResult = await runFullResumePhase('items', () =>
-            itemIndexer.sync({ onProgressEvent, onProgressHeartbeat })
-          );
+          const runInventory = () =>
+            runPreparedInventorySync({
+              prepared: activePreparedInventorySync,
+              cache: activeCacheService,
+              client: v3Client,
+              accountName,
+              accountIdentity: accountBinding.accountIdentity,
+              signal: lockLoss?.signal ?? new AbortController().signal,
+              assertWriterLockHeld: () => lockLoss?.assertHeld(),
+              onProgressEvent,
+              onProgressHeartbeat,
+            });
+          // Feed-backed inventory owns a durable PostgreSQL checkpoint. Keep the
+          // file checkpoint for accounts/categories/documents only.
+          const itemResult =
+            activePreparedInventorySync.selection.mode === 'compatibility_snapshot'
+              ? normalizeCompatibilityInventorySyncResult(
+                  await runFullResumePhase('items', runInventory)
+                )
+              : await awaitWhileSyncLockHeld(lockLoss, runInventory);
 
           const indexedRecordIssues = collectSyncRecordIssues(result, itemResult);
           let deletedResult: DeletedLogSyncResult;
@@ -432,7 +456,8 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           }
           const failedDocuments = recordIssues.filter((issue) => issue.resource === 'document');
           const failedItems = recordIssues.filter((issue) => issue.resource === 'item');
-          const hasWarnings = recordIssues.length > 0;
+          const hasWarnings =
+            recordIssues.length > 0 || itemResult.status === 'success_with_warnings';
           const cloudSyncFinishedAt = Math.floor(Date.now() / 1000);
 
           const finalState = await awaitWhileSyncLockHeld(lockLoss, () =>
@@ -627,6 +652,21 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             sync_type: result.type,
             sync_lookback_seconds: result.syncLookbackSeconds,
             inventory_source_api_version: '3',
+            inventory_sync: {
+              mode: itemResult.mode,
+              status: itemResult.status,
+              baseline_generation: itemResult.baselineGeneration,
+              baseline_promoted: itemResult.baselinePromoted,
+              ledger_promoted: itemResult.ledgerPromoted,
+              target_event_seq: itemResult.targetEventSeq,
+              observed_through_event_seq: itemResult.observedThroughEventSeq,
+              applied_through_event_seq: itemResult.appliedThroughEventSeq,
+              blocked_by_event_seq: itemResult.blockedByEventSeq,
+              events_claimed: itemResult.eventsClaimed,
+              events_completed: itemResult.eventsCompleted,
+              events_failed: itemResult.eventsFailed,
+              issues: itemResult.feedIssues,
+            },
             accounts_processed: accountResult.accountsProcessed,
             customers_processed: accountResult.customersProcessed,
             suppliers_processed: accountResult.suppliersProcessed,
@@ -665,7 +705,10 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
               full_resume: {
                 checkpoint_path: checkpointStore?.checkpointPath,
                 completed_phases: checkpoint?.completedPhases ?? [],
-                granularity: 'phase+document-replay+atomic-v3-inventory-snapshot',
+                granularity:
+                  itemResult.mode === 'compatibility_snapshot'
+                    ? 'phase+document-replay+atomic-v3-inventory-snapshot'
+                    : 'phase+document-replay+database-backed-inventory-resume',
                 document_position: checkpoint?.documents,
                 item_position: checkpoint?.items,
               },
@@ -678,7 +721,11 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           lockLoss?.assertHeld();
           syncProgress.finish();
           console.log(formatJson(output));
-          if (options.fullResume && checkpointStore) {
+          const retainDocumentCheckpointForFeedRetry =
+            options.fullResume &&
+            itemResult.mode !== 'compatibility_snapshot' &&
+            itemResult.status === 'success_with_warnings';
+          if (options.fullResume && checkpointStore && !retainDocumentCheckpointForFeedRetry) {
             try {
               lockLoss?.assertHeld();
               checkpointStore.removeAfterSuccess();
@@ -688,6 +735,10 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
                   'It was retained for a validated retry; use --reset-checkpoint to clear it.'
               );
             }
+          } else if (retainDocumentCheckpointForFeedRetry) {
+            console.error(
+              'Inventory change-feed work remains resumable; retaining the document checkpoint for the next --full-resume attempt.'
+            );
           }
         } catch (error) {
           const safeError = toSafeCacheSyncError(error, Boolean(progressReporter));
@@ -718,6 +769,11 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           console.error(formatError(safeError));
           process.exitCode = 1;
         } finally {
+          try {
+            await closePreparedInventorySync(preparedInventorySync);
+          } catch {
+            // Cache lock release remains mandatory even if the ledger pool close fails.
+          }
           await releaseCacheWriterLockAndClose(cacheService, syncLockKey, lockAcquired);
         }
       }
@@ -952,197 +1008,7 @@ No historical SalesBinder API requests are made.`
       }
     });
 
-  // Status command
-  cache
-    .command('status')
-    .description(
-      `Show cache status and statistics
-
-Example:
-  salesbinder cache status
-
-Displays:
-  - Cache backend (SQLite or PostgreSQL)
-  - Cache file location or connection info
-  - Account name
-  - Last sync time
-  - Document and inventory counts
-  - Category and inventory snapshot authority
-  - Freshness status`
-    )
-    .action(async () => {
-      let cacheService: import('@salesbinder/sdk').CacheService | null = null;
-
-      try {
-        const {
-          createCacheService,
-          createPostgresCacheService,
-          createSalesBinderAccountBinding,
-          DocumentIndexerService,
-          SalesBinderClient,
-          loadConfig,
-          loadPreferences,
-        } = await import('@salesbinder/sdk');
-
-        const dbUrl = process.env.SALESBINDER_DB_URL;
-        const accountName = program.opts().account || 'default';
-        const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
-
-        if (dbUrl) {
-          // PostgreSQL backend
-          const pgCache = await createPostgresCacheService();
-          if (!pgCache) {
-            throw new Error('PostgreSQL backend is configured but could not be opened.');
-          }
-          cacheService = pgCache;
-          await pgCache.verifyAccountBinding(accountBinding);
-          await pgCache.ensureSchema();
-          const client = new SalesBinderClient(accountName);
-          const prefs = loadPreferences();
-          const indexer = new DocumentIndexerService(
-            client,
-            cacheService,
-            accountName,
-            prefs?.cacheStaleSeconds
-          );
-
-          const state = await cacheService.getCacheState();
-          const syncStatus = await cacheService.getSyncStatus();
-          const paymentSyncStatus = await cacheService.getPaymentSyncStatus();
-          const stale = await indexer.isCacheStale();
-          const counts = await collectCacheCounts(cacheService);
-          const categoryMeta = await cacheService.getCategoryCacheMeta();
-          const inventoryMeta = await cacheService.getInventoryCacheMeta();
-
-          await cacheService.close();
-          cacheService = null;
-
-          const maskedUrl = (() => {
-            try {
-              const u = new URL(dbUrl);
-              u.password = '***';
-              return u.toString();
-            } catch {
-              return dbUrl;
-            }
-          })();
-
-          const output = {
-            backend: 'postgresql',
-            connection: maskedUrl,
-            account: accountName,
-            sync_health: deriveCacheSyncHealth(syncStatus),
-            sync_status: projectCacheSyncStatus(syncStatus),
-            ...(state
-              ? {
-                  last_sync: new Date(state.lastSync * 1000).toISOString(),
-                  last_full_sync: new Date(state.lastFullSync * 1000).toISOString(),
-                  ...counts,
-                  schema_version: state.schemaVersion,
-                  is_stale: stale,
-                  freshness: stale ? 'STALE' : 'FRESH',
-                  stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
-                  payment_sync_status: paymentSyncStatus ?? 'not_initialized',
-                  categories: categoryMeta ?? 'not_initialized',
-                  inventory: inventoryMeta ?? 'not_initialized',
-                }
-              : {
-                  message: 'Cache exists but no metadata found. May need full sync.',
-                }),
-          };
-
-          console.log(formatJson(output));
-        } else {
-          // SQLite backend
-          const sanitizedAccount = accountName.replace(/[^a-zA-Z0-9_-]/g, '_');
-          const cacheDir = join(homedir(), '.salesbinder', 'cache');
-          const cacheFile = join(cacheDir, `salesbinder-${sanitizedAccount}.db`);
-
-          const cacheExists = existsSync(cacheFile);
-
-          if (!cacheExists) {
-            console.log(
-              formatJson({
-                backend: 'sqlite',
-                exists: false,
-                account: accountName,
-                cache_file: cacheFile,
-                sync_health: 'not_initialized',
-                sync_status: 'not_initialized',
-                message: 'Cache does not exist. Run "cache sync" to create it.',
-              })
-            );
-            return;
-          }
-
-          const stats = statSync(cacheFile);
-          const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-
-          cacheService = await createCacheService(accountName);
-          await cacheService.verifyAccountBinding(accountBinding);
-          const client = new SalesBinderClient(accountName);
-
-          // Load stale threshold from config
-          const prefs = loadPreferences();
-          const indexer = new DocumentIndexerService(
-            client,
-            cacheService,
-            accountName,
-            prefs?.cacheStaleSeconds
-          );
-
-          const state = await cacheService.getCacheState();
-          const syncStatus = await cacheService.getSyncStatus();
-          const paymentSyncStatus = await cacheService.getPaymentSyncStatus();
-          const stale = await indexer.isCacheStale();
-          const counts = await collectCacheCounts(cacheService);
-          const categoryMeta = await cacheService.getCategoryCacheMeta();
-          const inventoryMeta = await cacheService.getInventoryCacheMeta();
-
-          await cacheService.close();
-          cacheService = null;
-
-          const output = {
-            backend: 'sqlite',
-            exists: true,
-            account: accountName,
-            cache_file: cacheFile,
-            size_mb: parseFloat(sizeMB),
-            sync_health: deriveCacheSyncHealth(syncStatus),
-            sync_status: projectCacheSyncStatus(syncStatus),
-            ...(state
-              ? {
-                  last_sync: new Date(state.lastSync * 1000).toISOString(),
-                  last_full_sync: new Date(state.lastFullSync * 1000).toISOString(),
-                  ...counts,
-                  schema_version: state.schemaVersion,
-                  is_stale: stale,
-                  freshness: stale ? 'STALE' : 'FRESH',
-                  stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
-                  payment_sync_status: paymentSyncStatus ?? 'not_initialized',
-                  categories: categoryMeta ?? 'not_initialized',
-                  inventory: inventoryMeta ?? 'not_initialized',
-                }
-              : {
-                  message: 'Cache exists but no metadata found. May need full sync.',
-                }),
-          };
-
-          console.log(formatJson(output));
-        }
-      } catch (error) {
-        console.error(formatError(error as Error));
-        process.exitCode = 1;
-      } finally {
-        try {
-          if (cacheService && typeof cacheService.close === 'function') {
-            await cacheService.close();
-          }
-        } catch {
-          // Ignore cleanup errors
-        }
-      }
-    });
+  registerCacheStatusCommand(cache, program);
 
   // Pull command (PG → SQLite)
   cache
@@ -1492,62 +1358,8 @@ function isSyncRecordIssueCode(
   return resource === 'item' && (value === 'invalid_variations' || value === 'content_changed');
 }
 
-function projectCacheSyncStatus(
-  status: CacheSyncStatus | null
-): Record<string, unknown> | 'not_initialized' {
-  if (!status) return 'not_initialized';
-  if (!['running', 'success', 'success_with_warnings', 'failed'].includes(status.status)) {
-    return 'not_initialized';
-  }
-  const projected: Record<string, unknown> = {
-    status: status.status,
-    message: {
-      running: 'Sync running',
-      success: 'Sync completed',
-      success_with_warnings: 'Sync completed with warnings',
-      failed: 'Sync failed',
-    }[status.status],
-  };
-  if (typeof status.runId === 'string') projected.runId = status.runId;
-  if (typeof status.accountName === 'string') projected.accountName = status.accountName;
-  if (status.syncTarget === 'sqlite' || status.syncTarget === 'postgresql')
-    projected.syncTarget = status.syncTarget;
-  for (const key of ['startedAt', 'updatedAt', 'finishedAt', 'progressUpdatedAt'] as const) {
-    if (safeOutputNumber(status[key]) !== undefined) projected[key] = status[key];
-  }
-  if (status.syncType === 'full' || status.syncType === 'delta')
-    projected.syncType = status.syncType;
-  for (const key of [
-    'documentsProcessed',
-    'lineItemsProcessed',
-    'itemsProcessed',
-    'categoriesProcessed',
-    'stockRowsProcessed',
-    'deletedRecordsProcessed',
-  ] as const) {
-    if (safeOutputNumber(status[key]) !== undefined) projected[key] = status[key];
-  }
-  const progress = projectCacheSyncProgress(status.progress);
-  if (progress) {
-    projected.phase = progress.phase;
-    projected.progress = progress;
-  }
-  try {
-    const recordIssues = collectSyncRecordIssues(status);
-    if (recordIssues.length > 0) projected.recordIssues = recordIssues;
-  } catch {
-    // Ignore malformed persisted warnings rather than exposing unknown fields.
-  }
-  if (status.status === 'failed') projected.error = 'Cache sync failed.';
-  return projected;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function safeOutputNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function toSafeCacheSyncError(error: unknown, syncStarted: boolean): Error {
@@ -1558,57 +1370,16 @@ function toSafeCacheSyncError(error: unknown, syncStarted: boolean): Error {
     return new Error('SalesBinder rate-limit wait exceeded the 15-minute safety ceiling.');
   }
   const message = error instanceof Error ? error.message : String(error);
+  const errorName = error instanceof Error ? error.name : '';
   if (
     !syncStarted &&
     (message.startsWith('SalesBinder API v3 key is required') ||
       message === 'Another cache sync is already running for this account.' ||
-      message.startsWith('Full-resume checkpoint at '))
+      message.startsWith('Full-resume checkpoint at ') ||
+      errorName === 'ChangeFeedConfigError' ||
+      errorName === 'InventorySyncModeError' ||
+      errorName === 'ChangeFeedRepositoryError')
   )
     return new Error(message);
   return new Error('Cache sync failed.');
-}
-
-async function collectCacheCounts(cacheService: CacheService) {
-  const [
-    documentCount,
-    invoiceCount,
-    poCount,
-    estimateCount,
-    lineItemCount,
-    paymentTransactionCount,
-    accountCount,
-    customerCount,
-    supplierCount,
-    itemCount,
-    categoryCount,
-    stockLocationCount,
-  ] = await Promise.all([
-    cacheService.getDocumentCount(),
-    cacheService.getDocumentCountByContext(5),
-    cacheService.getDocumentCountByContext(11),
-    cacheService.getDocumentCountByContext(4),
-    cacheService.getItemDocumentCount(),
-    cacheService.getPaymentTransactionCount(),
-    cacheService.getAccountCount(),
-    cacheService.getAccountCount(2),
-    cacheService.getAccountCount(10),
-    cacheService.getItemCount(),
-    cacheService.getCategoryCount(),
-    cacheService.getStockLocationCount(),
-  ]);
-
-  return {
-    document_count: documentCount,
-    invoice_document_count: invoiceCount,
-    purchase_order_document_count: poCount,
-    estimate_document_count: estimateCount,
-    line_item_count: lineItemCount,
-    payment_transaction_count: paymentTransactionCount,
-    account_count: accountCount,
-    customer_count: customerCount,
-    supplier_count: supplierCount,
-    item_count: itemCount,
-    category_count: categoryCount,
-    stock_location_count: stockLocationCount,
-  };
 }

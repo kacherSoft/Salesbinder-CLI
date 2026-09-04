@@ -31,3 +31,6 @@ export type {
 
 // Export cache types and services
 export * from './cache/index.js';
+
+// Export the strict PostgreSQL inventory change-feed consumer contract.
+export * from './change-feed/index.js';

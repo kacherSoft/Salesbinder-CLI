@@ -41,6 +41,11 @@ const BOUNDARY_EVENTS = new Set<CacheSyncProgress['event']>([
   'pass_completed',
   'retry_pass_started',
   'waiting_rate_limit',
+  'target_captured',
+  'batch_claimed',
+  'batch_applied',
+  'checkpoint_saved',
+  'blocker_observed',
   'phase_completed',
 ]);
 const PHASES = new Set<CacheSyncProgress['phase']>([
@@ -65,6 +70,12 @@ const EVENTS = new Set<CacheSyncProgress['event']>([
   'record_retry_succeeded',
   'record_retry_failed',
   'waiting_rate_limit',
+  'target_captured',
+  'batch_claimed',
+  'batch_applied',
+  'lease_renewed',
+  'checkpoint_saved',
+  'blocker_observed',
   'phase_completed',
 ]);
 
@@ -106,6 +117,7 @@ export class CacheSyncProgressController {
       recordsProcessed: current?.recordsProcessed ?? 0,
       recordsTotal: current?.recordsTotal ?? null,
       indeterminate: current?.indeterminate ?? true,
+      ...pickInventoryProgress(current),
       apiVersion: observation.apiVersion === 'v3' ? '3' : '2.0',
       timestamp: Math.floor(this.now() / 1000),
       rateLimit: pickRateLimit(observation),
@@ -204,7 +216,7 @@ export function projectCacheSyncProgress(value: unknown): CacheSyncProgress | un
     typeof value.indeterminate !== 'boolean'
   )
     return undefined;
-  return {
+  const projected: CacheSyncProgress = {
     phase: value.phase as CacheSyncProgress['phase'],
     event: value.event as CacheSyncProgress['event'],
     ...(safePositive(value.pass) === undefined ? {} : { pass: safePositive(value.pass) }),
@@ -225,6 +237,35 @@ export function projectCacheSyncProgress(value: unknown): CacheSyncProgress | un
       : { timestamp: safeNonNegative(value.timestamp) }),
     ...(isRecord(value.rateLimit) ? { rateLimit: pickRateLimit(value.rateLimit) } : {}),
   };
+  if (value.mode === 'baseline' || value.mode === 'replay' || value.mode === 'incremental') {
+    projected.mode = value.mode;
+  }
+  for (const key of [
+    'targetEventSeq',
+    'observedThroughEventSeq',
+    'appliedThroughEventSeq',
+  ] as const) {
+    const sequence = safeEventSequence(value[key]);
+    if (sequence !== undefined) projected[key] = sequence;
+  }
+  if (value.blockedByEventSeq === null) {
+    projected.blockedByEventSeq = null;
+  } else {
+    const sequence = safeEventSequence(value.blockedByEventSeq);
+    if (sequence !== undefined) projected.blockedByEventSeq = sequence;
+  }
+  for (const key of [
+    'batchEventCount',
+    'batchItemCount',
+    'queueCount',
+    'retryCount',
+    'deadLetterCount',
+    'lastEventAt',
+  ] as const) {
+    const count = safeNonNegative(value[key]);
+    if (count !== undefined) projected[key] = count;
+  }
+  return projected;
 }
 
 function formatProgress(progress: CacheSyncProgress, now: number): string {
@@ -261,6 +302,11 @@ function boundaryKey(progress: CacheSyncProgress): string {
     progress.event,
     progress.pass,
     progress.apiVersion,
+    progress.mode,
+    progress.targetEventSeq,
+    progress.observedThroughEventSeq,
+    progress.appliedThroughEventSeq,
+    progress.blockedByEventSeq,
     progress.rateLimit?.waitUntil,
   ].join(':');
 }
@@ -276,6 +322,44 @@ function pickRateLimit(value: Record<string, unknown> | CacheSyncRateLimitObserv
   );
 }
 
+type InventoryProgressProjection = Partial<
+  Pick<
+    CacheSyncProgress,
+    | 'mode'
+    | 'targetEventSeq'
+    | 'observedThroughEventSeq'
+    | 'appliedThroughEventSeq'
+    | 'blockedByEventSeq'
+    | 'batchEventCount'
+    | 'batchItemCount'
+    | 'queueCount'
+    | 'retryCount'
+    | 'deadLetterCount'
+    | 'lastEventAt'
+  >
+>;
+
+function pickInventoryProgress(source: CacheSyncProgress | undefined): InventoryProgressProjection {
+  if (!source) return {};
+  const projected: InventoryProgressProjection = {};
+  for (const key of [
+    'mode',
+    'targetEventSeq',
+    'observedThroughEventSeq',
+    'appliedThroughEventSeq',
+    'blockedByEventSeq',
+    'batchEventCount',
+    'batchItemCount',
+    'queueCount',
+    'retryCount',
+    'deadLetterCount',
+    'lastEventAt',
+  ] as const) {
+    if (source[key] !== undefined) Object.assign(projected, { [key]: source[key] });
+  }
+  return projected;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -287,4 +371,13 @@ function safeNonNegative(value: unknown): number | undefined {
 function safePositive(value: unknown): number | undefined {
   const number = safeNonNegative(value);
   return number && number > 0 ? number : undefined;
+}
+
+function safeEventSequence(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) return undefined;
+  try {
+    return BigInt(value) <= 9_223_372_036_854_775_807n ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }

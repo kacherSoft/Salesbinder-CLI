@@ -434,7 +434,7 @@ describe('PgToSqliteSyncService', () => {
         completedAt: 401,
         itemCount: 1,
         stockRowCount: 1,
-        schemaVersion: 7 as const,
+        schemaVersion: CACHE_SCHEMA_VERSION,
         sourceApiVersion: '3' as const,
         generation: 'mirror-inventory-generation',
         fingerprint: createInventorySnapshotFingerprint(
@@ -476,7 +476,7 @@ describe('PgToSqliteSyncService', () => {
         pages: 1,
         sourceRowCount: 1,
         storedRowCount: 1,
-        schemaVersion: 7 as const,
+        schemaVersion: CACHE_SCHEMA_VERSION,
         sourceApiVersion: '3' as const,
         generation: 'mirror-category-generation',
       };
@@ -487,7 +487,11 @@ describe('PgToSqliteSyncService', () => {
           rows: categoryRows,
           meta: {
             ...categoryMeta,
-            fingerprint: createCategoryFingerprint(categoryMeta, categoryRows, 7),
+            fingerprint: createCategoryFingerprint(
+              categoryMeta,
+              categoryRows,
+              CACHE_SCHEMA_VERSION
+            ),
           },
         },
         inventoryCacheMeta,
@@ -502,7 +506,7 @@ describe('PgToSqliteSyncService', () => {
           documentCount: 0,
           itemDocumentCount: 0,
           accountName: 'mirror',
-          schemaVersion: 7,
+          schemaVersion: CACHE_SCHEMA_VERSION,
           inventorySourceApiVersion: '3',
         },
         paymentSyncStatus: null,

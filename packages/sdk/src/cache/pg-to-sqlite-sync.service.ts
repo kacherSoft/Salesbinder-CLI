@@ -6,11 +6,14 @@
  * PostgreSQL is the shared source of truth (populated by `cache sync`).
  */
 
+import { randomUUID } from 'node:crypto';
 import type {
   AccountRow,
   CacheAccountBinding,
+  CacheState,
   CacheSyncStatus,
   DocumentRow,
+  InventoryCacheMeta,
   ItemDocumentRow,
   ItemRow,
   ItemStockLocationRow,
@@ -26,7 +29,12 @@ import type { PaymentTransactionRow } from './payment-sync.types.js';
 import { PostgresCacheService, PostgresSyncLockLostError } from './postgres-cache.service.js';
 import { SQLiteCacheService } from './sqlite-cache.service.js';
 import { loadConfig } from '../config/config.loader.js';
-import { createSalesBinderAccountBinding, DocumentContextId } from './types.js';
+import {
+  CACHE_SCHEMA_VERSION,
+  createInventorySnapshotFingerprint,
+  createSalesBinderAccountBinding,
+  DocumentContextId,
+} from './types.js';
 import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
 
 /** Result of a PG → SQLite pull */
@@ -185,6 +193,14 @@ export async function pullFromPostgres(
       const allMasterItems = await lockLoss.runAbortablePgOperation(() => getAllItems(pgService));
       const allStockRows = await lockLoss.runAbortablePgOperation(() => getAllStockRows(pgService));
       const pgState = await lockLoss.runAbortablePgOperation(() => pgService.getCacheState());
+      const localInventoryCacheMeta = createLocalInventoryCacheMeta(
+        inventoryCacheMeta,
+        pgState,
+        resolvedBinding.accountIdentity,
+        allMasterItems,
+        allStockRows,
+        Math.floor(Date.now() / 1_000)
+      );
       const pgPaymentSyncStatus = await lockLoss.runAbortablePgOperation(() =>
         pgService.getPaymentSyncStatus()
       );
@@ -202,7 +218,7 @@ export async function pullFromPostgres(
         await sqliteService.replaceMirror({
           accounts: allAccounts,
           categorySnapshot,
-          inventoryCacheMeta,
+          inventoryCacheMeta: localInventoryCacheMeta,
           items: allMasterItems,
           itemStockLocations: allStockRows,
           documents: allDocs,
@@ -681,6 +697,84 @@ async function getAllItems(pg: PostgresCacheService): Promise<ItemRow[]> {
 
 async function getAllStockRows(pg: PostgresCacheService): Promise<ItemStockLocationRow[]> {
   return pg.getAllItemStockLocations();
+}
+
+function createLocalInventoryCacheMeta(
+  sourceMeta: InventoryCacheMeta | null,
+  sourceState: CacheState | null,
+  accountIdentity: string,
+  items: ItemRow[],
+  stockRows: ItemStockLocationRow[],
+  completedAt: number
+): InventoryCacheMeta | null {
+  if (sourceState?.inventorySourceApiVersion !== '3') return null;
+  if (!sourceMeta && sourceState.schemaVersion !== CACHE_SCHEMA_VERSION) return null;
+  const authoritativeItems = items.filter(isV3ApiInventoryRow);
+  const authoritativeStockRows = stockRows.filter(isV3ApiInventoryRow);
+  const generation = randomUUID();
+  const itemCount = authoritativeItems.length;
+  const stockRowCount = authoritativeStockRows.length;
+  const localMeta: InventoryCacheMeta = sourceMeta
+    ? sourceMeta.version === 1
+      ? {
+          ...sourceMeta,
+          itemCount,
+          stockRowCount,
+          schemaVersion: CACHE_SCHEMA_VERSION,
+          generation,
+          fingerprint: '',
+        }
+      : {
+          ...sourceMeta,
+          itemCount,
+          stockRowCount,
+          freshItemCount:
+            sourceMeta.status === 'complete'
+              ? itemCount
+              : itemCount - sourceMeta.preservedItemCount,
+          schemaVersion: CACHE_SCHEMA_VERSION,
+          generation,
+          fingerprint: '',
+        }
+    : {
+        version: 2,
+        status: 'complete',
+        accountIdentity,
+        startedAt: completedAt,
+        completedAt,
+        itemCount,
+        stockRowCount,
+        schemaVersion: CACHE_SCHEMA_VERSION,
+        sourceApiVersion: '3',
+        generation,
+        fingerprint: '',
+        freshItemCount: itemCount,
+        preservedItemCount: 0,
+        omittedItemCount: 0,
+        warningCount: 0,
+        lastCompleteAt: completedAt,
+      };
+  if (
+    localMeta.version === 2 &&
+    (localMeta.freshItemCount < 0 ||
+      localMeta.freshItemCount + localMeta.preservedItemCount !== itemCount)
+  ) {
+    return null;
+  }
+  return {
+    ...localMeta,
+    schemaVersion: CACHE_SCHEMA_VERSION,
+    fingerprint: createInventorySnapshotFingerprint(
+      localMeta.accountIdentity,
+      generation,
+      authoritativeItems,
+      authoritativeStockRows
+    ),
+  };
+}
+
+function isV3ApiInventoryRow(value: ItemRow | ItemStockLocationRow): boolean {
+  return value.cache_source === 'api' && value.source_api_version === '3';
 }
 
 async function getAllPaymentTransactions(

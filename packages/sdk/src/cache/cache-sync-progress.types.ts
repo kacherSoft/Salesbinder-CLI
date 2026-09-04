@@ -22,7 +22,16 @@ export type CacheSyncProgressEventType =
   | 'record_retry_succeeded'
   | 'record_retry_failed'
   | 'waiting_rate_limit'
+  | 'target_captured'
+  | 'batch_claimed'
+  | 'batch_applied'
+  | 'lease_renewed'
+  | 'checkpoint_saved'
+  | 'blocker_observed'
   | 'phase_completed';
+
+/** Inventory execution mode, exposed without ledger or item identities. */
+export type CacheSyncInventoryMode = 'baseline' | 'replay' | 'incremental';
 
 /** Redacted rate-limit details safe to persist or render. */
 export interface CacheSyncRateLimitProgress {
@@ -52,6 +61,17 @@ export interface CacheSyncProgress {
   apiVersion?: '2.0' | '3';
   timestamp?: number;
   rateLimit?: CacheSyncRateLimitProgress;
+  mode?: CacheSyncInventoryMode;
+  targetEventSeq?: string;
+  observedThroughEventSeq?: string;
+  appliedThroughEventSeq?: string;
+  blockedByEventSeq?: string | null;
+  batchEventCount?: number;
+  batchItemCount?: number;
+  queueCount?: number;
+  retryCount?: number;
+  deadLetterCount?: number;
+  lastEventAt?: number;
 }
 
 export type CacheSyncProgressCallback = (event: CacheSyncProgress) => void;

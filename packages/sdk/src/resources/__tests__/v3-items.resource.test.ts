@@ -55,6 +55,132 @@ describe('V3ItemsResource', () => {
     expect(get).toHaveBeenCalledWith('/items/item-1');
   });
 
+  it.each([1, 50])('serializes %i exact item IDs in one archived v3 request', async (count) => {
+    const ids = Array.from({ length: count }, (_, index) => canonicalId(index + 1));
+    const get = jest.fn().mockResolvedValue({
+      data: listEnvelope(
+        ids.map((id) => v3Item(id)),
+        '/api/v3/items'
+      ),
+    });
+    const resource = createResource(get);
+
+    const result = await resource.getMany(ids);
+
+    expect(result.items.map(({ id }) => id)).toEqual(ids);
+    expect(result.omittedIds).toEqual([]);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledWith('/items', {
+      params: { ids: ids.join(','), archived: 'all' },
+    });
+  });
+
+  it('preserves caller order when the exact-ID response returns items in a different order', async () => {
+    const ids = [canonicalId(1), canonicalId(2), canonicalId(3)];
+    const get = jest.fn().mockResolvedValue({
+      data: listEnvelope([v3Item(ids[2]), v3Item(ids[0]), v3Item(ids[1])], '/api/v3/items'),
+    });
+    const resource = createResource(get);
+
+    const result = await resource.getMany(ids);
+
+    expect(result.items.map(({ id }) => id)).toEqual(ids);
+    expect(result.omittedIds).toEqual([]);
+  });
+
+  it('reports omitted exact IDs without issuing a fallback lookup', async () => {
+    const ids = [canonicalId(1), canonicalId(2), canonicalId(3)];
+    const get = jest.fn().mockResolvedValue({
+      data: listEnvelope([v3Item(ids[1])], '/api/v3/items'),
+    });
+    const resource = createResource(get);
+
+    const result = await resource.getMany(ids);
+
+    expect(result.items.map(({ id }) => id)).toEqual([ids[1]]);
+    expect(result.omittedIds).toEqual([ids[0], ids[2]]);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledWith('/items', {
+      params: { ids: ids.join(','), archived: 'all' },
+    });
+  });
+
+  it('passes through archived exact-ID results', async () => {
+    const id = canonicalId(1);
+    const get = jest.fn().mockResolvedValue({
+      data: listEnvelope([v3Item(id, { archived: true })], '/api/v3/items'),
+    });
+    const resource = createResource(get);
+
+    await expect(resource.getMany([id])).resolves.toMatchObject({
+      items: [{ id, archived: true }],
+      omittedIds: [],
+    });
+  });
+
+  it.each([
+    { label: 'empty', ids: [] },
+    { label: '51 IDs', ids: Array.from({ length: 51 }, (_, index) => canonicalId(index + 1)) },
+  ])('rejects $label exact-ID requests before making an HTTP request', async ({ ids }) => {
+    const get = jest.fn();
+    const resource = createResource(get);
+
+    await expect(resource.getMany(ids)).rejects.toThrow(RangeError);
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: 'duplicate IDs', ids: [canonicalId(1), canonicalId(1)] },
+    { label: 'noncanonical UUIDs', ids: ['00000000-0000-4000-8000-00000000000A'] },
+  ])('rejects $label before making an HTTP request', async ({ ids }) => {
+    const get = jest.fn();
+    const resource = createResource(get);
+
+    await expect(resource.getMany(ids)).rejects.toThrow(TypeError);
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('rejects unexpected exact-ID response identities', async () => {
+    const get = jest.fn().mockResolvedValue({
+      data: listEnvelope([v3Item(canonicalId(2))], '/api/v3/items'),
+    });
+    const resource = createResource(get);
+
+    await expect(resource.getMany([canonicalId(1)])).rejects.toThrow(
+      ApiResponseValidationError
+    );
+  });
+
+  it('rejects duplicate exact-ID response identities', async () => {
+    const id = canonicalId(1);
+    const get = jest.fn().mockResolvedValue({
+      data: listEnvelope([v3Item(id), v3Item(id)], '/api/v3/items'),
+    });
+    const resource = createResource(get);
+
+    await expect(resource.getMany([id])).rejects.toThrow(ApiResponseValidationError);
+  });
+
+  it.each([
+    {
+      label: 'malformed item object',
+      data: [{ id: canonicalId(1), object: 'customer' }],
+      message: 'expected item objects',
+    },
+    {
+      label: 'malformed item identity',
+      data: [v3Item('ITEM-1')],
+      message: 'expected canonical item identities',
+    },
+  ])('rejects $label in exact-ID responses', async ({ data, message }) => {
+    const get = jest.fn().mockResolvedValue({
+      data: listEnvelope(data, '/api/v3/items'),
+    });
+    const resource = createResource(get);
+
+    await expect(resource.getMany([canonicalId(1)])).rejects.toThrow(message);
+  });
+
   it('lists variations with locations and preserves the location row id', async () => {
     const variation = {
       id: 'variation-1',
@@ -158,4 +284,12 @@ function listEnvelope(data: unknown[], url: string) {
     data,
     pagination: { page: 1, per_page: 100, total_pages: 1, total_records: data.length },
   };
+}
+
+function canonicalId(index: number): string {
+  return `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`;
+}
+
+function v3Item(id: string, overrides: Partial<typeof item> = {}) {
+  return { ...item, id, ...overrides };
 }

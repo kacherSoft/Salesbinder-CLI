@@ -1,16 +1,15 @@
-import { ApiResponseValidationError } from '../resources/api-response-validation.error.js';
 import type { V3Item, V3ItemVariation, V3ListResponse } from '../types/items.types.js';
 import type { CacheService } from './cache.interface.js';
 import type { CacheSyncProgress, CacheSyncProgressCallback } from './cache-sync-progress.types.js';
 import type { SyncRecordIssue } from './sync-record-issue.types.js';
 import { CACHE_SCHEMA_VERSION } from './types.js';
+import type { NormalizedV3InventoryItem } from './v3-inventory-normalizer.js';
 import {
-  normalizeV3InventoryItem,
-  type NormalizedV3InventoryItem,
-} from './v3-inventory-normalizer.js';
+  observeV3InventorySnapshotItem,
+  type V3ItemHydrationObservation,
+} from './v3-exact-item-hydrator.service.js';
 import {
   fetchAllV3PageSnapshot,
-  fetchAllV3Pages,
   sameV3PaginationSignature,
   type V3PageSnapshot,
   type V3PaginationSignature,
@@ -21,13 +20,11 @@ import {
   classifyInventoryLocalFailure,
   contentChangedReason,
   createInventorySnapshot,
-  invalidRecordReason,
   type LocalIssueReason,
 } from './v3-inventory-recovery.js';
 import {
   assertCanonicalV3SourceId,
   compareSourceIds,
-  createV3ItemSourceFingerprint,
   sameSourceIdArray,
 } from './v3-inventory-source-validation.js';
 
@@ -64,11 +61,7 @@ export interface V3InventorySyncResult {
   recordIssues: SyncRecordIssue[];
 }
 
-interface ItemObservation {
-  normalized?: NormalizedV3InventoryItem;
-  fingerprint?: string;
-  failure?: LocalIssueReason;
-}
+type ItemObservation = V3ItemHydrationObservation;
 
 interface RootPass {
   items: V3Item[];
@@ -319,7 +312,10 @@ export class V3InventoryIndexerService {
     const observations = new Map<string, ItemObservation>();
     let recordsProcessed = 0;
     for (const item of root.items) {
-      observations.set(item.id, await this.observeItem(item, categoryNames));
+      observations.set(
+        item.id,
+        await observeV3InventorySnapshotItem(this.client, item, categoryNames)
+      );
       recordsProcessed++;
       this.emit(onProgressEvent, {
         event: 'record_processed',
@@ -348,38 +344,6 @@ export class V3InventoryIndexerService {
     return reader.bind(this.cache);
   }
 
-  private async observeItem(
-    item: V3Item,
-    categoryNames: Map<string, string> | null
-  ): Promise<ItemObservation> {
-    if (!Number.isSafeInteger(item.variation_count) || item.variation_count < 0) {
-      return { failure: invalidRecordReason() };
-    }
-
-    let variations: V3ItemVariation[];
-    try {
-      // The live v3 root item's variation_count is advisory and can lag behind
-      // the authoritative paginated variations endpoint (including reporting
-      // zero while rows exist). Always read and validate the endpoint snapshot.
-      variations = await this.fetchAllVariations(item);
-    } catch (error) {
-      const failure = classifyInventoryLocalFailure(error, 'variations');
-      if (failure) return { failure };
-      throw error;
-    }
-
-    try {
-      return {
-        normalized: normalizeV3InventoryItem(item, variations, categoryNames),
-        fingerprint: createV3ItemSourceFingerprint(item, variations),
-      };
-    } catch (error) {
-      const failure = classifyInventoryLocalFailure(error, 'record');
-      if (failure) return { failure };
-      throw error;
-    }
-  }
-
   private async recoverItem(
     id: string,
     categoryNames: Map<string, string> | null
@@ -396,7 +360,7 @@ export class V3InventoryIndexerService {
     if (item.id !== id) {
       throw new Error('V3 item detail identity did not match the requested item');
     }
-    return this.observeItem(item, categoryNames);
+    return observeV3InventorySnapshotItem(this.client, item, categoryNames);
   }
 
   private fetchAllItems(
@@ -431,19 +395,6 @@ export class V3InventoryIndexerService {
                 indeterminate: false,
               }),
           }
-    );
-  }
-
-  private fetchAllVariations(item: V3Item): Promise<V3ItemVariation[]> {
-    return fetchAllV3Pages(
-      (page) =>
-        this.client.items.listVariations(item.id, {
-          page,
-          limit: PAGE_LIMIT,
-          include: 'locations',
-        }),
-      `variations for item ${item.id}`,
-      (message) => new ApiResponseValidationError(message, 'variations')
     );
   }
 

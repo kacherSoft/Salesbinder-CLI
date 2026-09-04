@@ -38,7 +38,15 @@ type ProtectedStatusKey =
 
 export type CacheSyncStatusSummary = Partial<Omit<CacheSyncStatus, ProtectedStatusKey>>;
 
-const FORCED_EVENTS = new Set<CacheSyncProgress['event']>(['phase_started', 'phase_completed']);
+const FORCED_EVENTS = new Set<CacheSyncProgress['event']>([
+  'phase_started',
+  'target_captured',
+  'batch_claimed',
+  'batch_applied',
+  'checkpoint_saved',
+  'blocker_observed',
+  'phase_completed',
+]);
 
 /** Serializes and throttles complete cache sync status replacements for one run. */
 export class CacheSyncProgressReporter {
@@ -59,6 +67,7 @@ export class CacheSyncProgressReporter {
   private lastRateLimitSignature?: string;
   private lastRateLimitDeadline?: number;
   private persistedWaiting = false;
+  private currentProgress?: CacheSyncProgress;
 
   constructor(
     private readonly cache: Pick<CacheService, 'setSyncStatus'>,
@@ -103,6 +112,7 @@ export class CacheSyncProgressReporter {
   emit(event: CacheSyncProgress): void {
     if (this.terminalCommitted || this.terminalAttempt) return;
     const progress = projectProgress(event);
+    this.currentProgress = progress;
     const now = this.now();
     if (!this.shouldPersist(progress, now)) return;
 
@@ -125,13 +135,14 @@ export class CacheSyncProgressReporter {
 
   emitRateLimit(phase: CacheSyncPhase, event: CacheSyncRateLimitObservation): void {
     if (event.type !== 'wait' && event.type !== 'cooldown') return;
-    const previous = this.status.progress?.phase === phase ? this.status.progress : undefined;
+    const previous = this.currentProgress?.phase === phase ? this.currentProgress : undefined;
     this.emit({
       phase,
       event: 'waiting_rate_limit',
       recordsProcessed: previous?.recordsProcessed ?? 0,
       recordsTotal: previous?.recordsTotal ?? null,
       indeterminate: previous?.indeterminate ?? true,
+      ...projectInventoryProgress(previous),
       apiVersion: event.apiVersion === 'v2' ? '2.0' : '3',
       timestamp: toUnixSeconds(this.now()),
       rateLimit: projectRateLimit(event),
@@ -259,7 +270,61 @@ function projectProgress(event: CacheSyncProgress): CacheSyncProgress {
   for (const key of ['pass', 'page', 'pagesTotal', 'apiVersion', 'timestamp'] as const) {
     if (event[key] !== undefined) Object.assign(projected, { [key]: event[key] });
   }
+  Object.assign(projected, projectInventoryProgress(event));
   if (event.rateLimit) projected.rateLimit = projectRateLimit(event.rateLimit);
+  return projected;
+}
+
+type InventoryProgressProjection = Partial<
+  Pick<
+    CacheSyncProgress,
+    | 'mode'
+    | 'targetEventSeq'
+    | 'observedThroughEventSeq'
+    | 'appliedThroughEventSeq'
+    | 'blockedByEventSeq'
+    | 'batchEventCount'
+    | 'batchItemCount'
+    | 'queueCount'
+    | 'retryCount'
+    | 'deadLetterCount'
+    | 'lastEventAt'
+  >
+>;
+
+function projectInventoryProgress(
+  source: CacheSyncProgress | undefined
+): InventoryProgressProjection {
+  if (!source) return {};
+  const projected: InventoryProgressProjection = {};
+  if (source.mode === 'baseline' || source.mode === 'replay' || source.mode === 'incremental') {
+    projected.mode = source.mode;
+  }
+  for (const key of [
+    'targetEventSeq',
+    'observedThroughEventSeq',
+    'appliedThroughEventSeq',
+  ] as const) {
+    const sequence = safeEventSequence(source[key]);
+    if (sequence !== undefined) projected[key] = sequence;
+  }
+  if (source.blockedByEventSeq === null) {
+    projected.blockedByEventSeq = null;
+  } else {
+    const sequence = safeEventSequence(source.blockedByEventSeq);
+    if (sequence !== undefined) projected.blockedByEventSeq = sequence;
+  }
+  for (const key of [
+    'batchEventCount',
+    'batchItemCount',
+    'queueCount',
+    'retryCount',
+    'deadLetterCount',
+    'lastEventAt',
+  ] as const) {
+    const count = safeNonNegativeInteger(source[key]);
+    if (count !== undefined) projected[key] = count;
+  }
   return projected;
 }
 
@@ -295,6 +360,19 @@ function validInterval(value: number | undefined, fallback: number): number {
 
 function toUnixSeconds(milliseconds: number): number {
   return Math.floor(milliseconds / 1_000);
+}
+
+function safeEventSequence(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) return undefined;
+  try {
+    return BigInt(value) <= 9_223_372_036_854_775_807n ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function safeFailureMessage(_error: unknown): string {
