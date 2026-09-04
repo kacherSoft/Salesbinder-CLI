@@ -5,10 +5,7 @@ import type {
 } from './change-feed.constants.js';
 
 export type ChangeFeedEventSequence = string;
-export type ChangeFeedHydrationOutcome =
-  | 'found_current'
-  | 'found_archived'
-  | 'expected_tombstone';
+export type ChangeFeedHydrationOutcome = 'found_current' | 'found_archived' | 'expected_tombstone';
 export type ChangeFeedTerminalStatus = 'succeeded' | 'superseded_by_succeeded';
 export type ChangeFeedFailureStatus = 'retry' | 'dead_letter';
 export type ChangeFeedSyncKind = 'initial_full_sync' | 'cutover_replay' | 'reconciliation';
@@ -188,7 +185,10 @@ export interface ChangeFeedRepository {
   getStatus(): Promise<ChangeFeedConsumerStatus>;
   beginSyncRun(input: BeginChangeFeedSyncRun): Promise<ChangeFeedSyncBarrier>;
   verifyBaseline(syncRunId: string, receipt: VerifiedBaselineReceipt): Promise<void>;
-  captureSyncTarget(syncRunId: string, lockTimeoutMs: number): Promise<ChangeFeedEventSequence | null>;
+  captureSyncTarget(
+    syncRunId: string,
+    lockTimeoutMs: number
+  ): Promise<ChangeFeedEventSequence | null>;
   coverBaseline(syncRunId: string): Promise<string>;
   promoteSyncRun(syncRunId: string): Promise<void>;
   failSyncRun(input: FailChangeFeedSyncRun): Promise<void>;

@@ -2340,8 +2340,7 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
 
   private changeFeedStore(): PostgresInventoryChangeFeedStore {
     return (this.inventoryChangeFeedStore ??= new PostgresInventoryChangeFeedStore({
-      withVerifiedWrite: (run, operationSignal) =>
-        this.withVerifiedWrite(run, operationSignal),
+      withVerifiedWrite: (run, operationSignal) => this.withVerifiedWrite(run, operationSignal),
       withReadOnlyTransaction: (run) => this.withReadOnlyTransaction(run),
       assertItemBundle: (item, stockRows) => {
         const issue = inventorySnapshotRowsIssue([item], stockRows);

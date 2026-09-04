@@ -7,7 +7,8 @@ const { Pool: PostgresPool } = pg;
 function isConnectionFailure(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const code = (error as Error & { code?: string }).code;
-  return code?.startsWith('08') === true ||
+  return (
+    code?.startsWith('08') === true ||
     [
       '57P01',
       '57P02',
@@ -17,7 +18,8 @@ function isConnectionFailure(error: unknown): boolean {
       'EHOSTUNREACH',
       'ENETUNREACH',
       'ETIMEDOUT',
-    ].includes(code ?? '');
+    ].includes(code ?? '')
+  );
 }
 
 export class PostgresChangeFeedQueryRunner {
@@ -97,7 +99,8 @@ export class PostgresChangeFeedQueryRunner {
     values: readonly unknown[],
     operationSignal?: AbortSignal
   ): Promise<Row[]> {
-    if (operationSignal?.aborted) throw translateChangeFeedError(abortSignalReason(operationSignal));
+    if (operationSignal?.aborted)
+      throw translateChangeFeedError(abortSignalReason(operationSignal));
     let client: PoolClient;
     try {
       client = await this.#pool.connect();

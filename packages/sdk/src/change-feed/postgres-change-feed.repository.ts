@@ -1,12 +1,6 @@
 import type { Pool, QueryResultRow } from 'pg';
-import {
-  SALESBINDER_CLI_INVENTORY_CONSUMER,
-} from './change-feed.constants.js';
-import {
-  ChangeFeedRepositoryError,
-  invalidInput,
-  invalidResponse,
-} from './change-feed.errors.js';
+import { SALESBINDER_CLI_INVENTORY_CONSUMER } from './change-feed.constants.js';
+import { ChangeFeedRepositoryError, invalidInput, invalidResponse } from './change-feed.errors.js';
 import {
   mapActiveRunRow,
   mapClaimRows,
@@ -53,11 +47,7 @@ import { PostgresChangeFeedQueryRunner } from './postgres-change-feed-query-runn
 
 type Row = QueryResultRow & Record<string, unknown>;
 const RUN_KINDS = new Set(['initial_full_sync', 'cutover_replay', 'reconciliation']);
-const HYDRATION_OUTCOMES = new Set([
-  'found_current',
-  'found_archived',
-  'expected_tombstone',
-]);
+const HYDRATION_OUTCOMES = new Set(['found_current', 'found_archived', 'expected_tombstone']);
 
 export class PostgresChangeFeedRepository implements ChangeFeedRepository {
   readonly #accountIdentity: string;
@@ -298,10 +288,10 @@ export class PostgresChangeFeedRepository implements ChangeFeedRepository {
 
   async promoteSyncRun(syncRunId: string): Promise<void> {
     this.#requirePreflight();
-    await this.#execute(
-      `SELECT public.promote_change_feed_sync_run($1::uuid, $2::text)`,
-      [assertInputUuid(syncRunId, 'sync-run ID'), SALESBINDER_CLI_INVENTORY_CONSUMER]
-    );
+    await this.#execute(`SELECT public.promote_change_feed_sync_run($1::uuid, $2::text)`, [
+      assertInputUuid(syncRunId, 'sync-run ID'),
+      SALESBINDER_CLI_INVENTORY_CONSUMER,
+    ]);
   }
 
   async failSyncRun(input: FailChangeFeedSyncRun): Promise<void> {
@@ -396,7 +386,8 @@ function validateClaim(options: ClaimChangeFeedOptions): {
   const batchSize = assertInputInteger(options.batchSize, 'batch size', 1, 100);
   const leaseSeconds = assertInputInteger(options.leaseSeconds, 'lease seconds', 1, 900);
   if (options.mode === 'ordinary') {
-    if (options.syncRunId !== undefined) throw invalidInput('ordinary claim cannot include sync-run ID');
+    if (options.syncRunId !== undefined)
+      throw invalidInput('ordinary claim cannot include sync-run ID');
     return {
       leaseOwner,
       batchSize,
