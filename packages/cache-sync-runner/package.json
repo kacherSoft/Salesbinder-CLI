@@ -1,0 +1,31 @@
+{
+  "name": "@salesbinder/cache-sync-runner",
+  "version": "0.1.0",
+  "description": "Private background runner for scheduled SalesBinder cache synchronization",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix"
+  },
+  "dependencies": {
+    "@salesbinder/cli": "workspace:*",
+    "@salesbinder/sdk": "workspace:*",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.20.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}

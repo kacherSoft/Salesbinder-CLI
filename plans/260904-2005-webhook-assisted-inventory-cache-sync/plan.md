@@ -19,6 +19,8 @@ Before this update, `cache sync` always performed a complete V3 item membership 
 ## Decisions
 
 - Receiver/immutable ledger stay separate; CLI consumes a scoped **inventory** stream while other events remain stored without blocking it.
+- The approved runner boundary is a private `packages/cache-sync-runner` package in this monorepo, deployed as a separate URL-less Coolify app. The webhook service stays ingest-only; its receiver process never runs cache jobs.
+- `SALESBINDER_SCHEDULER_DISABLED=false` is the exact activation switch; otherwise the runner stays disabled. Normal sync defaults to 900 seconds, weekly status drives `cache sync --full`, and repeated full attempts are throttled for 24 hours.
 - `created_at`/`updated_at` are version guards only. They are not list cursors; V3 exposes no timestamp filter.
 - Initial/forced full sync still exists, but detail hydration runs once and resumes from PostgreSQL staging.
 - Changes during a full run are replayed from the ledger between start and fixed cutover barriers before promotion.
@@ -29,7 +31,7 @@ Before this update, `cache sync` always performed a complete V3 item membership 
 ## Scope
 
 **In:** ledger consumer contract v2 prerequisite, exact-ID item hydration, cache schema v8 staging/receipts, resumable full cutover, incremental event drain, progress/status, recovery tests, production canary and rollout.
-**Out:** webhook HTTP ingress inside CLI, MCP server work, document/account event hydration, timestamp polling, always-on daemon, automatic deletion from unexplained API omission, and removal of periodic reconciliation.
+**Out:** webhook HTTP ingress inside CLI, MCP server work, document/account event hydration, timestamp polling, a cache loop inside webhook ingress, automatic deletion from unexplained API omission, and removal of periodic reconciliation.
 
 ## Phases
 
@@ -60,8 +62,7 @@ Before this update, `cache sync` always performed a complete V3 item membership 
 
 - Deployed `kacherSoft/Salesbinder-Webhook-Service` and its private PostgreSQL ledger.
 - Official V3 exact-ID mode: `GET /api/v3/items?ids=...`, maximum 50, includes archived/sold known IDs.
-- One SalesBinder account per cache DB and per ledger DB; account bindings must match.
-- Least-privilege ledger worker login separate from receiver and migration identities.
+- One SalesBinder account per cache/ledger DB; bindings must match, and the least-privilege worker login stays separate from receiver/migration identities.
 
 ## Success Criteria
 
@@ -75,4 +76,4 @@ Before this update, `cache sync` always performed a complete V3 item membership 
 
 ## Remaining Input
 
-Add a durable read-only `SALESBINDER_V3_API_KEY`; authorize or directly configure V2 and least-privilege database credentials; choose a supported task interface because Coolify `4.0.0-beta.463` returns `404` for application task REST routes.
+The durable read-only V3 key is locally present and passed a live `/api/v3/items` authentication/schema probe. Configure the reviewed runner with V2 and least-privilege database credentials, then restart with `SALESBINDER_SCHEDULER_DISABLED=false`, run the real-event canary, and keep the 900-second normal sync plus weekly status-driven `--full` cadence.

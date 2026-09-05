@@ -65,8 +65,8 @@ Validate the complete two-database handoff, production event behavior, operation
 2. Deploy Phase 1 ledger migration and worker login; receiver remains on least-privilege ingest role.
 3. Deploy CLI code with `SALESBINDER_SCHEDULER_DISABLED=true`; run container runtime verification before credential/cutover preflight.
 4. Run initial resumable baseline and bounded replay; do not set feed-bound state until clean promotion.
-5. Enable normal event drain every 15 minutes through the existing scheduler/service runner.
-6. Schedule full reconciliation weekly initially; adjust only after observed webhook coverage proves safe.
+5. Enable normal event drain every 900 seconds through the approved runner app.
+6. Let `cache status` trigger weekly `cache sync --full`; repeated full attempts stay throttled for 24 hours through an atomic cache-DB metadata claim that survives runner replacement.
 7. Alert on receiver inactivity, queue age, retry/dead-letter, blocker cursor, repeated 429, sync lock loss and baseline age.
 
 ## Rollback
@@ -126,8 +126,8 @@ Validate the complete two-database handoff, production event behavior, operation
 - Coolify application `s0gcsk404kso88sc48s88wok` built and runs commit `f41159cb1fceed772b60eb7a43bdbdf37ac331b7` from the repository Dockerfile.
 - Runtime startup verified compiled CLI/SDK resolution and a native in-memory SQLite query.
 - The runner remains intentionally disabled; no production sync or database mutation has run from it.
-- Coolify `4.0.0-beta.463` returns `404` for application scheduled-task REST routes, so task activation needs a supported interface or separately authorized server upgrade.
+- Coolify `4.0.0-beta.463` returned `404` for application scheduled-task REST routes during research; that constraint is superseded by the approved URL-less runner app.
 
 ## Next Steps
 
-Add the V3 credential and authorize/configure the remaining secrets, restart with the scheduler enabled, run the real-event canary, then enable incremental and reconciliation tasks. After acceptance, mark the plan complete and treat feed status plus periodic reconciliation as the production freshness contract.
+Add the V3 credential and authorize/configure the remaining secrets, restart with `SALESBINDER_SCHEDULER_DISABLED=false`, run the real-event canary, then let the runner continue on 900-second normal sync plus weekly status-driven `--full` with 24-hour full-attempt throttling. After acceptance, mark the plan complete and treat feed status plus periodic reconciliation as the production freshness contract.
