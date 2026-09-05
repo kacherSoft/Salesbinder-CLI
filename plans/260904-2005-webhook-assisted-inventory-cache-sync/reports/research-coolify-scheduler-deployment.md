@@ -9,13 +9,13 @@ status: done
 
 ## Summary
 
-Actual deployed path supersedes the initial Nixpacks recommendation below: Coolify application `s0gcsk404kso88sc48s88wok` builds the repository `Dockerfile`, pins reviewed commit `f41159cb1fceed772b60eb7a43bdbdf37ac331b7`, has no domain or HTTP health check, and runs with `SALESBINDER_SCHEDULER_DISABLED=true` until credential/canary gates pass. Nixpacks was rejected after its generated build artifact contained an invalid `null` field and failed before image creation.
+Actual deployed path supersedes the initial Nixpacks recommendation below: Coolify application `s0gcsk404kso88sc48s88wok` builds the repository `Dockerfile`, pins reviewed commit `f41159cb1fceed772b60eb7a43bdbdf37ac331b7`, has no domain or HTTP health check, and runs with `SALESBINDER_SCHEDULER_DISABLED=true` until credential/canary gates pass. The approved runner boundary is a private monorepo package deployed as a separate URL-less Coolify app, not a public service. Nixpacks was rejected after its generated build artifact contained an invalid `null` field and failed before image creation.
 
 The repository Dockerfile now owns the security/runtime contract: digest-pinned Node 22.23.2, production-only dependencies, non-root process, root-owned application files, atomic environment-to-config bootstrap, and a startup probe that loads compiled CLI/SDK code and exercises `better-sqlite3` in memory. The deployed container emitted both expected pre-canary markers and is running.
 
-The installed Coolify version is `4.0.0-beta.463`. Its application scheduled-task REST routes return `404`, so the REST examples later in this research note are not executable on the current server. Use the supported task interface for that version or a separately authorized Coolify upgrade. The durable current procedure is [docs/deployment.md](../../../docs/deployment.md).
+The installed Coolify version is `4.0.0-beta.463`. Its application scheduled-task REST routes returned `404` during research, but that constraint is now superseded by the approved URL-less runner app. The durable current procedure is [docs/deployment.md](../../../docs/deployment.md).
 
-The background-container model remains necessary because Coolify tasks are container-scoped: they execute commands only while the application is running. A pure one-shot CLI container would exit and scheduled tasks would skip or fail.
+The background-container model remains necessary because the approved runner owns its serialized sync loop. A pure one-shot CLI container would exit after one attempt and could not provide the selected 900-second cadence.
 
 ## Evidence Checked
 
@@ -26,7 +26,7 @@ The background-container model remains necessary because Coolify tasks are conta
 - Root scripts: `pnpm build`, `pnpm test`, `pnpm lint`.
 - CLI bin: `packages/cli/dist/cli.js`; package bin name `salesbinder`.
 - Current config loader reads only `${HOME}/.salesbinder/config.json`; it does not read SalesBinder account credentials directly from env vars.
-- Local `.env` contains `SALESBINDER_DB_URL`, `COOLIFY_MONITOR_BASE_URL`, `COOLIFY_MONITOR_API_TOKEN`; no SalesBinder v2/v3 credential env keys observed.
+- At research start, local `.env` contained the cache DB and Coolify connection variables but no V3 credential. On 2026-09-05, a V3 credential was added locally and passed a redacted read-only `/api/v3/items` authentication/schema probe.
 - Local `~/.salesbinder/config.json` has account `phuthaitech`, subdomain `phuthaitech`, v2 key present, v3 key absent.
 - Coolify read-only live state:
   - Project `PHUTHAITECH`: `rkk8w40ck08o08cskg8s04g4`
@@ -53,7 +53,7 @@ The background-container model remains necessary because Coolify tasks are conta
 
 ## Recommended Deployment Spec
 
-> Historical research only. The deployed Dockerfile configuration and [durable deployment guide](../../../docs/deployment.md) replace this Nixpacks/start-command draft. Do not use the draft `config:init` command because secrets would be placed in process arguments.
+> Historical research only. The deployed Dockerfile configuration and [durable deployment guide](../../../docs/deployment.md) replace this Nixpacks/start-command draft. Do not use the draft `config:init` command because secrets would be placed in process arguments or because of the old Coolify task API path.
 
 Use Coolify application, not service, unless you decide to commit a Compose file. Minimal application fields:
 
@@ -99,6 +99,7 @@ SALESBINDER_V3_API_KEY=<salesbinder-v3-bearer-key>
 SALESBINDER_DB_URL=<postgres-cache-url>
 SALESBINDER_CHANGE_FEED_DB_URL=<postgres-ledger-url-if-feed-mode-required>
 SALESBINDER_READ_BACKEND=postgresql
+SALESBINDER_SCHEDULER_DISABLED=false
 ```
 
 Optional:
@@ -112,7 +113,7 @@ Do not put secret values in shell history or repo files. Use Coolify env UI, API
 
 ## REST Commands
 
-> Historical API examples. Application/env/deploy endpoints were validated; scheduled-task endpoints return `404` on Coolify `4.0.0-beta.463` and must not be treated as available there.
+> Historical API examples. Application/env/deploy endpoints were validated; scheduled-task endpoints returned `404` on Coolify `4.0.0-beta.463` and are now superseded by the approved runner app.
 
 Base:
 
@@ -286,17 +287,17 @@ Reason:
 - Coolify health checks are optional.
 - HTTP checks require `curl` or `wget` inside the final image and a listening endpoint.
 - Traefik removes unhealthy containers from routing when health checks are enabled.
-- This app has no domain and no user traffic; liveness is proven by container status plus scheduled task execution history.
+- This app has no domain and no user traffic; liveness is proven by container status plus recent runner-cycle and cache-status evidence.
 
 Operational health checks:
 
 - Container status is `running`.
-- First manual task execution is `success`.
-- `cache status` task or manual command reports `sync_status` not `failed`.
-- Coolify scheduled-task history has recent successful execution.
-- Coolify notifications should enable scheduled task failure events.
+- First enabled runner cycle completes successfully.
+- `cache status` reports `sync_status` not `failed` and current ledger progress.
+- Container logs show recent bounded runner activity without credentials or business payloads.
+- Coolify notifications should cover container failures and unexpected restarts.
 
-Optional second task:
+Historical optional status-task draft (not used by the approved internal runner):
 
 ```json
 {
@@ -310,32 +311,31 @@ Optional second task:
 
 ## Minimal Idle Container vs Cron/Service Design
 
-| Option                              | Pros                                                                                                                               | Cons                                                                              | Verdict                                       |
-| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | --------------------------------------------- |
-| Minimal idle Coolify app            | Fewest repo changes, uses built-in task history/notifications, no Docker socket, no host cron, exact commit pinning, easy rollback | Keeps one idle container running; config file created at startup from env secrets | Recommended now                               |
-| Dockerfile app with tiny idle image | More deterministic image, can add `HEALTHCHECK CMD test -f ...`, smaller runtime if optimized                                      | Requires repo change; must maintain Dockerfile/pnpm workspace pruning             | Good next hardening step                      |
-| Docker Compose service/cron         | Can model worker explicitly, multi-container health/storage better                                                                 | Requires Compose creation as service, more moving parts, maybe shared file edits  | Use only if adding queue/webhook worker stack |
-| Host cron calling `docker exec`     | No idle application design constraints                                                                                             | Outside Coolify UI/history/notifications; host coupling; harder audit             | Not recommended                               |
-| Container-internal cron             | Self-contained                                                                                                                     | Duplicates Coolify scheduler, weak run history, harder failure surfacing          | Not recommended                               |
+| Option                              | Pros                                                                                                                               | Cons                                                                             | Verdict                                       |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | --------------------------------------------- |
+| Minimal idle Coolify app            | Fewest repo changes, uses built-in task history/notifications, no Docker socket, no host cron, exact commit pinning, easy rollback | Depends on unavailable task routes for API-only setup                            | Superseded by the packaged runner             |
+| Dockerfile app with tiny idle image | More deterministic image, can add `HEALTHCHECK CMD test -f ...`, smaller runtime if optimized                                      | Requires repo change; must maintain Dockerfile/pnpm workspace pruning            | Good next hardening step                      |
+| Docker Compose service/cron         | Can model worker explicitly, multi-container health/storage better                                                                 | Requires Compose creation as service, more moving parts, maybe shared file edits | Use only if adding queue/webhook worker stack |
+| Host cron calling `docker exec`     | No idle application design constraints                                                                                             | Outside Coolify UI/history/notifications; host coupling; harder audit            | Not recommended                               |
+| Packaged internal runner loop       | Self-contained, reviewed with CLI/schema, no Coolify task API dependency                                                           | Requires container-log and cache-status monitoring                               | Selected                                      |
 
 ## Risks
 
-- Hard blocker before real sync: `SALESBINDER_V3_API_KEY` must be available. Current local config lacks it, and `cache sync` exits before cache mutation when v3 key missing.
+- Production activation still requires `SALESBINDER_V3_API_KEY`; the local candidate is now present and probe-verified, while the Coolify runner remains disabled until all secrets and the canary gate are configured.
 - The current monitor token may not have write/deploy permission. Official docs require token permissions selected during creation; write endpoints need `write`, deploy endpoints need `deploy`, or use `root`.
 - The `.env` file is not safe to shell-source; parse it as dotenv data or use Coolify secret store directly.
-- Scheduled task commands run inside the current running container; if the app is stopped, unhealthy, or container name changes in a multi-container resource, execution skips/fails.
-- Scheduled task overlap policy is not clearly documented in official current docs. Use a frequency longer than worst-case sync runtime or rely on the CLI/PostgreSQL advisory lock, which already fails concurrent sync attempts.
-- Commands longer than practical DB/UI limits are risky; keep scheduled task command short. The recommended command is short.
+- Scheduled task commands ran inside the current running container during the research phase; the approved URL-less runner app no longer depends on that task path.
+- Commands longer than practical DB/UI limits are risky; keep the runner command short.
 
 ## Exit Criteria
 
-- Application exists in PHUTHAITECH dev with `git_commit_sha=d3f2947661a7ff461ff8f59f2d1ca581ba62f1de`, `build_pack=nixpacks`, no domain, health check disabled.
+- Application exists in PHUTHAITECH dev with the reviewed `main` commit pinned, no domain, health check disabled, and the Dockerfile runtime contract in place.
 - Deployment created by API/CLI finishes successfully and deployment detail reports the pinned commit.
 - App container is `running`.
 - Coolify app env keys exist; secret values are not printed in logs.
 - Startup config file exists inside container with 0600 permissions and account `phuthaitech`.
-- Manual scheduled task execution queues and reaches `success`.
-- Execution history endpoint returns the success record.
+- Manual runner execution queues and reaches `success`.
+- Execution history reflects the successful runner run.
 - `cache status` reports PostgreSQL backend and acceptable sync health.
 - Next scheduled run occurs in the target server timezone and records success.
 

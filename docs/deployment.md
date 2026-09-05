@@ -2,7 +2,7 @@
 
 ## Platform
 
-The production cache-sync runner is a background Coolify application. It has no public URL and must not expose an HTTP domain.
+The approved cache-sync runner is a private monorepo package deployed as a separate Coolify application. It has no public URL and must not expose an HTTP domain.
 
 - Application: `SalesBinder CLI Scheduler`
 - Application UUID: `s0gcsk404kso88sc48s88wok`
@@ -28,7 +28,7 @@ SALESBINDER_CHANGE_FEED_DB_URL
 SALESBINDER_READ_BACKEND=postgresql
 ```
 
-`SALESBINDER_API_KEY` is the v2 credential for accounts/documents. `SALESBINDER_V3_API_KEY` is mandatory for inventory/categories; there is no v2 fallback. The change-feed URL must use the ledger worker role, not receiver or migration credentials.
+`SALESBINDER_API_KEY` is the v2 credential for accounts/documents. `SALESBINDER_V3_API_KEY` is mandatory for inventory/categories; there is no v2 fallback. The change-feed URL must use the ledger worker role, not receiver or migration credentials. Cache and change-feed URLs must resolve to distinct PostgreSQL databases; enabled startup rejects a shared database target.
 
 Before credentials and canary validation are complete, set:
 
@@ -36,7 +36,9 @@ Before credentials and canary validation are complete, set:
 SALESBINDER_SCHEDULER_DISABLED=true
 ```
 
-This is the only supported credential-less startup. When enabling the scheduler, remove that variable or set it to `false`; startup then fails closed unless every required SalesBinder credential is nonblank. The bootstrap writes `/home/node/.salesbinder/config.json` atomically with mode `0600` and never logs values.
+This is the only supported credential-less startup. When enabling the runner, set `SALESBINDER_SCHEDULER_DISABLED=false` exactly; any other value keeps the container in disabled keepalive mode. Startup then fails closed unless every required SalesBinder credential is nonblank. The bootstrap writes `/home/node/.salesbinder/config.json` atomically with mode `0600` and never logs values.
+
+The runner uses `cache status` as the authority for cadence. Normal sync defaults to every 900 seconds, weekly status drives `cache sync --full`, and repeated full attempts are throttled for 24 hours. The attempt claim is stored atomically in the cache database's `cache_meta`, so the throttle survives process replacement and Coolify redeploys without a local volume.
 
 ## Release Gates
 
@@ -47,10 +49,10 @@ This is the only supported credential-less startup. When enabling the scheduler,
 3. Run `cache status`; account, cache, ledger, consumer, and schema bindings must agree.
 4. Run one manual `cache sync` against a fixed ledger target. A read-only credential is sufficient when an existing real inventory event is available; do not mutate business data without separate authorization.
 5. Verify cache receipt, ledger completion, zero blocker at or below the target, and unchanged unrelated document events.
-6. Enable incremental sync every 15 minutes. Advisory locking safely rejects overlap, but frequency should still exceed normal runtime.
-7. Enable a weekly `cache sync --full` reconciliation until webhook delivery coverage is proven.
+6. Enable incremental sync every 900 seconds. Advisory locking safely rejects overlap, but frequency should still exceed normal runtime.
+7. Let weekly `cache status` checks trigger `cache sync --full`. Repeated full attempts remain throttled for 24 hours.
 
-Coolify `4.0.0-beta.463` does not expose the application scheduled-task REST routes (they return `404`). Configure the two tasks through a supported Coolify task interface for that server version, or upgrade Coolify in a separately authorized maintenance window. Do not write directly to Coolify's internal database.
+Coolify `4.0.0-beta.463` returned `404` for application scheduled-task REST routes during research. That is now a superseded deployment constraint; the approved URL-less runner path does not depend on Coolify task API/UI/upgrade behavior. Do not write directly to Coolify's internal database.
 
 ## Commands
 
@@ -67,7 +69,7 @@ node packages/cli/dist/cli.js --account phuthaitech cache status
 
 ## Rollback
 
-1. Disable scheduled tasks before changing application versions.
+1. Set `SALESBINDER_SCHEDULER_DISABLED=true` and restart before changing application versions.
 2. Keep webhook receiver ingestion and immutable ledger history running.
 3. Roll the Coolify application back to the previous known image/commit.
 4. Preserve cache receipts, staging rows, event state, and ledger cursors.
@@ -78,4 +80,4 @@ node packages/cli/dist/cli.js --account phuthaitech cache status
 
 - Refresh the pinned Node image digest after upstream security rebuilds and run a container vulnerability scan.
 - Run `pnpm audit --prod`, `pnpm test`, `pnpm lint`, and `pnpm build` before deployment.
-- Alert on receiver inactivity, oldest pending event age, blocker cursor, repeated `429`, lock loss, failed scheduled tasks, and baseline age.
+- Alert on receiver inactivity, oldest pending event age, blocker cursor, repeated `429`, lock loss, failed runner cycles or container restarts, and baseline age.

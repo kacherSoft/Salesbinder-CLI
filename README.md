@@ -134,9 +134,9 @@ If the PostgreSQL writer loses its session ownership or a transaction outcome is
 
 PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `cache sync` do not start a background pull.
 
-Inventory change-feed sync uses a separate PostgreSQL ledger database configured with `SALESBINDER_CHANGE_FEED_DB_URL`. The cache database and the ledger database are both one-account-per-database resources; the CLI validates that they target the same SalesBinder account before it reads or writes feed-backed inventory state. `cache status` reports only sanitized ledger reachability and progress, not raw connection details.
+Inventory change-feed sync uses a separate PostgreSQL ledger database configured with `SALESBINDER_CHANGE_FEED_DB_URL`. The cache database and the ledger database are both one-account-per-database resources; they must be distinct database targets, and the CLI validates that they represent the same SalesBinder account before it reads or writes feed-backed inventory state. `cache status` reports only sanitized ledger reachability and progress, not raw connection details.
 
-The production scheduler is packaged by the root `Dockerfile`. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. See [Deployment](docs/deployment.md) for required environment names, the explicit disabled mode, activation gates, and rollback.
+The approved cache-sync runner lives as a private monorepo package (`packages/cache-sync-runner`) and is deployed as a separate URL-less Coolify app. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. The runner treats `cache status` as the cadence authority: normal sync runs every 900 seconds by default, weekly status drives `cache sync --full`, and repeated full attempts are throttled for 24 hours through durable PostgreSQL cache metadata shared across restarts. Feature branches stay in PRs until the runner package, Dockerfile, and docs are reviewed; only reviewed `main` commits promote to the Coolify app. See [Deployment](docs/deployment.md) for the exact disabled mode, activation gate, and rollback.
 
 The PostgreSQL schema is created automatically on first use.
 
