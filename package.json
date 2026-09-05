@@ -4,6 +4,7 @@
   "description": "CLI tool for SalesBinder API integration with full CRUD operations",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@10.33.0",
   "workspaces": [
     "packages/*"
   ],
@@ -11,7 +12,7 @@
     "clean": "rm -rf node_modules packages/*/node_modules",
     "build": "pnpm -r --filter './packages/**' build",
     "dev": "pnpm --filter './packages/cli' dev",
-    "test": "node --test scripts/*.test.mjs && pnpm -r --filter './packages/**' test",
+    "test": "pnpm -r --filter './packages/**' test",
     "test:coverage": "pnpm -r --filter './packages/**' test:coverage",
     "lint": "pnpm -r --filter './packages/**' lint",
     "lint:fix": "pnpm -r --filter './packages/**' lint:fix",

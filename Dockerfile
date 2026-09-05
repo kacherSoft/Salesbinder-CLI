@@ -9,11 +9,13 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/cache-sync-runner/package.json packages/cache-sync-runner/package.json
 COPY packages/cli/package.json packages/cli/package.json
 COPY packages/sdk/package.json packages/sdk/package.json
 RUN pnpm install --frozen-lockfile
 
 COPY . .
+RUN pnpm -r --filter './packages/**' exec tsc --build --clean
 RUN pnpm build
 
 FROM node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS production-dependencies
@@ -27,6 +29,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/cache-sync-runner/package.json packages/cache-sync-runner/package.json
 COPY packages/cli/package.json packages/cli/package.json
 COPY packages/sdk/package.json packages/sdk/package.json
 RUN pnpm install --prod --frozen-lockfile
@@ -41,15 +44,16 @@ ENV HOME=/home/node
 WORKDIR /app
 
 COPY --from=production-dependencies /app/node_modules ./node_modules
+COPY --from=production-dependencies /app/packages/cache-sync-runner/node_modules ./packages/cache-sync-runner/node_modules
 COPY --from=production-dependencies /app/packages/cli/node_modules ./packages/cli/node_modules
 COPY --from=production-dependencies /app/packages/sdk/node_modules ./packages/sdk/node_modules
+COPY --from=build /app/packages/cache-sync-runner/dist ./packages/cache-sync-runner/dist
 COPY --from=build /app/packages/cli/dist ./packages/cli/dist
 COPY --from=build /app/packages/sdk/dist ./packages/sdk/dist
 COPY package.json ./package.json
+COPY packages/cache-sync-runner/package.json ./packages/cache-sync-runner/package.json
 COPY packages/cli/package.json ./packages/cli/package.json
 COPY packages/sdk/package.json ./packages/sdk/package.json
-COPY scripts/bootstrap-container-config.mjs ./scripts/bootstrap-container-config.mjs
-COPY scripts/verify-container-runtime.mjs ./scripts/verify-container-runtime.mjs
 
 USER node
-CMD ["sh", "-c", "node scripts/verify-container-runtime.mjs && node scripts/bootstrap-container-config.mjs && exec tail -f /dev/null"]
+CMD ["sh", "-c", "node packages/cache-sync-runner/dist/runtime-probe.js && node packages/cache-sync-runner/dist/bootstrap-main.js && exec node packages/cache-sync-runner/dist/main.js"]

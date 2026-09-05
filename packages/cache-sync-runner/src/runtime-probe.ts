@@ -1,7 +1,10 @@
 import { createRequire } from 'node:module';
 
-const requireFromSdk = createRequire(new URL('../packages/sdk/package.json', import.meta.url));
-const Database = requireFromSdk('better-sqlite3');
+const requireFromSdk = createRequire(new URL('../../sdk/package.json', import.meta.url));
+const Database = requireFromSdk('better-sqlite3') as new (filename: string) => {
+  prepare(sql: string): { get(): { healthy?: number } | undefined };
+  close(): void;
+};
 const database = new Database(':memory:');
 
 try {
@@ -13,7 +16,7 @@ try {
   database.close();
 }
 
-await import('../packages/sdk/dist/index.js');
-await import('../packages/cli/dist/index.js');
+await import('@salesbinder/sdk');
+await import('@salesbinder/cli');
 
 console.log('SalesBinder container runtime verified.');
