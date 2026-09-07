@@ -51,6 +51,8 @@ function invoice(): Record<string, unknown> {
         discount_percent: '10.000',
         discounted_unit_price: '45.0000',
         subtotal: '90.0000',
+        unit_cost: '25.0000',
+        total_cost: '50.0000',
         sku: 'BLUE',
         location_name: 'Main Warehouse',
         tax_rate: '5.000',
@@ -67,7 +69,7 @@ function firstLine(doc: Record<string, unknown>): Record<string, unknown> {
 }
 
 describe('normalizeV3DocumentCacheRows', () => {
-  it('maps invoice identity, true subtotal, current shipping, and unknown costs', () => {
+  it('maps invoice identity, true subtotal, current shipping, and authoritative costs', () => {
     const result = normalizeV3DocumentCacheRows(invoice(), expected);
     expect(result.docRow).toMatchObject({
       doc_id: id,
@@ -75,9 +77,9 @@ describe('normalizeV3DocumentCacheRows', () => {
       context_id: 5,
       account_context_id: 2,
       account_number: 2,
-      total_price: 104.5,
+      total_price: 90,
       subtotal: 90,
-      total_cost: null,
+      total_cost: 50,
       archived: null,
       shipped_percent: 50,
       custom_doc_number: 'INV-1002',
@@ -93,18 +95,160 @@ describe('normalizeV3DocumentCacheRows', () => {
         total_amount: 90,
         quantity_shipped: 1,
         quantity_received: null,
-        cost: null,
+        cost: 25,
       }),
     ]);
     expect(Object.keys(result)).toEqual(['docRow', 'itemRows']);
   });
 
-  it('uses permitted unit cost without fabricating a document total cost', () => {
+  it('uses source line total costs for inventory and service, with sales discounts contributing zero cost', () => {
     const doc = invoice();
-    Object.assign(firstLine(doc), { unit_cost: '25.0000', total_cost: '50.0000' });
+    const line = firstLine(doc);
+    doc.lines = [
+      line,
+      {
+        ...line,
+        id: '394e9262-b64f-4e14-87b4-6b115ac339df',
+        item_id: null,
+        line_type: 'service',
+        quantity: 3,
+        unit_cost: '10.0000',
+        total_cost: '30.0000',
+      },
+      {
+        ...line,
+        id: '7f3398c4-54f2-4648-9365-789a7c757182',
+        item_id: null,
+        line_type: 'discount',
+        unit_cost: null,
+        total_cost: null,
+      },
+    ];
     const result = normalizeV3DocumentCacheRows(doc, expected);
     expect(result.itemRows[0]?.cost).toBe(25);
-    expect(result.docRow.total_cost).toBeNull();
+    expect(result.docRow.total_cost).toBe(80);
+    expect(result.itemRows).toHaveLength(1);
+  });
+
+  it.each([
+    { contextId: 5 as const, object: 'invoice', numberKey: 'invoice_number', idKey: 'customer_id', nameKey: 'customer_name', assignmentKey: 'salesperson_id' },
+    { contextId: 4 as const, object: 'estimate', numberKey: 'estimate_number', idKey: 'customer_id', nameKey: 'customer_name', assignmentKey: 'salesperson_id' },
+    { contextId: 11 as const, object: 'purchase_order', numberKey: 'purchase_order_number', idKey: 'supplier_id', nameKey: 'supplier_name', assignmentKey: 'assigned_user_id' },
+  ])('treats omitted party as unobserved account numbers for $object', (shape) => {
+    const doc = invoice();
+    Object.assign(doc, {
+      object: shape.object,
+      [shape.numberKey]: expected.documentNumber,
+      [shape.idKey]: doc.customer_id,
+      [shape.nameKey]: shape.contextId === 11 ? 'Example Supplier' : doc.customer_name,
+      [shape.assignmentKey]: null,
+    });
+    Object.assign(firstLine(doc), {
+      object: `${shape.object}_line`,
+      ...(shape.contextId === 11 ? { unit_cost: '25.0000' } : {}),
+    });
+    delete doc.party;
+
+    const result = normalizeV3DocumentCacheRows(doc, { ...expected, contextId: shape.contextId });
+
+    expect(result.docRow).not.toHaveProperty('account_number');
+    expect(result.docRow).not.toHaveProperty('customer_number');
+    expect(result.docRow).not.toHaveProperty('supplier_number');
+  });
+
+  it('treats observed party account_number null as an explicit number clear', () => {
+    const doc = invoice();
+    doc.party = { account_number: null };
+
+    const result = normalizeV3DocumentCacheRows(doc, expected);
+
+    expect(result.docRow).toMatchObject({
+      account_number: null,
+      customer_number: null,
+      supplier_number: null,
+    });
+  });
+
+  it('keeps cache total_price compatible with source subtotal while validating gross total', () => {
+    const invoiceWithShippingTaxAndDiscount = invoice();
+    Object.assign(invoiceWithShippingTaxAndDiscount, {
+      subtotal: '90.0000',
+      shipping_fee: '10.0000',
+      tax: '4.5000',
+      total: '104.5000',
+      discount_total: '-10.0000',
+    });
+    const invoiceResult = normalizeV3DocumentCacheRows(invoiceWithShippingTaxAndDiscount, expected);
+    expect(invoiceResult.docRow.total_price).toBe(90);
+
+    const estimateWithShippingTaxAndDiscount = invoice();
+    Object.assign(estimateWithShippingTaxAndDiscount, {
+      object: 'estimate',
+      estimate_number: 1002,
+      customer_kind: 'customer',
+      subtotal: '151872000.0000',
+      shipping_fee: '0.0000',
+      tax: '12149760.0000',
+      tax_2: '0.0000',
+      total: '164021760.0000',
+      discount: '-1000.0000',
+    });
+    firstLine(estimateWithShippingTaxAndDiscount).object = 'estimate_line';
+    const estimateResult = normalizeV3DocumentCacheRows(estimateWithShippingTaxAndDiscount, {
+      ...expected,
+      contextId: 4,
+    });
+    expect(estimateResult.docRow.total_price).toBe(151872000);
+
+    const poWithShippingTaxAndDiscount = invoice();
+    Object.assign(poWithShippingTaxAndDiscount, {
+      object: 'purchase_order',
+      purchase_order_number: 1002,
+      supplier_id: poWithShippingTaxAndDiscount.customer_id,
+      supplier_name: 'Example Supplier',
+      assigned_user_id: poWithShippingTaxAndDiscount.salesperson_id,
+      subtotal: '28500000.0000',
+      shipping_fee: '0.0000',
+      tax: '2280000.0000',
+      total: '30780000.0000',
+      discount_total: '-2500.0000',
+    });
+    Object.assign(firstLine(poWithShippingTaxAndDiscount), {
+      object: 'purchase_order_line',
+      unit_cost: '28500000.0000',
+      discounted_unit_cost: null,
+      subtotal: '28500000.0000',
+    });
+    const poResult = normalizeV3DocumentCacheRows(poWithShippingTaxAndDiscount, {
+      ...expected,
+      contextId: 11,
+    });
+    expect(poResult.docRow.total_price).toBe(28500000);
+    expect(poResult.docRow.total_cost).toBe(28500000);
+  });
+
+  it('aggregates four-decimal source costs without binary floating drift and rejects unsafe money', () => {
+    const doc = invoice();
+    Object.assign(firstLine(doc), { quantity: 1, unit_cost: '0.1000', total_cost: '0.1000' });
+    doc.lines = [
+      firstLine(doc),
+      {
+        ...firstLine(doc),
+        id: '394e9262-b64f-4e14-87b4-6b115ac339df',
+        unit_cost: '0.2000',
+        total_cost: '0.2000',
+      },
+    ];
+    expect(normalizeV3DocumentCacheRows(doc, expected).docRow.total_cost).toBe(0.3);
+
+    Object.assign(firstLine(doc), { total_cost: '0.12345' });
+    expect(() => normalizeV3DocumentCacheRows(doc, expected)).toThrow(DocumentRecordError);
+
+    Object.assign(firstLine(doc), {
+      total_cost: `${Number.MAX_SAFE_INTEGER}.0000`,
+      unit_cost: '1.0000',
+    });
+    expect(() => normalizeV3DocumentCacheRows(doc, expected)).toThrow(DocumentRecordError);
   });
 
   it('maps purchase-order costs and receiving instead of invoice selling fields', () => {
@@ -129,6 +273,7 @@ describe('normalizeV3DocumentCacheRows', () => {
       account_context_id: 10,
       supplier_name: 'Example Supplier',
       customer_name: null,
+      total_cost: 20,
     });
     expect(result.itemRows[0]).toMatchObject({
       price: 12,
@@ -160,7 +305,7 @@ describe('normalizeV3DocumentCacheRows', () => {
       line,
       { ...line, id: '2cbe61a2-8f87-4f47-a6ae-238e89aa9d16' },
       { ...line, id: '394e9262-b64f-4e14-87b4-6b115ac339df', item_id: null, line_type: 'service' },
-      { ...line, id: '7f3398c4-54f2-4648-9365-789a7c757182', item_id: null, line_type: 'discount' },
+      { ...line, id: '7f3398c4-54f2-4648-9365-789a7c757182', item_id: null, line_type: 'discount', unit_cost: null, total_cost: null },
     ];
     expect(normalizeV3DocumentCacheRows(doc, expected).itemRows).toHaveLength(2);
   });
@@ -180,9 +325,11 @@ describe('normalizeV3DocumentCacheRows', () => {
     { unit_price: '' },
     { unit_price: true },
     { unit_cost: 'NaN' },
+    { unit_cost: '0.12345' },
     { name: '\ud800' },
     { description: 123 },
     { quantity_shipped: {} },
+    { subtotal: undefined },
     { item_id: '' },
     { item_id: null },
     { id: 'bad-id' },
@@ -224,8 +371,17 @@ describe('normalizeV3DocumentCacheRows', () => {
     { issue_date: '2026-02-30' },
     { updated_at: null },
     { subtotal: 'NaN' },
+    { subtotal: null },
+    { total: undefined },
+    { status: undefined },
     { status_id: -1 },
+    { status_id: null },
+    { party: undefined },
+    { party: null },
+    { party: {} },
+    { party: { account_number: {} } },
     { customer_id: 'bad-id' },
+    { customer_name: '' },
     { customer_name: '\udfff' },
   ])('rejects malformed document content %j', (patch) => {
     expect(() => normalizeV3DocumentCacheRows({ ...invoice(), ...patch }, expected)).toThrow(
@@ -239,15 +395,14 @@ describe('normalizeV3DocumentCacheRows', () => {
     expect(normalizeV3DocumentCacheRows(doc, expected).itemRows[0]?.item_name).toBe('Máy 🔧');
   });
 
-  it('keeps missing document money and line subtotal unknown', () => {
+  it('rejects missing source cost authority instead of erasing known cache costs', () => {
     const doc = invoice();
-    delete doc.total;
-    delete doc.subtotal;
-    delete firstLine(doc).subtotal;
+    delete firstLine(doc).unit_cost;
+    expect(() => normalizeV3DocumentCacheRows(doc, expected)).toThrow(DocumentRecordError);
+    Object.assign(firstLine(doc), { unit_cost: '0.0000', total_cost: '0.0000' });
     const result = normalizeV3DocumentCacheRows(doc, expected);
-    expect(result.docRow.total_price).toBeNull();
-    expect(result.docRow.subtotal).toBeNull();
-    expect(result.itemRows[0]?.total_amount).toBeNull();
+    expect(result.itemRows[0]?.cost).toBe(0);
+    expect(result.docRow.total_cost).toBe(0);
   });
 
   it('keeps V3 salesperson names unobserved while explicit unassignment clears the ID', () => {

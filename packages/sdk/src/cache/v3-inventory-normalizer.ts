@@ -36,8 +36,8 @@ export function normalizeV3InventoryItem(
   const quantity = requiredJsonNumber(item.quantity, 'item quantity');
   const reserved = requiredJsonNumber(item.quantity_reserved, 'item reserved quantity');
   const incoming = requiredJsonNumber(item.quantity_incoming, 'item incoming quantity');
-  const price = optionalDecimalNumber(item.price, 'item price');
-  const cost = optionalDecimalNumber(item.cost, 'item cost');
+  const price = requiredObservedNullableDecimal(item, 'price', 'item price', 'record');
+  const cost = requiredObservedNullableDecimal(item, 'cost', 'item cost', 'record');
   const categoryName = canonicalCategoryName(item, categoryId, categoryNames);
   const archived = requiredBoolean(item.archived, 'item archived');
   const sku = nullableIdentifierText(item.sku, 'item sku');
@@ -152,8 +152,8 @@ function variationStockRows(
   itemNumber: number,
   variation: V3ItemVariation,
   categoryName: string | null,
-  price: number | null,
-  cost: number | null,
+  parentPrice: number | null,
+  parentCost: number | null,
   itemBarcode: string | null
 ): ItemStockLocationRow[] {
   if (variation.object !== 'item_variation' || variation.item_id !== item.id) {
@@ -176,6 +176,20 @@ function variationStockRows(
   }
   const barcode =
     nullableIdentifierText(variation.barcode, 'variation barcode', 'variations') ?? itemBarcode;
+  const price =
+    requiredObservedNullableDecimal(
+      variation,
+      'unit_price_override',
+      'variation price override',
+      'variations'
+    ) ?? parentPrice;
+  const cost =
+    requiredObservedNullableDecimal(
+      variation,
+      'unit_cost_override',
+      'variation cost override',
+      'variations'
+    ) ?? parentCost;
   if (locations.length === 0) {
     return [
       {
@@ -516,11 +530,23 @@ function optionalJsonNumber(
   return requiredJsonNumber(value, field, scope);
 }
 
-function optionalDecimalNumber(value: unknown, field: string): number | null {
-  if (value == null) return null;
-  if (typeof value !== 'string') throw invalidRecord(`Invalid v3 ${field}`);
+function requiredObservedNullableDecimal(
+  source: object,
+  key: string,
+  field: string,
+  scope: 'record' | 'variations'
+): number | null {
+  const record = source as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(record, key)) {
+    throw new ApiResponseValidationError(`Missing v3 ${field}`, scope);
+  }
+  const value = record[key];
+  if (value === null) return null;
+  if (typeof value !== 'string') {
+    throw new ApiResponseValidationError(`Invalid v3 ${field}`, scope);
+  }
   const parsed = parseSalesBinderFiniteDecimal(value);
-  if (parsed === undefined) throw invalidRecord(`Invalid v3 ${field}`);
+  if (parsed === undefined) throw new ApiResponseValidationError(`Invalid v3 ${field}`, scope);
   return parsed;
 }
 

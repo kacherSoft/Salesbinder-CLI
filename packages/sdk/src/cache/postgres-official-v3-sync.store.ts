@@ -25,7 +25,6 @@ import {
   officialTaskKey,
   officialTaskPrefix,
 } from './official-v3-sync.validation.js';
-import { assertCanonicalV3SourceId } from './v3-inventory-source-validation.js';
 
 type Transaction = <T>(run: (client: PoolClient) => Promise<T>) => Promise<T>;
 
@@ -188,7 +187,7 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     });
   }
 
-  async applyDocumentUpsertAndQueueRefreshes(
+  async applyDocumentUpsert(
     runId: string,
     task: OfficialV3SyncTask,
     document: DocumentRow,
@@ -199,18 +198,16 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
       const persisted = await this.requireTask(client, runId, task);
       if (await this.completeIfStale(client, runId, persisted)) return;
       const resolved = await this.options.resolveDocument(client, document);
-      const old = await this.oldLineItemIds(client, resolved.doc_id);
-      await this.queueRefreshes(client, runId, persisted, [...old, ...lines.map((line) => line.item_id)]);
       await this.options.writeDocument(
         client,
         resolved,
         lines.map((line) => ({ ...line, doc_id: resolved.doc_id }))
       );
-      await this.completeOrWait(client, runId, persisted);
+      await this.complete(client, runId, persisted, 'done', task.attempts);
     });
   }
 
-  async applyDocumentDeleteAndQueueRefreshes(
+  async applyDocumentDelete(
     runId: string,
     task: OfficialV3SyncTask
   ): Promise<void> {
@@ -218,10 +215,22 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
       const persisted = await this.requireTask(client, runId, task);
       if (await this.completeIfStale(client, runId, persisted)) return;
       const resolvedDocId = await this.options.resolveDocumentIdByApiId(client, persisted.id);
-      const old = resolvedDocId ? await this.oldLineItemIds(client, resolvedDocId) : [];
-      await this.queueRefreshes(client, runId, persisted, old);
       if (resolvedDocId) await this.options.deleteDocument(client, resolvedDocId);
-      await this.completeOrWait(client, runId, persisted);
+      await this.complete(client, runId, persisted, 'done', task.attempts);
+    });
+  }
+
+  async retireLegacyItemRefreshTasks(runId: string): Promise<void> {
+    await this.options.withVerifiedWrite(async (client) => {
+      await this.requireRun(client, runId);
+      let changed = false;
+      for (const task of await this.readTasks(client, runId)) {
+        if (isRetirableLegacyRefresh(task)) {
+          await this.complete(client, runId, task, 'superseded', task.attempts);
+          changed = true;
+        }
+      }
+      if (changed) await this.completeWaitingParents(client, runId);
     });
   }
 
@@ -229,7 +238,7 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     await this.options.withVerifiedWrite(async (client) => {
       const persisted = await this.requireTask(client, runId, task);
       if (persisted.status !== 'waiting_children') return;
-      await this.completeOrWait(client, runId, persisted);
+      await this.completeWaitingParents(client, runId, persisted.taskId);
     });
   }
 
@@ -380,39 +389,24 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     return typeof receipt.generation === 'number' && receipt.generation > task.generation;
   }
 
-  private async queueRefreshes(
+  private async completeWaitingParents(
     client: PoolClient,
     runId: string,
-    parent: OfficialV3SyncTask,
-    ids: readonly string[]
+    taskId?: string
   ): Promise<void> {
-    for (const id of [...new Set(ids)]) {
-      assertCanonicalV3SourceId(id, 'official V3 document item reference');
-      const task = refreshTask(runId, parent, id);
-      const prior = await readJson(client, officialTaskKey(runId, task.taskId));
-      if (!prior) await putJson(client, officialTaskKey(runId, task.taskId), task);
-    }
-  }
-
-  private async oldLineItemIds(client: PoolClient, docId: string): Promise<string[]> {
-    const result = await client.query<{ item_id: string }>(
-      'SELECT item_id FROM item_documents WHERE doc_id = $1',
-      [docId]
+    const tasks = await this.readTasks(client, runId);
+    const parents = tasks.filter(
+      (task) => task.status === 'waiting_children' && (!taskId || task.taskId === taskId)
     );
-    return result.rows.map((row) => row.item_id);
-  }
-
-  private async completeOrWait(
-    client: PoolClient,
-    runId: string,
-    task: OfficialV3SyncTask
-  ): Promise<void> {
-    const children = (await this.readTasks(client, runId)).filter((child) => child.parentTaskId === task.taskId);
-    if (children.some((child) => child.status === 'pending' || child.status === 'failed' || child.status === 'waiting_children')) {
-      await putJson(client, officialTaskKey(runId, task.taskId), { ...task, status: 'waiting_children' });
-      return;
+    for (const parent of parents) {
+      const children = tasks.filter((child) => child.parentTaskId === parent.taskId);
+      if (
+        children.length > 0 &&
+        children.every((child) => child.status === 'done' || child.status === 'superseded')
+      ) {
+        await this.complete(client, runId, parent, 'done', parent.attempts);
+      }
     }
-    await this.complete(client, runId, task, 'done', task.attempts);
   }
 
   private async complete(
@@ -486,21 +480,13 @@ function canResumeInitialSinceRun(
   );
 }
 
-function refreshTask(runId: string, parent: OfficialV3SyncTask, id: string): OfficialV3SyncTask {
-  return {
-    taskId: `${parent.taskId}:refresh:${id}`,
-    runId,
-    page: parent.page,
-    ordinal: parent.ordinal,
-    generation: parent.generation,
-    kind: 'item_refresh',
-    parentTaskId: parent.taskId,
-    resource: 'item',
-    id,
-    operation: 'refresh',
-    status: 'pending',
-    attempts: 0,
-  };
+function isRetirableLegacyRefresh(task: OfficialV3SyncTask): boolean {
+  return (
+    task.kind === 'item_refresh' &&
+    task.resource === 'item' &&
+    task.operation === 'refresh' &&
+    (task.status === 'pending' || task.status === 'failed')
+  );
 }
 
 function assertDocumentTask(

@@ -16,7 +16,7 @@ import { sanitizeOfficialV3SyncRun } from './official-v3-sync-status.js';
 import { drainOfficialV3Tasks } from './official-v3-sync-task-runner.js';
 import { hasAsciiControlCharacter } from './official-v3-sync.validation.js';
 
-const DEFAULT_PAGE_LIMIT = 500;
+const DEFAULT_PAGE_LIMIT = 100;
 const DEFAULT_MAX_PAGES = 1_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 2_000_000;
 

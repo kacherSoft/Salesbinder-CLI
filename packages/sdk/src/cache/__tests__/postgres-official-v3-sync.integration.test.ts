@@ -1,7 +1,12 @@
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { OfficialV3SyncService } from '../official-v3-sync.service.js';
-import { officialPagePrefix } from '../official-v3-sync.validation.js';
+import {
+  officialLatestReceiptKey,
+  officialPagePrefix,
+  officialTaskKey,
+  officialTaskPrefix,
+} from '../official-v3-sync.validation.js';
 import { PostgresCacheService } from '../postgres-cache.service.js';
 import type {
   OfficialV3SyncMarker,
@@ -154,7 +159,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     expect(harness.sync.read).toHaveBeenCalledWith({
       since: '1788670542',
       resources: ['item', 'invoice', 'estimate', 'purchase_order'],
-      limit: 500,
+      limit: 100,
     });
     expect(resumed.run.status).toBe('success');
     expect(JSON.stringify(resumed)).not.toContain('cursor-after-auth');
@@ -189,14 +194,14 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       resume: true,
     });
 
-    expect(resumedHarness.sync.read).toHaveBeenCalledWith({ cursor: 'cursor-page-1', limit: 500 });
+    expect(resumedHarness.sync.read).toHaveBeenCalledWith({ cursor: 'cursor-page-1', limit: 100 });
     expect(resumed.run.status).toBe('success');
     expect(resumed.tasks).toMatchObject({ discovered: 2, applied: 2, failed: 0 });
     expect(resumed.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
   });
 
-  it('drains old and new document item refreshes in the same service invocation before advancing coverage', async () => {
-    const ctx = await createContext('doc-refreshes');
+  it('applies source document upserts without inventory refresh children before advancing coverage', async () => {
+    const ctx = await createContext('source-doc-upsert-coverage');
     const harness = serviceHarness(ctx, {
       'since:1788670542': envelope(
         [{ resource: 'invoice', id: docId, operation: 'upsert' }],
@@ -215,11 +220,9 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       accountIdentity: binding.accountIdentity,
       since: 1788670542,
     });
-    const hydratedIds = harness.hydrator.hydrate.mock.calls.flatMap(([ids]) => [...ids]);
-
-    expect(hydratedIds).toEqual(expect.arrayContaining([itemA, itemB]));
+    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
     expect(result.run.status).toBe('success');
-    expect(result.tasks).toMatchObject({ discovered: 3, applied: 3, failed: 0, pending: 0 });
+    expect(result.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
     expect(result.state.cursorGap).toBe(false);
     const updatedDocument = await ctx.service.getDocument(docId);
     expect(updatedDocument).toMatchObject({
@@ -231,14 +234,231 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     await expect(ctx.service.getItemDocuments(docId)).resolves.toEqual([
       expect.objectContaining({ item_id: itemB, document_item_id: lineNew }),
     ]);
-    await expect(ctx.service.getItem(itemA)).resolves.toMatchObject({
-      item_id: itemA,
-      quantity: 1,
+    await expect(ctx.service.getItem(itemA)).resolves.toBeUndefined();
+    await expect(ctx.service.getItem(itemB)).resolves.toBeUndefined();
+  });
+
+  it('applies source document upserts without queuing inventory refresh children', async () => {
+    const ctx = await createContext('source-doc-upsert');
+    const harness = serviceHarness(ctx, {
+      'since:1788670542': envelope(
+        [{ resource: 'invoice', id: docId, operation: 'upsert' }],
+        false,
+        'cursor-source-doc'
+      ),
     });
-    await expect(ctx.service.getItem(itemB)).resolves.toMatchObject({
-      item_id: itemB,
-      quantity: 1,
+
+    await ctx.service.insertDocument(document(docId, { archived: 1, document_name: 'Prior' }));
+    await ctx.service.insertItemDocument(line(itemA, docId, 'old-line'));
+    harness.documents.get.mockResolvedValueOnce(invoicePayload(docId, itemB));
+
+    const result = await harness.service.sync({
+      accountIdentity: binding.accountIdentity,
+      since: 1788670542,
     });
+
+    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(result.run.status).toBe('success');
+    expect(result.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
+    expect(result.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
+    await expect(readOfficialTasks(ctx.pool, result.run.runId)).resolves.toEqual([
+      expect.objectContaining({ resource: 'invoice', status: 'done' }),
+    ]);
+    await expect(ctx.service.getItem(itemA)).resolves.toBeUndefined();
+    await expect(ctx.service.getItem(itemB)).resolves.toBeUndefined();
+    await expect(ctx.service.getItemDocuments(docId)).resolves.toEqual([
+      expect.objectContaining({ item_id: itemB, document_item_id: lineNew }),
+    ]);
+  });
+
+  it('applies source document deletes without queuing inventory refresh children', async () => {
+    const ctx = await createContext('source-doc-delete');
+    const harness = serviceHarness(ctx, {
+      'since:1788670542': envelope(
+        [{ resource: 'invoice', id: docId, operation: 'delete' }],
+        false,
+        'cursor-source-delete'
+      ),
+    });
+
+    await ctx.service.insertDocument(document(docId, { archived: 1 }));
+    await ctx.service.insertItemDocument(line(itemA, docId, 'old-line'));
+
+    const result = await harness.service.sync({
+      accountIdentity: binding.accountIdentity,
+      since: 1788670542,
+    });
+
+    expect(harness.documents.get).not.toHaveBeenCalled();
+    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(result.run.status).toBe('success');
+    expect(result.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
+    await expect(ctx.service.getDocument(docId)).resolves.toBeUndefined();
+    await expect(ctx.service.getItemDocuments(docId)).resolves.toEqual([]);
+    await expect(readOfficialTasks(ctx.pool, result.run.runId)).resolves.toEqual([
+      expect.objectContaining({ resource: 'invoice', status: 'done' }),
+    ]);
+  });
+
+  it('keeps a persistently failed source marker blocking cursor advancement without inventory hydration', async () => {
+    const ctx = await createContext('source-doc-failed-persistent');
+    const harness = serviceHarness(ctx, {
+      'since:1788670542': envelope(
+        [{ resource: 'invoice', id: docId, operation: 'upsert' }],
+        false,
+        'cursor-failed-source-doc'
+      ),
+    });
+    const malformed = invoicePayload(docId, itemB);
+    delete ((malformed.lines as Record<string, unknown>[])[0]!).unit_cost;
+    delete ((malformed.lines as Record<string, unknown>[])[0]!).total_cost;
+    harness.documents.get.mockResolvedValue(malformed);
+
+    const result = await harness.service.sync({
+      accountIdentity: binding.accountIdentity,
+      since: 1788670542,
+    });
+
+    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(harness.documents.get).toHaveBeenCalledTimes(2);
+    expect(result.run.status).toBe('success_with_warnings');
+    expect(result.tasks).toMatchObject({ discovered: 1, applied: 0, failed: 1, pending: 0 });
+    expect(result.state).toMatchObject({ hasAppliedCursor: false, cursorGap: true });
+    await expect(ctx.service.getDocument(docId)).resolves.toBeUndefined();
+  });
+
+  it('retries a failed source marker with a valid source payload without inventory hydration', async () => {
+    const ctx = await createContext('source-doc-failed-retry');
+    const harness = serviceHarness(ctx, {
+      'since:1788670542': envelope(
+        [{ resource: 'invoice', id: docId, operation: 'upsert' }],
+        false,
+        'cursor-retried-source-doc'
+      ),
+    });
+    const malformed = invoicePayload(docId, itemB);
+    delete ((malformed.lines as Record<string, unknown>[])[0]!).unit_cost;
+    delete ((malformed.lines as Record<string, unknown>[])[0]!).total_cost;
+    harness.documents.get
+      .mockResolvedValueOnce(malformed)
+      .mockResolvedValueOnce(invoicePayload(docId, itemB));
+
+    const result = await harness.service.sync({
+      accountIdentity: binding.accountIdentity,
+      since: 1788670542,
+    });
+
+    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(harness.documents.get).toHaveBeenCalledTimes(2);
+    expect(result.run.status).toBe('success');
+    expect(result.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
+    expect(result.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
+    const [task] = await readOfficialTasks(ctx.pool, result.run.runId);
+    expect(task).toMatchObject({ resource: 'invoice', status: 'done', attempts: 2 });
+  });
+
+  it('rolls back source document writes when marker receipt commit fails and resumes cleanly', async () => {
+    const ctx = await createContext('source-doc-rollback');
+    const harness = serviceHarness(ctx, {
+      'since:1788670542': envelope(
+        [{ resource: 'invoice', id: docId, operation: 'upsert' }],
+        false,
+        'cursor-source-rollback'
+      ),
+      'cursor:cursor-source-rollback': envelope([], false, 'cursor-source-rollback-resumed'),
+    });
+    const store = ctx.service.getOfficialV3SyncStore();
+    const run = officialRun();
+    await store.beginRun(run);
+    await store.sealPage(
+      run.runId,
+      { kind: 'since', value: '1788670542' },
+      page(run.runId, 1, 'cursor-source-rollback', false),
+      [{ resource: 'invoice', id: docId, operation: 'upsert' }]
+    );
+    const task = (await store.listTasks(run.runId))[0]!;
+    await installTaskReceiptFailure(ctx.pool, task);
+
+    await expect(
+      harness.service.sync({ accountIdentity: binding.accountIdentity, resume: true })
+    ).rejects.toMatchObject({ code: 'operation_failed' });
+    await expect(ctx.service.getDocument(docId)).resolves.toBeUndefined();
+    await expect(store.listTasks(run.runId)).resolves.toEqual([
+      expect.objectContaining({ taskId: task.taskId, status: 'pending', attempts: 0 }),
+    ]);
+
+    await ctx.pool.query('DROP TRIGGER fail_official_receipt ON cache_meta');
+    await ctx.pool.query('DROP FUNCTION fail_official_receipt_fn()');
+    const resumed = await harness.service.sync({
+      accountIdentity: binding.accountIdentity,
+      resume: true,
+    });
+
+    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(resumed.run.status).toBe('success');
+    await expect(ctx.service.getDocument(docId)).resolves.toMatchObject({
+      api_doc_id: docId,
+      document_name: 'Official invoice',
+    });
+  });
+
+  it('retires legacy item refresh children without inventory hydration or new item receipts', async () => {
+    const ctx = await createContext('legacy-source-children');
+    const harness = serviceHarness(ctx, {});
+    const store = ctx.service.getOfficialV3SyncStore();
+    const run = officialRun();
+    await store.beginRun(run);
+    await store.sealPage(
+      run.runId,
+      { kind: 'since', value: '1788670542' },
+      page(run.runId, 1, 'cursor-legacy-children', false),
+      [{ resource: 'invoice', id: docId, operation: 'upsert' }]
+    );
+    const parent = (await store.listTasks(run.runId))[0]!;
+    const pendingChild = legacyRefreshTask(parent, itemA, 'pending');
+    const failedChild = legacyRefreshTask(parent, itemB, 'failed', { errorCode: 'invalid_record' });
+    const doneChild = legacyRefreshTask(parent, itemC, 'done', { attempts: 1 });
+    const priorReceipt = { generation: doneChild.generation, runId: run.runId, taskId: doneChild.taskId };
+    await ctx.service.insertDocument(document(docId));
+    await ctx.service.insertItemDocument(line(itemA, docId, 'legacy-child-line'));
+    await putOfficialTask(ctx.pool, { ...parent, status: 'waiting_children', attempts: 1 });
+    await putOfficialTask(ctx.pool, pendingChild);
+    await putOfficialTask(ctx.pool, failedChild);
+    await putOfficialTask(ctx.pool, doneChild);
+    await putMeta(ctx.pool, officialLatestReceiptKey('item', itemC), JSON.stringify(priorReceipt));
+
+    await expect(store.listTasks(run.runId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ taskId: parent.taskId, status: 'waiting_children' }),
+        expect.objectContaining({ kind: 'item_refresh', id: itemA, status: 'pending' }),
+        expect.objectContaining({ kind: 'item_refresh', id: itemB, status: 'failed' }),
+        expect.objectContaining({ kind: 'item_refresh', id: itemC, status: 'done' }),
+      ])
+    );
+
+    const result = await harness.service.sync({
+      accountIdentity: binding.accountIdentity,
+      resume: true,
+    });
+
+    expect(harness.documents.get).not.toHaveBeenCalled();
+    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(result.run.status).toBe('success');
+    expect(result.tasks).toMatchObject({ discovered: 4, applied: 2, superseded: 2, failed: 0 });
+    expect(result.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
+    await expect(readMeta(ctx.pool, officialLatestReceiptKey('item', itemA))).resolves.toBeNull();
+    await expect(readMeta(ctx.pool, officialLatestReceiptKey('item', itemB))).resolves.toBeNull();
+    await expect(readMeta(ctx.pool, officialLatestReceiptKey('item', itemC))).resolves.toBe(
+      JSON.stringify(priorReceipt)
+    );
+    await expect(readOfficialTasks(ctx.pool, run.runId)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ taskId: parent.taskId, status: 'done', attempts: 1 }),
+        expect.objectContaining({ taskId: pendingChild.taskId, status: 'superseded' }),
+        expect.objectContaining({ taskId: failedChild.taskId, status: 'superseded' }),
+        expect.objectContaining({ taskId: doneChild.taskId, status: 'done', attempts: 1 }),
+      ])
+    );
   });
 
   it('retries prior failed work on resume, ingests a new cycle, and advances prefix across runs', async () => {
@@ -282,7 +502,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       resume: true,
     });
 
-    expect(harness.sync.read).toHaveBeenLastCalledWith({ cursor: 'cursor-clean', limit: 500 });
+    expect(harness.sync.read).toHaveBeenLastCalledWith({ cursor: 'cursor-clean', limit: 100 });
     expect(resumed.run.status).toBe('success');
     expect(resumed.tasks).toMatchObject({ discovered: 3, applied: 3, failed: 0, pending: 0 });
     expect(resumed.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
@@ -326,11 +546,11 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
         {
           since: '1788670542',
           resources: ['item', 'invoice', 'estimate', 'purchase_order'],
-          limit: 500,
+          limit: 100,
         },
       ],
-      [{ cursor: 'cursor-empty-1', limit: 500 }],
-      [{ cursor: 'cursor-empty-2', limit: 500 }],
+      [{ cursor: 'cursor-empty-1', limit: 100 }],
+      [{ cursor: 'cursor-empty-2', limit: 100 }],
     ]);
     expect(pages).toEqual([
       expect.objectContaining({
@@ -627,6 +847,29 @@ function missing(id: string): V3ExactItemHydrationResult {
   return { id, status: 'missing_unproven' };
 }
 
+function legacyRefreshTask(
+  parent: OfficialV3SyncTask,
+  id: string,
+  status: OfficialV3SyncTask['status'],
+  overrides: Partial<OfficialV3SyncTask> = {}
+): OfficialV3SyncTask {
+  return {
+    taskId: `${parent.taskId}:refresh:${id}`,
+    runId: parent.runId,
+    page: parent.page,
+    ordinal: parent.ordinal,
+    generation: parent.generation,
+    kind: 'item_refresh',
+    parentTaskId: parent.taskId,
+    resource: 'item',
+    id,
+    operation: 'refresh',
+    status,
+    attempts: 0,
+    ...overrides,
+  };
+}
+
 function document(id: string, overrides: Partial<DocumentRow> = {}): DocumentRow {
   return {
     doc_id: id,
@@ -683,6 +926,8 @@ function invoicePayload(
         name: 'Widget',
         quantity: 1,
         unit_price: '10.0000',
+        unit_cost: '10.0000',
+        total_cost: '10.0000',
         subtotal: '10.0000',
       },
     ],
@@ -699,6 +944,39 @@ async function readOfficialPages(
     [officialPagePrefix(runId)]
   );
   return result.rows.map((row) => JSON.parse(row.value) as OfficialV3SyncPage);
+}
+
+async function readOfficialTasks(
+  pool: InstanceType<typeof Pool>,
+  runId: string
+): Promise<OfficialV3SyncTask[]> {
+  const result = await pool.query<{ value: string }>(
+    'SELECT value FROM cache_meta WHERE starts_with(key, $1) ORDER BY key',
+    [officialTaskPrefix(runId)]
+  );
+  return result.rows.map((row) => JSON.parse(row.value) as OfficialV3SyncTask);
+}
+
+async function readMeta(pool: InstanceType<typeof Pool>, key: string): Promise<string | null> {
+  const result = await pool.query<{ value: string }>(
+    'SELECT value FROM cache_meta WHERE key = $1',
+    [key]
+  );
+  return result.rows[0]?.value ?? null;
+}
+
+async function putOfficialTask(
+  pool: InstanceType<typeof Pool>,
+  task: OfficialV3SyncTask
+): Promise<void> {
+  await putMeta(pool, officialTaskKey(task.runId, task.taskId), JSON.stringify(task));
+}
+
+async function putMeta(pool: InstanceType<typeof Pool>, key: string, value: string): Promise<void> {
+  await pool.query(
+    'INSERT INTO cache_meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+    [key, value]
+  );
 }
 
 async function installTaskReceiptFailure(
