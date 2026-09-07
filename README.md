@@ -796,6 +796,26 @@ or building a backlog. PostgreSQL writer-lock contention is reported as a safe
 skip. Official run/task/cursor status—not legacy full-sync timestamps—drives
 health and the next action.
 
+By default the scheduler is unrestricted, preserving existing deployments.
+Production enables the business-hours gate only by configuring all four values:
+
+```bash
+SALESBINDER_CACHE_SYNC_INTERVAL_SECONDS=300
+SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS=cycle
+SALESBINDER_SCHEDULER_TIMEZONE=Asia/Ho_Chi_Minh
+SALESBINDER_SCHEDULER_DAYS=1,2,3,4,5,6
+SALESBINDER_SCHEDULER_START_HOUR=7
+SALESBINDER_SCHEDULER_END_HOUR=22
+```
+
+Weekday numbers use `0=Sunday` through `6=Saturday`. With that configuration,
+new cycles run only Monday–Saturday from `07:00` inclusive to `22:00` exclusive
+in the configured timezone. A cycle already entered before closing finishes
+safely; no new status or sync command starts while the runner is asleep. Sleep
+is interruptible on shutdown and logs its next UTC wake time; eligible-cycle
+entry is logged too, so deployment verification does not require exposing
+credentials or cache state.
+
 The runner requires account name, subdomain, V3 key, PostgreSQL cache URL, and
 PostgreSQL read mode. It does not require or access the webhook-ledger URL.
 Reference refresh reads V3 customers, prospects, suppliers, and categories;
@@ -803,9 +823,12 @@ archived account records are intentionally excluded before name validation;
 existing cached historical account rows are not deleted by this refresh;
 `SALESBINDER_API_KEY` is optional and adds the explicit V2 users-directory read.
 It is never a fallback from official V3 polling. `SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS`
-defaults to `86400`; use `0` or `disabled` to turn that job off. The runner
-passes this value to `sync-references --if-stale`; durable last-attempt time
-throttles attempts, while per-resource last-success times report freshness.
+defaults to `cycle`: every eligible scheduled cycle invokes `sync-references`
+without `--if-stale`, so references are refreshed with the official V3 poll.
+Use a numeric interval (`60`–`604800`, `daily`, or `weekly`) to retain the
+previous `sync-references --if-stale <seconds>` freshness-throttled behavior,
+or `0`/`disabled` to turn reference refresh off. Numeric cadence uses durable
+last-attempt time while per-resource last-success times report freshness.
 
 Scheduled V3 covers only items, invoices, estimates, and purchase orders. The
 reference job has separate authority/freshness, and payment-history completeness

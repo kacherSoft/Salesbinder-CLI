@@ -75,6 +75,53 @@ describeIfPostgres('PostgresCacheService reference refresh integration', () => {
     });
   });
 
+  it('batches large reference refreshes and remains idempotent', async () => {
+    const ctx = await createContext('account_batching');
+    const accounts = Array.from({ length: 501 }, (_, index) => ({
+      account_id: `10000000-0000-4000-8000-${String(index + 200).padStart(12, '0')}`,
+      context_id: 2,
+      account_number: index + 1,
+      name: `Batch Customer ${index + 1}`,
+      office_email: index % 2 === 0 ? null : `customer-${index + 1}@example.test`,
+      cache_source: 'api' as const,
+    }));
+
+    await expect(ctx.service.upsertReferenceAccounts(accounts)).resolves.toBe(501);
+    await expect(ctx.service.upsertReferenceAccounts(accounts)).resolves.toBe(501);
+    await expect(ctx.service.getAllAccounts()).resolves.toHaveLength(501);
+  });
+
+  it('rolls back the whole batch when a row violates database constraints', async () => {
+    const ctx = await createContext('account_rollback');
+    const valid = {
+      account_id: accountId,
+      context_id: 2,
+      name: 'Valid Customer',
+      cache_source: 'api' as const,
+    };
+    const invalid = {
+      account_id: newAccountId,
+      context_id: 2,
+      name: null,
+      cache_source: 'api' as const,
+    } as unknown as Parameters<PostgresCacheService['upsertReferenceAccounts']>[0][number];
+
+    await expect(ctx.service.upsertReferenceAccounts([valid, invalid])).rejects.toBeDefined();
+    await expect(ctx.service.getAllAccounts()).resolves.toHaveLength(0);
+  });
+
+  it('preserves sequential last-write semantics for duplicate IDs', async () => {
+    const ctx = await createContext('account_duplicates');
+    await expect(ctx.service.upsertReferenceAccounts([
+      { account_id: accountId, context_id: 2, name: 'First Name', cache_source: 'api' },
+      { account_id: accountId, context_id: 2, name: 'Last Name', office_email: 'last@example.test', cache_source: 'api' },
+    ])).resolves.toBe(2);
+    await expect(ctx.service.getAccount(accountId)).resolves.toMatchObject({
+      name: 'Last Name',
+      office_email: 'last@example.test',
+    });
+  });
+
   async function createContext(label: string): Promise<TestContext> {
     if (!adminPool) throw new Error('admin pool unavailable');
     const schema = `reference_refresh_${label}_${randomUUID().replaceAll('-', '_')}`;

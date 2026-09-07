@@ -1,7 +1,16 @@
 export const DEFAULT_SYNC_INTERVAL_SECONDS = 300;
-export const DEFAULT_REFERENCE_SYNC_INTERVAL_SECONDS = 86_400;
+export const DEFAULT_REFERENCE_SYNC_INTERVAL_SECONDS = 'cycle';
 export const MIN_SYNC_INTERVAL_SECONDS = 60;
 export const MAX_SYNC_INTERVAL_SECONDS = 604_800;
+
+export interface BusinessHoursSchedule {
+  timezone: string;
+  days: number[];
+  startHour: number;
+  endHour: number;
+}
+
+export type ReferenceSyncInterval = number | 'cycle' | null;
 
 export type SchedulerConfig =
   | { disabled: true }
@@ -15,7 +24,8 @@ export type SchedulerConfig =
       homeDirectory: string;
       syncIntervalSeconds: number;
       initialSince?: string;
-      referenceSyncIntervalSeconds: number | null;
+      referenceSyncIntervalSeconds: ReferenceSyncInterval;
+      businessHours?: BusinessHoursSchedule;
     };
 
 function boundedSeconds(
@@ -72,6 +82,69 @@ function requiredValue(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
+function businessHoursSchedule(env: NodeJS.ProcessEnv): BusinessHoursSchedule | undefined {
+  const names = [
+    'SALESBINDER_SCHEDULER_TIMEZONE',
+    'SALESBINDER_SCHEDULER_DAYS',
+    'SALESBINDER_SCHEDULER_START_HOUR',
+    'SALESBINDER_SCHEDULER_END_HOUR',
+  ] as const;
+  const configured = names.filter((name) => env[name] !== undefined);
+  if (configured.length === 0) return undefined;
+  if (configured.length !== names.length) {
+    throw new Error(`${names.join(', ')} must be configured together.`);
+  }
+
+  const timezone = requiredValue(env, 'SALESBINDER_SCHEDULER_TIMEZONE');
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(0);
+  } catch {
+    throw new Error('SALESBINDER_SCHEDULER_TIMEZONE must be a valid IANA timezone.');
+  }
+
+  const rawDays = requiredValue(env, 'SALESBINDER_SCHEDULER_DAYS');
+  const dayTokens = rawDays.split(',').map((day) => day.trim());
+  const days = dayTokens.map((day) => Number(day));
+  if (
+    days.length === 0 ||
+    dayTokens.some((day) => !/^[0-6]$/.test(day)) ||
+    new Set(days).size !== days.length
+  ) {
+    throw new Error('SALESBINDER_SCHEDULER_DAYS must be unique weekday numbers from 0 through 6.');
+  }
+
+  const parseHour = (
+    name: 'SALESBINDER_SCHEDULER_START_HOUR' | 'SALESBINDER_SCHEDULER_END_HOUR'
+  ) => {
+    const raw = requiredValue(env, name);
+    if (!/^(?:[01]?\d|2[0-3])$/.test(raw))
+      throw new Error(`${name} must be an integer from 0 through 23.`);
+    return Number(raw);
+  };
+  const startHour = parseHour('SALESBINDER_SCHEDULER_START_HOUR');
+  const endHour = parseHour('SALESBINDER_SCHEDULER_END_HOUR');
+  if (startHour >= endHour) {
+    throw new Error(
+      'SALESBINDER_SCHEDULER_START_HOUR must be earlier than SALESBINDER_SCHEDULER_END_HOUR.'
+    );
+  }
+  return { timezone, days, startHour, endHour };
+}
+
+function referenceSyncInterval(env: NodeJS.ProcessEnv): ReferenceSyncInterval {
+  const raw = env.SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS;
+  if (raw === undefined) return DEFAULT_REFERENCE_SYNC_INTERVAL_SECONDS;
+  if (raw === 'cycle') return 'cycle';
+  return boundedSeconds(
+    env,
+    'SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS',
+    DEFAULT_SYNC_INTERVAL_SECONDS,
+    MIN_SYNC_INTERVAL_SECONDS,
+    MAX_SYNC_INTERVAL_SECONDS,
+    true
+  );
+}
+
 export function validateSchedulerEnvironment(env: NodeJS.ProcessEnv): SchedulerConfig {
   if (env.SALESBINDER_SCHEDULER_DISABLED !== 'false') return { disabled: true };
   const required = [
@@ -96,6 +169,7 @@ export function validateSchedulerEnvironment(env: NodeJS.ProcessEnv): SchedulerC
   if (syncIntervalSeconds === null) {
     throw new Error('SALESBINDER_CACHE_SYNC_INTERVAL_SECONDS cannot be disabled.');
   }
+  const businessHours = businessHoursSchedule(env);
   return {
     disabled: false,
     accountName: requiredValue(env, 'SALESBINDER_ACCOUNT_NAME'),
@@ -109,13 +183,7 @@ export function validateSchedulerEnvironment(env: NodeJS.ProcessEnv): SchedulerC
     homeDirectory: requiredValue(env, 'HOME'),
     syncIntervalSeconds,
     ...(initialSince ? { initialSince } : {}),
-    referenceSyncIntervalSeconds: boundedSeconds(
-      env,
-      'SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS',
-      DEFAULT_REFERENCE_SYNC_INTERVAL_SECONDS,
-      MIN_SYNC_INTERVAL_SECONDS,
-      MAX_SYNC_INTERVAL_SECONDS,
-      true
-    ),
+    referenceSyncIntervalSeconds: referenceSyncInterval(env),
+    ...(businessHours ? { businessHours } : {}),
   };
 }
