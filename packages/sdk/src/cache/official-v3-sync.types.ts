@@ -92,16 +92,14 @@ export interface OfficialV3SyncStore {
     stockRows: ItemStockLocationRow[]
   ): Promise<void>;
   applyItemDelete(runId: string, task: OfficialV3SyncTask): Promise<void>;
-  applyDocumentUpsertAndQueueRefreshes(
+  applyDocumentUpsert(
     runId: string,
     task: OfficialV3SyncTask,
     document: DocumentRow,
     lines: Omit<ItemDocumentRow, 'id'>[]
   ): Promise<void>;
-  applyDocumentDeleteAndQueueRefreshes(
-    runId: string,
-    task: OfficialV3SyncTask
-  ): Promise<void>;
+  applyDocumentDelete(runId: string, task: OfficialV3SyncTask): Promise<void>;
+  retireLegacyItemRefreshTasks(runId: string): Promise<void>;
   applyItemRefresh(
     runId: string,
     task: OfficialV3SyncTask,

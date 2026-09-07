@@ -3198,14 +3198,14 @@ export class PostgresCacheService
     const existingByApiId = doc.api_doc_id
       ? (
         await executor.query<DocumentIdentityRow>(
-            `SELECT doc_id, api_doc_id, archived, user_id, salesperson_name FROM documents WHERE api_doc_id = $1`,
+            `SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE api_doc_id = $1`,
             [doc.api_doc_id]
           )
         ).rows[0]
       : undefined;
     const existingByNumber = (
       await executor.query<DocumentIdentityRow>(
-        `SELECT doc_id, api_doc_id, archived, user_id, salesperson_name FROM documents WHERE context_id = $1 AND doc_number = $2`,
+        `SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE context_id = $1 AND doc_number = $2`,
         [doc.context_id, doc.doc_number]
       )
     ).rows[0];
@@ -3236,9 +3236,28 @@ export class PostgresCacheService
             archived: doc.archived == null ? existing.archived : doc.archived,
             user_id: assignment.user_id,
             salesperson_name: assignment.salesperson_name,
+            shipping_location: Object.prototype.hasOwnProperty.call(doc, 'shipping_location')
+              ? doc.shipping_location
+              : existing.shipping_location,
+            ...this.preserveUnobservedDocumentNumbers(doc, existing),
           }
         : { ...doc, user_id: assignment.user_id, salesperson_name: assignment.salesperson_name }
     );
+  }
+
+  private preserveUnobservedDocumentNumbers(
+    doc: DocumentRow,
+    existing: DocumentIdentityRow
+  ): Partial<DocumentRow> {
+    if (Object.prototype.hasOwnProperty.call(doc, 'account_number')) return {};
+    const incomingAccountId = doc.account_id ?? doc.customer_id ?? null;
+    const existingAccountId = existing.account_id ?? existing.customer_id ?? null;
+    if (!incomingAccountId || incomingAccountId !== existingAccountId) return {};
+    return {
+      account_number: existing.account_number ?? null,
+      customer_number: existing.customer_number ?? null,
+      supplier_number: existing.supplier_number ?? null,
+    };
   }
 
   private async readSalespersonDirectory(
@@ -3394,6 +3413,12 @@ interface DocumentIdentityRow {
   archived?: 0 | 1 | null;
   user_id?: string | null;
   salesperson_name?: string | null;
+  shipping_location?: string | null;
+  customer_id?: string | null;
+  account_id?: string | null;
+  account_number?: number | null;
+  customer_number?: number | null;
+  supplier_number?: number | null;
 }
 
 const assertWellFormedDocumentApiId = (value: unknown): void => {
@@ -3413,7 +3438,14 @@ const assertWellFormedStoredDocumentIdentity = (value: DocumentIdentityRow | und
         (typeof value.user_id !== 'string' || hasUnpairedUtf16Surrogate(value.user_id))) ||
       (value.salesperson_name != null &&
         (typeof value.salesperson_name !== 'string' ||
-          hasUnpairedUtf16Surrogate(value.salesperson_name))))
+          hasUnpairedUtf16Surrogate(value.salesperson_name))) ||
+      (value.shipping_location != null &&
+        (typeof value.shipping_location !== 'string' ||
+          hasUnpairedUtf16Surrogate(value.shipping_location))) ||
+      (value.customer_id != null &&
+        (typeof value.customer_id !== 'string' || hasUnpairedUtf16Surrogate(value.customer_id))) ||
+      (value.account_id != null &&
+        (typeof value.account_id !== 'string' || hasUnpairedUtf16Surrogate(value.account_id))))
   ) {
     throw new Error('Cached document identity is invalid.');
   }

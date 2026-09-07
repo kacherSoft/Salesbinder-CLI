@@ -7,6 +7,11 @@ import {
 } from './salesbinder-source-date-validation.js';
 import { parseSalesBinderFiniteDecimal } from './salesbinder-source-number-validation.js';
 import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
+import {
+  documentCostFromUnits,
+  normalizeOfficialV3LineCost,
+  type OfficialV3DocumentLineKind,
+} from './v3-document-cost-normalizer.js';
 
 const OBJECTS = { 4: 'estimate', 5: 'invoice', 11: 'purchase_order' } as const;
 const RESOURCE_CONTEXTS = { estimate: 4, invoice: 5, purchase_order: 11 } as const;
@@ -60,17 +65,19 @@ export function normalizeV3DocumentCacheRows(
   if (!Object.prototype.hasOwnProperty.call(payload, assignmentKey)) throw invalid();
   const userId = optionalUuid(payload[assignmentKey]);
   const accountId = uuid(payload[po ? 'supplier_id' : 'customer_id']);
-  const accountName = text(payload[po ? 'supplier_name' : 'customer_name']);
+  const accountName = requiredText(payload[po ? 'supplier_name' : 'customer_name']);
+  if (!Object.prototype.hasOwnProperty.call(payload, 'status') || payload.status === undefined)
+    throw invalid();
   const status = text(payload.status);
-  const party = payload.party == null ? null : record(payload.party);
-  const accountNumberText = text(party?.account_number);
-  // Display account numbers may contain prefixes that cannot fit the integer cache column.
-  const accountNumber = safeDocumentNumber(accountNumberText) ?? null;
+  const accountNumbers = documentAccountNumberFields(payload, po);
   const customerKind = text(payload.customer_kind);
   if (customerKind != null && !['customer', 'prospect'].includes(customerKind)) throw invalid();
   if (!isValidSalesBinderTimestampText(payload.updated_at) || !Array.isArray(payload.lines))
     throw invalid();
+  requiredNumber(payload.total);
+  const subtotal = requiredNumber(payload.subtotal);
   const seen = new Set<string>();
+  let totalCostUnits = 0n;
   const itemRows = payload.lines.flatMap((value: unknown) => {
     const line = record(value);
     const lineId = uuid(line.id);
@@ -81,17 +88,19 @@ export function normalizeV3DocumentCacheRows(
     if (parentId != null && parentId !== payload.id) throw invalid();
     const kind = text(line.line_type);
     if (kind == null || !['inventory', 'service', 'discount'].includes(kind)) throw invalid();
+    const lineKind = kind as OfficialV3DocumentLineKind;
     const itemId = line.item_id == null ? null : uuid(line.item_id);
     if (
-      (kind === 'inventory' && !itemId) ||
-      (itemId && (kind === 'service' || kind === 'discount'))
+      (lineKind === 'inventory' && !itemId) ||
+      (itemId && (lineKind === 'service' || lineKind === 'discount'))
     )
       throw invalid();
+    const sourceCost = normalizeOfficialV3LineCost(line, object, lineKind);
+    totalCostUnits += sourceCost.aggregateCostUnits;
     const quantity = requiredNumber(line.quantity);
     const price = optionalNumber(line[po ? 'unit_cost' : 'unit_price']);
-    const cost = optionalNumber(line.unit_cost);
     const discounted = optionalNumber(line[po ? 'discounted_unit_cost' : 'discounted_unit_price']);
-    const total = optionalNumber(line.subtotal);
+    const total = requiredNumber(line.subtotal);
     const name = text(line.name);
     const description = text(line.description);
     const sku = text(line.sku);
@@ -120,7 +129,7 @@ export function normalizeV3DocumentCacheRows(
         document_item_id: lineId,
         quantity,
         price,
-        cost,
+        cost: sourceCost.unitCost,
         total_amount: total,
         discounted_price: discounted,
         discount_percent: discount,
@@ -154,20 +163,17 @@ export function normalizeV3DocumentCacheRows(
               ? 2
               : null,
       account_name: accountName,
-      account_number: accountNumber,
+      ...accountNumbers,
       customer_name: po ? null : accountName,
-      customer_number: po ? null : accountNumber,
       supplier_name: po ? accountName : null,
-      supplier_number: po ? accountNumber : null,
       user_id: userId,
       document_name: text(payload.name),
       custom_doc_number: text(payload[`custom_${object}_number`]),
-      status_id: integer(payload.status_id),
+      status_id: requiredInteger(payload.status_id),
       status_name: status,
-      total_price: optionalNumber(payload.total),
-      subtotal: optionalNumber(payload.subtotal),
-      // V3 does not provide an authoritative document aggregate of internal line costs.
-      total_cost: null,
+      total_price: subtotal,
+      subtotal,
+      total_cost: documentCostFromUnits(totalCostUnits),
       archived: null,
       external_po_number: po ? null : text(payload.purchase_order_number),
       date_sent: payload.date_sent == null ? null : date(payload.date_sent),
@@ -214,11 +220,37 @@ function requiredNumber(value: unknown): number {
 function optionalNumber(value: unknown): number | null {
   return value == null ? null : requiredNumber(value);
 }
+function requiredInteger(value: unknown): number {
+  const result = integer(value);
+  if (result == null) throw invalid();
+  return result;
+}
 function integer(value: unknown): number | null {
   if (value == null) return null;
   const result = safeDocumentNumber(value);
   if (result === undefined) throw invalid();
   return result;
+}
+function requiredText(value: unknown): string {
+  const result = text(value);
+  if (result == null || result.trim().length === 0) throw invalid();
+  return result;
+}
+function documentAccountNumberFields(
+  payload: Record<string, unknown>,
+  po: boolean
+): Record<string, number | null> {
+  if (!Object.prototype.hasOwnProperty.call(payload, 'party')) return {};
+  const party = record(payload.party);
+  if (!Object.prototype.hasOwnProperty.call(party, 'account_number')) throw invalid();
+  const accountNumberText = text(party.account_number);
+  // Display account numbers may contain prefixes that cannot fit the integer cache column.
+  const accountNumber = safeDocumentNumber(accountNumberText) ?? null;
+  return {
+    account_number: accountNumber,
+    customer_number: po ? null : accountNumber,
+    supplier_number: po ? accountNumber : null,
+  };
 }
 function date(value: unknown): string {
   if (!isValidSalesBinderCalendarDateText(value)) throw invalid();

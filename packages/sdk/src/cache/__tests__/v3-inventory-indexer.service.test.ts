@@ -2414,6 +2414,8 @@ function v3Variation(overrides: Partial<V3ItemVariation> = {}): V3ItemVariation 
     object: 'item_variation',
     item_id: 'item-1',
     barcode: 'W-1',
+    unit_price_override: null,
+    unit_cost_override: null,
     quantity: 12,
     quantity_reserved: 3,
     quantity_incoming: 5,

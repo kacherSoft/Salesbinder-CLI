@@ -263,6 +263,8 @@ function variation(overrides: Partial<V3ItemVariation> = {}): V3ItemVariation {
         threshold: 1,
       },
     ],
+    unit_price_override: null,
+    unit_cost_override: null,
     ...overrides,
   };
 }

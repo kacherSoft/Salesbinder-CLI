@@ -2500,10 +2500,10 @@ describe('PostgresCacheService atomic document bundles', () => {
     expect(statements).toEqual(
       expect.arrayContaining([
         expect.stringContaining(
-          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name FROM documents WHERE api_doc_id'
+          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE api_doc_id'
         ),
         expect.stringContaining(
-          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name FROM documents WHERE context_id = $1 AND doc_number = $2'
+          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE context_id = $1 AND doc_number = $2'
         ),
         'ROLLBACK',
       ])
@@ -2576,6 +2576,138 @@ describe('PostgresCacheService atomic document bundles', () => {
       )?.[1]?.[1]
     ).toBe('legacy-doc');
     expect(query.mock.calls.map(([sql]) => String(sql)).at(-1)).toBe('COMMIT');
+  });
+
+  it('rewrites a legacy-number document with V3 costs while preserving V3-unobserved shipping location', async () => {
+    const existing = {
+      doc_id: 'legacy-doc',
+      api_doc_id: null,
+      archived: 1,
+      shipping_location: 'CSV Dock',
+    };
+    const { service, query } = makeService(async (sql) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('WHERE api_doc_id = $1')) return { rows: [] };
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) {
+        return { rows: [existing] };
+      }
+      return { rows: [] };
+    });
+
+    await service.replaceDocumentBundle(
+      {
+        ...document,
+        total_price: 200,
+        total_cost: 123.45,
+        subtotal: 180,
+        status_id: 9,
+        status_name: 'Sent',
+      },
+      [
+        {
+          item_id: 'new-line',
+          doc_id: document.doc_id,
+          document_item_id: 'line-1',
+          quantity: 0,
+          price: 12.5,
+          cost: 3.25,
+          total_amount: 0,
+          discounted_price: null,
+          quantity_shipped: 0,
+        },
+      ]
+    );
+
+    const documentInsert = query.mock.calls.find(([sql]) =>
+      String(sql).startsWith('INSERT INTO documents')
+    );
+    expect(documentInsert?.[1]?.[0]).toBe('legacy-doc');
+    expect(documentInsert?.[1]?.[6]).toBe(document.api_doc_id);
+    expect(documentInsert?.[1]?.[20]).toBe(9);
+    expect(documentInsert?.[1]?.[22]).toBe(200);
+    expect(documentInsert?.[1]?.[23]).toBe(123.45);
+    expect(documentInsert?.[1]?.[24]).toBe(180);
+    expect(documentInsert?.[1]?.[27]).toBe('CSV Dock');
+    expect(documentInsert?.[1]?.[31]).toBe(1);
+
+    const itemInsert = query.mock.calls.find(([sql]) =>
+      String(sql).startsWith('INSERT INTO item_documents')
+    );
+    expect(itemInsert?.[1]?.[1]).toBe('legacy-doc');
+    expect(itemInsert?.[1]?.[2]).toBe(0);
+    expect(itemInsert?.[1]?.[3]).toBe(12.5);
+    expect(itemInsert?.[1]?.[11]).toBe(0);
+    expect(itemInsert?.[1]?.[12]).toBe(3.25);
+    expect(itemInsert?.[1]?.[13]).toBe(0);
+  });
+
+  it('allows explicit public-writer shipping location clears', async () => {
+    const existing = {
+      doc_id: 'stored-doc',
+      api_doc_id: document.api_doc_id,
+      archived: 0,
+      shipping_location: 'CSV Dock',
+    };
+    const { service, query } = makeService(async (sql) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('WHERE api_doc_id = $1')) return { rows: [existing] };
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) return { rows: [existing] };
+      return { rows: [] };
+    });
+
+    await service.replaceDocumentBundle({ ...document, shipping_location: null }, []);
+
+    const documentInsert = query.mock.calls.find(([sql]) =>
+      String(sql).startsWith('INSERT INTO documents')
+    );
+    expect(documentInsert?.[1]?.[27]).toBeNull();
+  });
+
+  it('preserves omitted account numbers only for the same resolved account identity', async () => {
+    const existing = {
+      doc_id: 'stored-doc',
+      api_doc_id: document.api_doc_id,
+      customer_id: document.customer_id,
+      account_id: document.customer_id,
+      account_number: 42,
+      customer_number: 42,
+      supplier_number: null,
+    };
+    const preserved = makeService(async (sql) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('WHERE api_doc_id = $1')) return { rows: [existing] };
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) return { rows: [existing] };
+      return { rows: [] };
+    });
+
+    await preserved.service.replaceDocumentBundle(document, []);
+    const preservedInsert = preserved.query.mock.calls.find(([sql]) =>
+      String(sql).startsWith('INSERT INTO documents')
+    );
+    expect(preservedInsert?.[1]?.[13]).toBe(42);
+    expect(preservedInsert?.[1]?.[17]).toBe(42);
+
+    const changed = makeService(async (sql) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('WHERE api_doc_id = $1')) {
+        return {
+          rows: [{ ...existing, customer_id: 'previous-customer', account_id: 'previous-customer' }],
+        };
+      }
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) {
+        return {
+          rows: [{ ...existing, customer_id: 'previous-customer', account_id: 'previous-customer' }],
+        };
+      }
+      return { rows: [] };
+    });
+
+    await changed.service.replaceDocumentBundle(document, []);
+    const changedInsert = changed.query.mock.calls.find(([sql]) =>
+      String(sql).startsWith('INSERT INTO documents')
+    );
+    expect(changedInsert?.[1]?.[13]).toBeNull();
+    expect(changedInsert?.[1]?.[17]).toBeNull();
   });
 
   it.each(['\ud800', '\udc00'])(

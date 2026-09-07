@@ -1,7 +1,7 @@
 import { PostgresOfficialV3SyncStore } from '../postgres-official-v3-sync.store.js';
 import type { OfficialV3SyncRun, OfficialV3SyncTask } from '../official-v3-sync.types.js';
 import { officialLatestReceiptKey, officialTaskKey } from '../official-v3-sync.validation.js';
-import type { ItemRow, ItemStockLocationRow } from '../types.js';
+import type { DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from '../types.js';
 
 const accountIdentity = 'salesbinder:acme';
 const itemId = '05c86ce5-c234-438b-9908-f518e42d42e4';
@@ -30,7 +30,25 @@ describe('PostgresOfficialV3SyncStore', () => {
     expect(h.task(oldDelete)).toMatchObject({ status: 'superseded' });
   });
 
-  it('resolves document deletes through API identity, queues old refs, and avoids CSV-only rows', async () => {
+  it('applies document upserts without queueing item refresh tasks', async () => {
+    const h = harness();
+    const run = officialRun();
+    const upsertTask = task(run.runId, 'upsert-doc', 1, 'upsert', 'invoice', apiDocId);
+    h.seedRun(run);
+    h.seedTask(upsertTask);
+
+    await h.store.applyDocumentUpsert(run.runId, upsertTask, document(apiDocId), [line(apiDocId, oldItemId)]);
+
+    expect(h.documentWrites).toEqual([{ docId: apiDocId, itemIds: [oldItemId] }]);
+    expect(h.task(upsertTask)).toMatchObject({ status: 'done' });
+    expect(await h.store.listTasks(run.runId)).toHaveLength(1);
+    expect(h.client.query).not.toHaveBeenCalledWith(
+      'SELECT item_id FROM item_documents WHERE doc_id = $1',
+      expect.anything()
+    );
+  });
+
+  it('resolves document deletes through API identity without queueing old refs or touching CSV-only rows', async () => {
     const h = harness();
     const run = officialRun();
     const deleteTask = task(run.runId, 'delete-doc', 1, 'delete', 'invoice', apiDocId);
@@ -39,21 +57,48 @@ describe('PostgresOfficialV3SyncStore', () => {
     h.seedRun(run);
     h.seedTask(deleteTask);
 
-    await h.store.applyDocumentDeleteAndQueueRefreshes(run.runId, deleteTask);
+    await h.store.applyDocumentDelete(run.runId, deleteTask);
 
     expect(h.deletedDocuments).toEqual([localDocId]);
-    expect(await h.store.listTasks(run.runId)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ parentTaskId: deleteTask.taskId, id: oldItemId, status: 'pending' }),
-        expect.objectContaining({ taskId: deleteTask.taskId, status: 'waiting_children' }),
-      ])
+    expect(h.task(deleteTask)).toMatchObject({ status: 'done' });
+    expect(await h.store.listTasks(run.runId)).toHaveLength(1);
+    expect(h.client.query).not.toHaveBeenCalledWith(
+      'SELECT item_id FROM item_documents WHERE doc_id = $1',
+      expect.anything()
     );
 
     const missing = task(run.runId, 'missing-doc', 2, 'delete', 'invoice', localDocId);
     h.seedTask(missing);
-    await h.store.applyDocumentDeleteAndQueueRefreshes(run.runId, missing);
+    await h.store.applyDocumentDelete(run.runId, missing);
     expect(h.deletedDocuments).toEqual([localDocId]);
     expect(h.task(missing)).toMatchObject({ status: 'done' });
+  });
+
+  it('retires unfinished legacy item refresh children without inventory writes or latest item receipts', async () => {
+    const h = harness();
+    const run = officialRun();
+    const parent = task(run.runId, 'doc-parent', 1, 'upsert', 'invoice', apiDocId);
+    const pendingChild = legacyRefresh(run.runId, parent, oldItemId, 'pending');
+    const failedChild = legacyRefresh(run.runId, parent, itemId, 'failed');
+    const completedChild = legacyRefresh(run.runId, parent, '37b6ffdb-7458-47db-a945-fc1f6b81c665', 'done');
+    const failedSource = task(run.runId, 'source-failed', 4, 'upsert', 'item', itemId);
+    h.seedRun(run);
+    h.seedTask(parent, 'waiting_children');
+    h.seedTask(pendingChild, 'pending');
+    h.seedTask(failedChild, 'failed');
+    h.seedTask(completedChild, 'done');
+    h.seedTask(failedSource, 'failed');
+
+    await h.store.retireLegacyItemRefreshTasks(run.runId);
+
+    expect(h.inventoryWrites).toEqual([]);
+    expect(h.task(pendingChild)).toMatchObject({ status: 'superseded' });
+    expect(h.task(failedChild)).toMatchObject({ status: 'superseded' });
+    expect(h.task(completedChild)).toMatchObject({ status: 'done' });
+    expect(h.task(parent)).toMatchObject({ status: 'done' });
+    expect(h.task(failedSource)).toMatchObject({ status: 'failed' });
+    expect(h.meta.has(officialLatestReceiptKey('item', oldItemId))).toBe(false);
+    expect(h.meta.has(officialLatestReceiptKey('item', itemId))).toBe(false);
   });
 
   it('rolls back inventory writes and task receipts when an atomic mutation fails', async () => {
@@ -82,6 +127,7 @@ function harness() {
   const deletedDocuments: string[] = [];
   const deletedItems: string[] = [];
   const inventoryWrites: string[] = [];
+  const documentWrites: { docId: string; itemIds: string[] }[] = [];
   let failInventoryWrite = false;
   const client = {
     query: jest.fn(async (sql: string, params: unknown[] = []) => {
@@ -122,7 +168,9 @@ function harness() {
     },
     resolveDocument: async (_client, doc) => doc,
     resolveDocumentIdByApiId: async (_client, id) => apiDocuments.get(id) ?? null,
-    writeDocument: async () => undefined,
+    writeDocument: async (_client, doc, lines) => {
+      documentWrites.push({ docId: doc.doc_id, itemIds: lines.map((line) => line.item_id) });
+    },
     deleteDocument: async (_client, id) => {
       deletedDocuments.push(id);
     },
@@ -137,12 +185,14 @@ function harness() {
   });
   return {
     store,
+    client,
     meta,
     apiDocuments,
     documentRefs,
     deletedDocuments,
     deletedItems,
     inventoryWrites,
+    documentWrites,
     get failInventoryWrite() { return failInventoryWrite; },
     set failInventoryWrite(value: boolean) { failInventoryWrite = value; },
     seedRun: (run: OfficialV3SyncRun) => {
@@ -219,5 +269,52 @@ function stock(id: string): ItemStockLocationRow {
     in_transit: 0,
     cache_source: 'api',
     source_api_version: '3',
+  };
+}
+
+function document(id: string): DocumentRow {
+  return {
+    doc_id: id,
+    api_doc_id: id,
+    context_id: 5,
+    doc_number: 100,
+    issue_date: '2026-09-07',
+    customer_id: oldItemId,
+    modified: 1788670542,
+    customer_name: 'Acme',
+    status_name: 'Sent',
+    cache_source: 'api',
+  };
+}
+
+function line(docId: string, lineItemId: string): Omit<ItemDocumentRow, 'id'> {
+  return {
+    doc_id: docId,
+    item_id: lineItemId,
+    quantity: 1,
+    price: 10,
+    total_amount: 10,
+  };
+}
+
+function legacyRefresh(
+  runId: string,
+  parent: OfficialV3SyncTask,
+  id: string,
+  status: OfficialV3SyncTask['status']
+): OfficialV3SyncTask {
+  return {
+    taskId: `${parent.taskId}:refresh:${id}`,
+    runId,
+    page: parent.page,
+    ordinal: parent.ordinal,
+    generation: parent.generation,
+    kind: 'item_refresh',
+    parentTaskId: parent.taskId,
+    resource: 'item',
+    id,
+    operation: 'refresh',
+    status,
+    attempts: 1,
   };
 }

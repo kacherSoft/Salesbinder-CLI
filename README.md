@@ -739,8 +739,25 @@ is a no-op; it does not start a new poll. The command seals each fetched page
 and its candidate cursor in PostgreSQL before following it, then advances the applied
 checkpoint only over a contiguous, successfully handled prefix. A failed or
 unresolved task receives one bounded retry after the primary task drain, then
-yields retained warning state rather than silently advancing coverage. Already
-applied data and prior warnings remain available for inspection and resume.
+yields retained warning state rather than silently advancing coverage. Resuming a
+warning run first ingests any new feed pages from the retained ingestion cursor,
+then drains pending or failed work; already completed tasks are not replayed.
+Already applied data and prior warnings remain available for inspection and resume.
+The combined feed requests `item`, `invoice`, `estimate`, and `purchase_order`
+markers together. Its page limit defaults to 100 and the SDK accepts 1–500;
+that number counts change markers, not fully hydrated records. Only source
+`item` markers create item work. Eligible item markers may group across
+intervening document markers, at most 10 distinct root IDs per root-items
+request, while preserving same-ID upsert/delete order. Variation/location
+pagination and each item's atomic checkpoint remain separate, so this is not a
+complete ten-item sync in one HTTP request. Document markers use individual
+detail reads and update only their own document bundles; they never derive item
+work from document line references.
+
+When old durable state contains document-derived `item_refresh` children,
+resume supersedes unfinished children without an inventory write or new
+item-latest receipt. It closes only already-applied waiting parents and
+preserves failed source parents, completed receipts, and the same cursor chain.
 Cursor values are opaque and are intentionally not shown in command output or
 status.
 
@@ -750,6 +767,15 @@ keep the existing partial state for diagnosis, then perform a new reconciled
 full baseline before starting another official catch-up. Do not replace an
 existing partial state with a fresh `--since` value to bypass that condition.
 This path remains partial catch-up coverage even after a clean run.
+
+V3 document monetary fields preserve the legacy cache contract: `total_price`
+and `subtotal` both store the line-level pre-tax subtotal from V3 `subtotal`;
+the gross V3 `total` is validated but is not the legacy `total_price`.
+Historical `total_cost` is derived from complete authoritative document-line
+cost detail—including service lines, zero-cost sales discounts, and effective
+purchase-order cost—and never from current item-master cost.
+
+- Continuity guard: V3 cache writes require observed cost-permission fields on parent items, variations, and document lines. Missing permission/required fields produce a retryable record failure that preserves the previous bundle instead of writing `NULL` or zero; variation overrides win, and a source-unavailable `shipping_location` preserves the CSV value.
 
 #### Scheduled official V3 polling
 

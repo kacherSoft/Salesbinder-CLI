@@ -116,6 +116,8 @@ export interface V3ItemVariation {
   object: 'item_variation';
   item_id: string;
   barcode: string;
+  unit_price_override: string | null;
+  unit_cost_override?: string | null;
   quantity: number;
   quantity_reserved: number;
   quantity_incoming: number;

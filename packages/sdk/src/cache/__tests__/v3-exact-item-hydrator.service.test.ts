@@ -368,6 +368,8 @@ function v3Variation(
     object: 'item_variation',
     item_id: itemId,
     barcode: 'W-1',
+    unit_price_override: null,
+    unit_cost_override: null,
     quantity: 12,
     quantity_reserved: 3,
     quantity_incoming: 5,
