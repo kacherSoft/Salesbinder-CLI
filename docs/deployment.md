@@ -12,7 +12,9 @@ The approved cache-sync runner is a private monorepo package deployed as a separ
 - First verified runtime commit: `f41159cb1fceed772b60eb7a43bdbdf37ac331b7`
 - Health: Coolify container state plus constant startup markers; HTTP health checks are disabled
 
-The current Coolify application is still disabled on the first verified runtime image. The official-V3 scheduler described below is the next reviewed release contract; it is not deployed until its commit reaches `main` and the canary gates pass.
+Tested `main` commit `782471f4948550b5c591fcb33f7fd1286a3aa10a` is deployed as the disabled canary. Normal and preview scopes both remain disabled, so the configured 300-second incremental cadence is not active. Actual official cache state remains 49/49 tasks complete at generation 169 with no cursor gap; no first new scheduled production cycle has run.
+
+The activation restart is currently blocked before clone/build/start: the Coolify host's HTTPS `git ls-remote` connection to GitHub port 443 timed out after about 135 seconds and exited 128. The running CLI and cache data were unaffected. A Codex local-thread monitor named `monitor-salesbinder-incremental-sync` checks this known-disabled baseline every 10 minutes and stays quiet unless a new issue or read-only recovery signal appears; it is not a Coolify/server scheduler.
 
 The image uses a digest-pinned Node 22 base, installs production dependencies separately, runs as the unprivileged `node` user, and keeps `/app` root-owned. Startup fails before idling if the compiled CLI/SDK or native `better-sqlite3` runtime cannot load.
 
@@ -64,6 +66,8 @@ Official polling covers `item`, `invoice`, `estimate`, and `purchase_order` only
 7. Verify reference status separately. If V2 users refresh is intended, supply its read credential explicitly; otherwise disable or accept the documented partial reference result. Payment history remains a separate explicit job.
 
 The live Coolify instance is `4.0.0-beta.463`; earlier scheduled-task REST probing returned `404`. [Current Coolify documentation](https://next.coolify.io/docs/core/automation/scheduled-tasks/overview) describes scheduled tasks, but the live instance/API was not revalidated. The approved path therefore remains the existing self-scheduled URL-less runner. A future native task may invoke the same one-shot dispatcher only with its internal loop disabled. Do not run both schedulers or write directly to Coolify's internal database.
+
+To recover activation, first verify outbound DNS and TCP/HTTPS 443 from the Coolify host to GitHub. Then enable only normal scope and perform a runtime-recreating restart at the same reviewed SHA; preview must remain disabled. Confirm the enabled startup marker and the first official sync result before declaring polling active. Preserve the existing official cursor/state throughout—never reset the cursor to work around deployment or network failure.
 
 ## Commands
 
