@@ -199,6 +199,7 @@ const ACCOUNT_COLUMNS = [
   'cache_source',
   'imported_at',
 ] as const;
+const REFERENCE_ACCOUNT_BATCH_SIZE = 500;
 
 const ITEM_COLUMNS = [
   'item_id',
@@ -252,6 +253,12 @@ const STOCK_COLUMNS = [
 ] as const;
 
 type QueryExecutor = Pick<PoolClient, 'query'>;
+interface ReferenceAccountGroup {
+  insertColumns: readonly (typeof ACCOUNT_COLUMNS)[number][];
+  updateColumns: readonly (typeof ACCOUNT_COLUMNS)[number][];
+  accounts: AccountRow[];
+}
+
 const supportsClientLifecycleEvents = (client: PoolClient): boolean =>
   typeof client.on === 'function' &&
   typeof client.once === 'function' &&
@@ -1515,15 +1522,46 @@ export class PostgresCacheService
 
   async upsertReferenceAccounts(accounts: AccountRow[]): Promise<number> {
     if (accounts.length === 0) return 0;
+    const seen = new Set<string>();
+    let hasDuplicate = false;
+    for (const account of accounts) {
+      if (seen.has(account.account_id)) hasDuplicate = true;
+      seen.add(account.account_id);
+    }
     let rowCount = 0;
     await this.withVerifiedWrite(async (client) => {
+      if (hasDuplicate) {
+        for (const account of accounts) {
+          const insertColumns = referenceAccountInsertColumns(account);
+          const result = await client.query(
+            this.referenceAccountUpsertSql(insertColumns, referenceAccountUpdateColumns(account)),
+            this.valuesFor(insertColumns, account as unknown as Record<string, unknown>)
+          );
+          rowCount += result.rowCount ?? 0;
+        }
+        return;
+      }
+      const groups = new Map<string, ReferenceAccountGroup>();
       for (const account of accounts) {
         const insertColumns = referenceAccountInsertColumns(account);
-        const result = await client.query(
-          this.referenceAccountUpsertSql(insertColumns, referenceAccountUpdateColumns(account)),
-          this.valuesFor(insertColumns, account as unknown as Record<string, unknown>)
-        );
-        rowCount += result.rowCount ?? 0;
+        const updateColumns = referenceAccountUpdateColumns(account);
+        const key = `${insertColumns.join(',')}|${updateColumns.join(',')}`;
+        const group = groups.get(key) ?? { insertColumns, updateColumns, accounts: [] };
+        group.accounts.push(account);
+        groups.set(key, group);
+      }
+      for (const group of groups.values()) {
+        for (let offset = 0; offset < group.accounts.length; offset += REFERENCE_ACCOUNT_BATCH_SIZE) {
+          const batch = group.accounts.slice(offset, offset + REFERENCE_ACCOUNT_BATCH_SIZE);
+          const values = batch.flatMap((account) =>
+            this.valuesFor(group.insertColumns, account as unknown as Record<string, unknown>)
+          );
+          const result = await client.query(
+            this.referenceAccountUpsertSql(group.insertColumns, group.updateColumns, batch.length),
+            values
+          );
+          rowCount += result.rowCount ?? 0;
+        }
       }
     });
     return rowCount;
@@ -3146,10 +3184,15 @@ export class PostgresCacheService
 
   private referenceAccountUpsertSql(
     insertColumns: readonly (typeof ACCOUNT_COLUMNS)[number][],
-    updateColumns: readonly (typeof ACCOUNT_COLUMNS)[number][]
+    updateColumns: readonly (typeof ACCOUNT_COLUMNS)[number][],
+    rowCount = 1
   ): string {
     const updates = updateColumns.map((column) => `${column} = EXCLUDED.${column}`).join(', ');
-    return `${this.insertSql('accounts', insertColumns)} ON CONFLICT (account_id) DO UPDATE SET ${updates}`;
+    const width = insertColumns.length;
+    const values = Array.from({ length: rowCount }, (_, row) =>
+      `(${insertColumns.map((_, column) => `$${row * width + column + 1}`).join(', ')})`
+    ).join(', ');
+    return `INSERT INTO accounts (${insertColumns.join(', ')}) VALUES ${values} ON CONFLICT (account_id) DO UPDATE SET ${updates}`;
   }
 
   private valuesFor(columns: readonly string[], row: Record<string, unknown>): unknown[] {

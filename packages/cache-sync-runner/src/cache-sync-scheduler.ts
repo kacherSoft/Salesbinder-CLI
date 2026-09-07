@@ -1,4 +1,5 @@
 import type { CliExecutor, CommandResult } from './cli-process-executor.js';
+import { isWithinBusinessHours, nextBusinessHoursStart } from './business-hours-schedule.js';
 import type { SchedulerConfig } from './scheduler-config.js';
 
 export type SyncAction = 'initialize' | 'resume' | 'poll' | 'reconcile_required';
@@ -145,15 +146,14 @@ function resultSummary(result: CommandResult): string | null {
 
 async function refreshReferences(
   accountArgs: string[],
-  intervalSeconds: number,
+  intervalSeconds: Extract<SchedulerConfig, { disabled: false }>['referenceSyncIntervalSeconds'],
   executor: CliExecutor,
   warn: (message: string) => void,
   info: (message: string) => void
 ): Promise<void> {
-  const refresh = await executor.execute(
-    [...accountArgs, 'cache', 'sync-references', '--if-stale', String(intervalSeconds)],
-    true
-  );
+  const arguments_ = [...accountArgs, 'cache', 'sync-references'];
+  if (typeof intervalSeconds === 'number') arguments_.push('--if-stale', String(intervalSeconds));
+  const refresh = await executor.execute(arguments_, true);
   if (refresh.code !== 0) {
     warn('SalesBinder reference refresh failed; retrying on the next cycle.');
     return;
@@ -206,6 +206,15 @@ export function createCacheSyncScheduler(
       const accountArgs = ['--account', config.accountName];
       while (!controller.signal.aborted) {
         const cycleStartedAt = now();
+        if (config.businessHours && !isWithinBusinessHours(cycleStartedAt, config.businessHours)) {
+          const nextStart = nextBusinessHoursStart(cycleStartedAt, config.businessHours);
+          info(
+            `SalesBinder scheduler sleeping until ${new Date(nextStart).toISOString()} (next ${config.businessHours.timezone} business-hours start).`
+          );
+          await delay(nextStart - cycleStartedAt, controller.signal);
+          continue;
+        }
+        if (config.businessHours) info('SalesBinder scheduler entering an eligible sync cycle.');
         const status = await dependencies.executor.execute(
           [...accountArgs, 'cache', 'sync-v3', '--status'],
           true
@@ -253,7 +262,11 @@ export function createCacheSyncScheduler(
           );
         }
         if (controller.signal.aborted) break;
-        const remaining = Math.max(0, cycleStartedAt + config.syncIntervalSeconds * 1000 - now());
+        const completedAt = now();
+        const remaining =
+          config.businessHours && !isWithinBusinessHours(completedAt, config.businessHours)
+            ? nextBusinessHoursStart(completedAt, config.businessHours) - completedAt
+            : Math.max(0, cycleStartedAt + config.syncIntervalSeconds * 1000 - completedAt);
         await delay(remaining, controller.signal);
       }
     },

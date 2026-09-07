@@ -224,3 +224,102 @@ test('treats a fresh durable reference result as a healthy skipped cycle', async
   ]);
   expect(warnings).toEqual([]);
 });
+
+test('runs references every eligible cycle when the explicit cycle cadence is selected', async () => {
+  const calls: string[][] = [];
+  let cycles = 0;
+  let scheduler: ReturnType<typeof createCacheSyncScheduler>;
+  scheduler = createCacheSyncScheduler(
+    config({ SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS: 'cycle' }),
+    {
+      executor: executor(
+        [
+          { code: 0, output: clean },
+          { code: 0, output: completed },
+          { code: 0, output: JSON.stringify({ status: { run: { status: 'success' } } }) },
+          { code: 0, output: clean },
+          { code: 0, output: completed },
+          { code: 0, output: JSON.stringify({ status: { run: { status: 'success' } } }) },
+        ],
+        calls
+      ),
+      delay: async () => {
+        if (++cycles === 2) scheduler.stop();
+      },
+    }
+  );
+  await scheduler.run();
+  expect(calls.filter((args) => args.includes('sync-references'))).toEqual([
+    ['--account', 'account', 'cache', 'sync-references'],
+    ['--account', 'account', 'cache', 'sync-references'],
+  ]);
+});
+
+test('sleeps immediately outside business hours without invoking status or sync commands', async () => {
+  const calls: string[][] = [];
+  const info: string[] = [];
+  let scheduler: ReturnType<typeof createCacheSyncScheduler>;
+  scheduler = createCacheSyncScheduler(
+    config({
+      SALESBINDER_SCHEDULER_TIMEZONE: 'Asia/Ho_Chi_Minh',
+      SALESBINDER_SCHEDULER_DAYS: '1,2,3,4,5,6',
+      SALESBINDER_SCHEDULER_START_HOUR: '7',
+      SALESBINDER_SCHEDULER_END_HOUR: '22',
+    }),
+    {
+      executor: executor([], calls),
+      now: () => Date.parse('2026-09-06T23:59:00Z'),
+      info: (message) => info.push(message),
+      delay: async (milliseconds) => {
+        expect(milliseconds).toBe(60_000);
+        scheduler.stop();
+      },
+    }
+  );
+  await scheduler.run();
+  expect(calls).toEqual([]);
+  expect(info).toEqual([
+    'SalesBinder scheduler sleeping until 2026-09-07T00:00:00.000Z (next Asia/Ho_Chi_Minh business-hours start).',
+  ]);
+});
+
+test('finishes a cycle that started before close, then sleeps until the next eligible opening', async () => {
+  const calls: string[][] = [];
+  const info: string[] = [];
+  const times = [Date.parse('2026-09-07T14:59:00Z'), Date.parse('2026-09-07T15:01:00Z')];
+  let scheduler: ReturnType<typeof createCacheSyncScheduler>;
+  scheduler = createCacheSyncScheduler(
+    config({
+      SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS: 'cycle',
+      SALESBINDER_SCHEDULER_TIMEZONE: 'Asia/Ho_Chi_Minh',
+      SALESBINDER_SCHEDULER_DAYS: '1,2,3,4,5,6',
+      SALESBINDER_SCHEDULER_START_HOUR: '7',
+      SALESBINDER_SCHEDULER_END_HOUR: '22',
+    }),
+    {
+      executor: executor(
+        [
+          { code: 0, output: clean },
+          { code: 0, output: completed },
+          { code: 0, output: JSON.stringify({ status: { run: { status: 'success' } } }) },
+        ],
+        calls
+      ),
+      now: () => times.shift() ?? Date.parse('2026-09-07T15:01:00Z'),
+      info: (message) => info.push(message),
+      delay: async (milliseconds) => {
+        expect(milliseconds).toBe(
+          Date.parse('2026-09-08T00:00:00Z') - Date.parse('2026-09-07T15:01:00Z')
+        );
+        scheduler.stop();
+      },
+    }
+  );
+  await scheduler.run();
+  expect(calls).toEqual([
+    ['--account', 'account', 'cache', 'sync-v3', '--status'],
+    ['--account', 'account', 'cache', 'sync-v3'],
+    ['--account', 'account', 'cache', 'sync-references'],
+  ]);
+  expect(info).toContain('SalesBinder scheduler entering an eligible sync cycle.');
+});

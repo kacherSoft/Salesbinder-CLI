@@ -44,6 +44,7 @@ test('uses bounded intervals and accepts relative daily and weekly presets', () 
   if (defaults.disabled) throw new Error('Expected enabled configuration.');
   expect(defaults.syncIntervalSeconds).toBe(DEFAULT_SYNC_INTERVAL_SECONDS);
   expect(defaults.referenceSyncIntervalSeconds).toBe(DEFAULT_REFERENCE_SYNC_INTERVAL_SECONDS);
+  expect(defaults).not.toHaveProperty('businessHours');
   expect(
     validateSchedulerEnvironment(environment({ SALESBINDER_CACHE_SYNC_INTERVAL_SECONDS: 'daily' }))
   ).toMatchObject({ syncIntervalSeconds: 86_400 });
@@ -55,9 +56,71 @@ test('uses bounded intervals and accepts relative daily and weekly presets', () 
       environment({ SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS: 'disabled' })
     )
   ).toMatchObject({ referenceSyncIntervalSeconds: null });
+  expect(
+    validateSchedulerEnvironment(
+      environment({ SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS: 'cycle' })
+    )
+  ).toMatchObject({ referenceSyncIntervalSeconds: 'cycle' });
   for (const value of ['0', '59', '604801', '1.5']) {
     expect(() =>
       validateSchedulerEnvironment(environment({ SALESBINDER_CACHE_SYNC_INTERVAL_SECONDS: value }))
     ).toThrow();
+  }
+});
+
+test('enables a validated all-or-nothing business-hours gate', () => {
+  expect(
+    validateSchedulerEnvironment(
+      environment({
+        SALESBINDER_SCHEDULER_TIMEZONE: 'Asia/Ho_Chi_Minh',
+        SALESBINDER_SCHEDULER_DAYS: '1,2,3,4,5,6',
+        SALESBINDER_SCHEDULER_START_HOUR: '7',
+        SALESBINDER_SCHEDULER_END_HOUR: '22',
+      })
+    )
+  ).toMatchObject({
+    businessHours: {
+      timezone: 'Asia/Ho_Chi_Minh',
+      days: [1, 2, 3, 4, 5, 6],
+      startHour: 7,
+      endHour: 22,
+    },
+  });
+  expect(() =>
+    validateSchedulerEnvironment(
+      environment({ SALESBINDER_SCHEDULER_TIMEZONE: 'Asia/Ho_Chi_Minh' })
+    )
+  ).toThrow(/configured together/);
+  expect(() =>
+    validateSchedulerEnvironment(
+      environment({
+        SALESBINDER_SCHEDULER_TIMEZONE: 'not/a-timezone',
+        SALESBINDER_SCHEDULER_DAYS: '1,2,3,4,5,6',
+        SALESBINDER_SCHEDULER_START_HOUR: '7',
+        SALESBINDER_SCHEDULER_END_HOUR: '22',
+      })
+    )
+  ).toThrow(/IANA timezone/);
+  expect(() =>
+    validateSchedulerEnvironment(
+      environment({
+        SALESBINDER_SCHEDULER_TIMEZONE: 'Asia/Ho_Chi_Minh',
+        SALESBINDER_SCHEDULER_DAYS: '1,1',
+        SALESBINDER_SCHEDULER_START_HOUR: '22',
+        SALESBINDER_SCHEDULER_END_HOUR: '7',
+      })
+    )
+  ).toThrow();
+  for (const days of ['1,2,', '1,,2', ',1,2', '1,7']) {
+    expect(() =>
+      validateSchedulerEnvironment(
+        environment({
+          SALESBINDER_SCHEDULER_TIMEZONE: 'Asia/Ho_Chi_Minh',
+          SALESBINDER_SCHEDULER_DAYS: days,
+          SALESBINDER_SCHEDULER_START_HOUR: '7',
+          SALESBINDER_SCHEDULER_END_HOUR: '22',
+        })
+      )
+    ).toThrow(/weekday numbers/);
   }
 });
