@@ -799,6 +799,8 @@ health and the next action.
 The runner requires account name, subdomain, V3 key, PostgreSQL cache URL, and
 PostgreSQL read mode. It does not require or access the webhook-ledger URL.
 Reference refresh reads V3 customers, prospects, suppliers, and categories;
+archived account records are intentionally excluded before name validation;
+existing cached historical account rows are not deleted by this refresh;
 `SALESBINDER_API_KEY` is optional and adds the explicit V2 users-directory read.
 It is never a fallback from official V3 polling. `SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS`
 defaults to `86400`; use `0` or `disabled` to turn that job off. The runner

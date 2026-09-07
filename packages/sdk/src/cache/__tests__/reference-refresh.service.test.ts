@@ -119,6 +119,104 @@ describe('ReferenceRefreshService', () => {
       recordCount: 1,
     });
   });
+
+  it('skips archived accounts before validating their names', async () => {
+    const upsertReferenceAccounts = jest.fn(async (rows: AccountRow[]) => rows.length);
+    const service = new ReferenceRefreshService({
+      cache: cacheWith(memoryStore(), undefined, upsertReferenceAccounts),
+      categories: categoryClient(),
+      accounts: {
+        list: jest.fn(async (resource) => accountResponse(resource, 1, [
+          accountRecord(resource, `${resource}-archived`, '', true),
+        ], 1, 1)),
+      },
+      now: () => 1_800_000_000,
+    });
+
+    const result = await service.sync({ accountIdentity });
+
+    expect(result.resources.find((row) => row.resource === 'accounts')).toMatchObject({
+      outcome: 'success',
+      recordCount: 0,
+    });
+    expect(upsertReferenceAccounts).toHaveBeenCalledWith([]);
+  });
+
+  it('counts archived records across multiple pages while retaining active rows', async () => {
+    const upsertReferenceAccounts = jest.fn(async (rows: AccountRow[]) => rows.length);
+    const service = new ReferenceRefreshService({
+      cache: cacheWith(memoryStore(), undefined, upsertReferenceAccounts),
+      categories: categoryClient(),
+      accounts: {
+        list: jest.fn(async (resource, params) => accountResponse(
+          resource,
+          params?.page ?? 1,
+          params?.page === 1
+            ? [accountRecord(resource, `${resource}-archived-1`, '', true), accountRecord(resource, `${resource}-active`, 'Active')]
+            : [accountRecord(resource, `${resource}-archived-2`, '', true)],
+          2,
+          3
+        )),
+      },
+      now: () => 1_800_000_000,
+    });
+
+    const result = await service.sync({ accountIdentity });
+
+    expect(result.resources.find((row) => row.resource === 'accounts')).toMatchObject({
+      outcome: 'success',
+      recordCount: 3,
+    });
+    expect(upsertReferenceAccounts.mock.calls[0][0]).toHaveLength(3);
+  });
+
+  it('continues rejecting blank names on active accounts', async () => {
+    const upsertReferenceAccounts = jest.fn(async (rows: AccountRow[]) => rows.length);
+    const service = new ReferenceRefreshService({
+      cache: cacheWith(memoryStore(), undefined, upsertReferenceAccounts),
+      categories: categoryClient(),
+      accounts: {
+        list: jest.fn(async (resource) => accountResponse(resource, 1, [
+          accountRecord(resource, `${resource}-active-blank`, '', false),
+        ], 1, 1)),
+      },
+      now: () => 1_800_000_000,
+    });
+
+    const result = await service.sync({ accountIdentity });
+
+    expect(result.resources.find((row) => row.resource === 'accounts')).toMatchObject({
+      outcome: 'failed',
+      code: 'failed',
+    });
+    expect(upsertReferenceAccounts).not.toHaveBeenCalled();
+  });
+
+  it('does not publish when raw pagination count is incomplete', async () => {
+    const upsertReferenceAccounts = jest.fn(async (rows: AccountRow[]) => rows.length);
+    const service = new ReferenceRefreshService({
+      cache: cacheWith(memoryStore(), undefined, upsertReferenceAccounts),
+      categories: categoryClient(),
+      accounts: {
+        list: jest.fn(async (resource) => accountResponse(
+          resource,
+          1,
+          [accountRecord(resource, `${resource}-active`, 'Active')],
+          1,
+          2
+        )),
+      },
+      now: () => 1_800_000_000,
+    });
+
+    const result = await service.sync({ accountIdentity });
+
+    expect(result.resources.find((row) => row.resource === 'accounts')).toMatchObject({
+      outcome: 'failed',
+      code: 'failed',
+    });
+    expect(upsertReferenceAccounts).not.toHaveBeenCalled();
+  });
 });
 
 function emptyStatus(now: number): ReferenceRefreshStatus {
@@ -151,15 +249,43 @@ function memoryStore(): ReferenceRefreshStore {
 
 function cacheWith(
   store: ReferenceRefreshStore,
-  applySalespersonDirectoryRepair?: ReferenceRefreshCache['applySalespersonDirectoryRepair']
+  applySalespersonDirectoryRepair?: ReferenceRefreshCache['applySalespersonDirectoryRepair'],
+  upsertReferenceAccounts: ReferenceRefreshCache['upsertReferenceAccounts'] = jest.fn(async (rows: AccountRow[]) => rows.length)
 ): ReferenceRefreshCache {
   return {
     getCacheState: jest.fn(async () => ({ schemaVersion: CACHE_SCHEMA_VERSION })),
     replaceCategorySnapshot: jest.fn(async () => undefined),
-    upsertReferenceAccounts: jest.fn(async (rows: AccountRow[]) => rows.length),
+    upsertReferenceAccounts,
     getReferenceRefreshStore: () => store,
     applySalespersonDirectoryRepair,
   } as unknown as ReferenceRefreshCache;
+}
+
+function accountResponse(
+  resource: string,
+  page: number,
+  data: ReturnType<typeof accountRecord>[],
+  totalPages: number,
+  totalRecords: number
+) {
+  return {
+    object: 'list' as const,
+    url: `/${resource}`,
+    has_more: page < totalPages,
+    pagination: { page, per_page: 100, total_pages: totalPages, total_records: totalRecords },
+    data,
+  };
+}
+
+function accountRecord(resource: string, seed: string, name: string, archived?: boolean) {
+  const object = resource === 'customers' ? 'customer' : resource === 'prospects' ? 'prospect' : 'supplier';
+  const suffix = [...seed].map((character) => character.charCodeAt(0).toString(16)).join('').padEnd(12, '0').slice(0, 12);
+  return {
+    id: `10000000-0000-4000-8000-${suffix}`,
+    object: object as 'customer' | 'prospect' | 'supplier',
+    name,
+    archived,
+  };
 }
 
 function categoryClient() {

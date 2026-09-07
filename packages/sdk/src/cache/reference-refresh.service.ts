@@ -182,15 +182,23 @@ export class ReferenceRefreshService {
   ): Promise<AccountRow[]> {
     const first = await this.options.accounts.list(resource, { page: 1, limit: 100 });
     validateAccountPage(first, resource, 1);
-    const rows = first.data.map((account) => accountRow(account, resource, seen));
+    const rows = first.data
+      .filter((account) => account.archived !== true)
+      .map((account) => accountRow(account, resource, seen));
+    let rawRecordCount = first.data.length;
     const totalPages = boundedCount(first.pagination.total_pages, MAX_ACCOUNT_PAGES);
     const totalRecords = boundedCount(first.pagination.total_records, MAX_ACCOUNT_COUNT);
     for (let page = 2; page <= totalPages; page++) {
       const response = await this.options.accounts.list(resource, { page, limit: 100 });
       validateAccountPage(response, resource, page, totalPages, totalRecords);
-      rows.push(...response.data.map((account) => accountRow(account, resource, seen)));
+      rows.push(
+        ...response.data
+          .filter((account) => account.archived !== true)
+          .map((account) => accountRow(account, resource, seen))
+      );
+      rawRecordCount += response.data.length;
     }
-    if (rows.length !== totalRecords) {
+    if (rawRecordCount !== totalRecords) {
       throw new Error(`V3 ${resource} pagination ended before its declared count.`);
     }
     return rows;
