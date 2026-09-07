@@ -47,6 +47,7 @@ import {
 import { registerCacheStatusCommand } from './cache-status.command.js';
 import { registerCacheOffsetSyncCommand } from './cache-offset-sync.command.js';
 import { registerCacheV3SyncCommand } from './cache-v3-sync.command.js';
+import { registerCacheReferencesSyncCommand } from './cache-references-sync.command.js';
 
 type ActiveFullResume = {
   checkpoint: FullResumeCheckpoint;
@@ -68,6 +69,7 @@ export function registerCacheCommands(program: Command): void {
   registerCachePaymentSyncCommand(cache, program);
   registerCacheOffsetSyncCommand(cache, program);
   registerCacheV3SyncCommand(cache, program);
+  registerCacheReferencesSyncCommand(cache, program);
 
   // Sync command
   cache

@@ -98,3 +98,15 @@ export { createOfficialV3SyncService } from './official-v3-sync-client.factory.j
 export { PostgresOfficialV3SyncStore } from './postgres-official-v3-sync.store.js';
 export type { PostgresOfficialV3SyncStoreOptions } from './postgres-official-v3-sync.store.js';
 export * from './salesperson-directory.js';
+export * from './reference-refresh.types.js';
+export { ReferenceRefreshService } from './reference-refresh.service.js';
+export type {
+  ReferenceAccountsRefreshClient,
+  ReferenceRefreshCache,
+  ReferenceRefreshServiceOptions,
+} from './reference-refresh.service.js';
+export { ReferenceUsersResource } from './reference-users.resource.js';
+export { createReferenceRefreshService } from './reference-refresh-client.factory.js';
+export type { ReferenceRefreshAccountConfig } from './reference-refresh-client.factory.js';
+export { PostgresReferenceRefreshStore } from './postgres-reference-refresh.store.js';
+export type { PostgresReferenceRefreshStoreOptions } from './postgres-reference-refresh.store.js';

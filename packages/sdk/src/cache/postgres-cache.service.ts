@@ -63,6 +63,7 @@ import { assertCanonicalV3SourceId } from './v3-inventory-source-validation.js';
 import { PostgresInventoryChangeFeedStore } from './postgres-inventory-change-feed.store.js';
 import { PostgresDocumentOffsetStore } from './postgres-document-offset.store.js';
 import { PostgresOfficialV3SyncStore } from './postgres-official-v3-sync.store.js';
+import { PostgresReferenceRefreshStore } from './postgres-reference-refresh.store.js';
 import {
   SALESPERSON_DIRECTORY_META_KEY,
   assertSalespersonDirectorySnapshot,
@@ -87,6 +88,7 @@ import type {
   OfficialV3SyncStore,
 } from './official-v3-sync.types.js';
 import { readOfficialV3SyncStatus } from './official-v3-sync-status.js';
+import type { ReferenceRefreshStore } from './reference-refresh.types.js';
 
 const { Pool } = pg;
 
@@ -255,6 +257,30 @@ const supportsClientLifecycleEvents = (client: PoolClient): boolean =>
   typeof client.once === 'function' &&
   typeof client.removeListener === 'function';
 
+function referenceAccountUpdateColumns(
+  account: AccountRow
+): readonly (typeof ACCOUNT_COLUMNS)[number][] {
+  const disallowed = new Set<typeof ACCOUNT_COLUMNS[number]>(['account_id', 'account_manager', 'label_name']);
+  return ACCOUNT_COLUMNS.filter(
+    (column) => !disallowed.has(column) && Object.prototype.hasOwnProperty.call(account, column)
+  );
+}
+
+function referenceAccountInsertColumns(
+  account: AccountRow
+): readonly (typeof ACCOUNT_COLUMNS)[number][] {
+  return ACCOUNT_COLUMNS.filter(
+    (column) =>
+      (column === 'account_id' ||
+        column === 'context_id' ||
+        column === 'name' ||
+        column === 'cache_source') ||
+      (column !== 'account_manager' &&
+        column !== 'label_name' &&
+        Object.prototype.hasOwnProperty.call(account, column))
+  );
+}
+
 export interface PostgresSyncLockOptions {
   onLost?: (error: Error) => void | Promise<void>;
 }
@@ -299,6 +325,7 @@ export class PostgresCacheService
   private inventoryChangeFeedStore?: PostgresInventoryChangeFeedStore;
   private documentOffsetStore?: PostgresDocumentOffsetStore;
   private officialV3SyncStore?: PostgresOfficialV3SyncStore;
+  private referenceRefreshStore?: PostgresReferenceRefreshStore;
 
   constructor(connectionString: string) {
     this.connectionString = connectionString;
@@ -1347,6 +1374,10 @@ export class PostgresCacheService
     return readOfficialV3SyncStatus(this.officialSyncStore());
   }
 
+  getReferenceRefreshStore(): ReferenceRefreshStore {
+    return this.referencesStore();
+  }
+
   async insertItemDocument(item: Omit<ItemDocumentRow, 'id'>): Promise<void> {
     await this.withVerifiedWrite(async (client) => {
       await client.query(
@@ -1480,6 +1511,22 @@ export class PostgresCacheService
         this.valuesFor(ACCOUNT_COLUMNS, this.normalizeAccount(account))
       )
     );
+  }
+
+  async upsertReferenceAccounts(accounts: AccountRow[]): Promise<number> {
+    if (accounts.length === 0) return 0;
+    let rowCount = 0;
+    await this.withVerifiedWrite(async (client) => {
+      for (const account of accounts) {
+        const insertColumns = referenceAccountInsertColumns(account);
+        const result = await client.query(
+          this.referenceAccountUpsertSql(insertColumns, referenceAccountUpdateColumns(account)),
+          this.valuesFor(insertColumns, account as unknown as Record<string, unknown>)
+        );
+        rowCount += result.rowCount ?? 0;
+      }
+    });
+    return rowCount;
   }
 
   async deleteAccount(accountId: string): Promise<void> {
@@ -2595,6 +2642,14 @@ export class PostgresCacheService
     }));
   }
 
+  private referencesStore(): PostgresReferenceRefreshStore {
+    return (this.referenceRefreshStore ??= new PostgresReferenceRefreshStore({
+      withVerifiedWrite: (run) => this.withVerifiedWrite(run),
+      withReadOnlyTransaction: (run) => this.withReadOnlyTransaction(run),
+      accountIdentity: () => this.requireExpectedBinding().accountIdentity,
+    }));
+  }
+
   private assertApiInventoryBundle(item: ItemRow, rows: ItemStockLocationRow[]): void {
     const issue = inventorySnapshotRowsIssue([item], rows);
     if (issue !== null) throw new Error(`API inventory bundle is invalid: ${issue}.`);
@@ -3087,6 +3142,14 @@ export class PostgresCacheService
       )
       .join(', ');
     return `${this.insertSql(table, columns)} ON CONFLICT (${conflictColumn}) DO UPDATE SET ${updates}`;
+  }
+
+  private referenceAccountUpsertSql(
+    insertColumns: readonly (typeof ACCOUNT_COLUMNS)[number][],
+    updateColumns: readonly (typeof ACCOUNT_COLUMNS)[number][]
+  ): string {
+    const updates = updateColumns.map((column) => `${column} = EXCLUDED.${column}`).join(', ');
+    return `${this.insertSql('accounts', insertColumns)} ON CONFLICT (account_id) DO UPDATE SET ${updates}`;
   }
 
   private valuesFor(columns: readonly string[], row: Record<string, unknown>): unknown[] {

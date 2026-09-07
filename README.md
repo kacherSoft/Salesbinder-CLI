@@ -173,7 +173,7 @@ PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `
 
 Inventory change-feed sync uses a separate PostgreSQL ledger database configured with `SALESBINDER_CHANGE_FEED_DB_URL`. The cache database and the ledger database are both one-account-per-database resources; they must be distinct database targets, and the CLI validates that they represent the same SalesBinder account before it reads or writes feed-backed inventory state. `cache status` reports only sanitized ledger reachability and progress, not raw connection details.
 
-The approved cache-sync runner lives as a private monorepo package (`packages/cache-sync-runner`) and is deployed as a separate URL-less Coolify app. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. The runner treats `cache status` as the cadence authority: normal sync runs every 900 seconds by default, weekly status drives `cache sync --full`, and repeated full attempts are throttled for 24 hours through durable PostgreSQL cache metadata shared across restarts. Feature branches stay in PRs until the runner package, Dockerfile, and docs are reviewed; only reviewed `main` commits promote to the Coolify app. See [Deployment](docs/deployment.md) for the exact disabled mode, activation gate, and rollback.
+The approved cache-sync runner lives as a private monorepo package (`packages/cache-sync-runner`) and is deployed as a separate URL-less Coolify app. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. The next runner release schedules the official V3 partial catch-up from its durable status: initialize uninitialized state once, resume incomplete/warning state, and poll clean state from the retained applied cursor. It defaults to 300 seconds, never depends on the webhook ledger, and never launches legacy `cache sync` or automatic weekly `--full`. Feature branches stay in PRs until reviewed; only reviewed `main` commits promote to the Coolify app. The currently deployed app remains disabled on the earlier verified image until that promotion and canary complete. See [Deployment](docs/deployment.md) for configuration, activation gates, and rollback.
 
 The PostgreSQL schema is created automatically on first use.
 
@@ -751,6 +751,41 @@ full baseline before starting another official catch-up. Do not replace an
 existing partial state with a fresh `--since` value to bypass that condition.
 This path remains partial catch-up coverage even after a clean run.
 
+#### Scheduled official V3 polling
+
+The URL-less runner invokes `cache sync-v3 --status` before each cycle. `null`
+state uses `SALESBINDER_V3_SYNC_INITIAL_SINCE` exactly once; `running`, `failed`,
+or `success_with_warnings` resumes durable work; a clean `success` with an
+applied cursor and no gap starts the next no-option poll. Warning/failed state
+may have a cursor gap and is resumed. Missing initialization input, malformed
+state, an inconsistent clean-success gap, and reconciliation-required responses
+do not reset the cursor. A clean `--resume` is deliberately not used because it
+is a no-op rather than a new poll.
+
+`SALESBINDER_CACHE_SYNC_INTERVAL_SECONDS` defaults to `300` and accepts
+`60`–`604800`; `daily` and `weekly` are relative interval presets. Exact
+X-minute scheduling uses seconds, not cron division. One run remains active;
+an overrun coalesces missed ticks rather than terminating the healthy command
+or building a backlog. PostgreSQL writer-lock contention is reported as a safe
+skip. Official run/task/cursor status—not legacy full-sync timestamps—drives
+health and the next action.
+
+The runner requires account name, subdomain, V3 key, PostgreSQL cache URL, and
+PostgreSQL read mode. It does not require or access the webhook-ledger URL.
+Reference refresh reads V3 customers, prospects, suppliers, and categories;
+`SALESBINDER_API_KEY` is optional and adds the explicit V2 users-directory read.
+It is never a fallback from official V3 polling. `SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS`
+defaults to `86400`; use `0` or `disabled` to turn that job off. The runner
+passes this value to `sync-references --if-stale`; durable last-attempt time
+throttles attempts, while per-resource last-success times report freshness.
+
+Scheduled V3 covers only items, invoices, estimates, and purchase orders. The
+reference job has separate authority/freshness, and payment-history completeness
+still requires the explicit payment workflow. Neither path establishes a full
+cache baseline. A future cold bootstrap must capture `start=now` before complete
+enumeration and replay from that cursor; existing partial cache contents cannot
+be promoted merely because polling is clean.
+
 #### Salesperson-directory incident and repair boundary
 
 The one-off V3 catch-up completed 39 document tasks and 49 related item tasks
@@ -917,6 +952,8 @@ When using this CLI via AI agents (Claude, ChatGPT, etc.), the CLI provides comp
 | `salesbinder analytics item-sales <id>` | Get item sales analytics                                    |
 | `salesbinder cache sync`                | Sync SalesBinder API deltas to the configured cache backend |
 | `salesbinder cache sync --pull`         | Sync to PostgreSQL, then refresh local SQLite mirror        |
+| `salesbinder cache sync-v3`             | Poll the official V3 four-resource partial catch-up         |
+| `salesbinder cache sync-references`     | Refresh separate account/category/user reference data       |
 | `salesbinder cache status`              | Check cache status                                          |
 | `salesbinder --help`                    | Show all commands                                           |
 | `salesbinder <command> --help`          | Command-specific help                                       |

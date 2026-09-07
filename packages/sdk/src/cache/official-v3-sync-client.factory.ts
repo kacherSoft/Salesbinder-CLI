@@ -1,4 +1,4 @@
-import type { AccountConfig } from '../config/config.schema.js';
+import type { V3AccountConfig } from '../config/config.schema.js';
 import type { ClientRuntimeOptions } from '../client/salesbinder-rate-limiter.js';
 import { createV3AxiosClient } from '../client/v3-axios.factory.js';
 import { V3DocumentsReadResource } from '../resources/v3-documents-read.resource.js';
@@ -14,7 +14,7 @@ interface OfficialV3SyncCacheWithCategories {
 }
 
 export function createOfficialV3SyncService(
-  account: AccountConfig,
+  account: V3AccountConfig,
   cache: OfficialV3SyncCacheWithCategories | OfficialV3SyncStore,
   runtimeOptions: ClientRuntimeOptions = {},
   guard?: () => void | Promise<void>

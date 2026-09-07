@@ -94,7 +94,7 @@ export interface AccountRow {
   vat_number?: string | null;
   account_manager?: string | null;
   label_name?: string | null;
-  archived?: number;
+  archived?: number | null;
   last_invoiced?: string | null;
   created?: string | null;
   modified?: number | null;

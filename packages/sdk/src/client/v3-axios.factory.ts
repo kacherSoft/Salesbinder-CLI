@@ -1,7 +1,7 @@
 /** Axios factory for SalesBinder API v3 Bearer-authenticated resources. */
 
 import axios, { type AxiosInstance } from 'axios';
-import type { AccountConfig } from '../config/config.schema.js';
+import type { V3AccountConfig } from '../config/config.schema.js';
 import { generateRequestId } from '../utils/request-id.generator.js';
 import {
   createV3RateLimitBucketKey,
@@ -16,7 +16,7 @@ import {
 
 /** Create a governed v3 client without changing the existing v2 Basic-auth transport. */
 export function createV3AxiosClient(
-  account: AccountConfig,
+  account: V3AccountConfig,
   runtimeOptions: ClientRuntimeOptions = {}
 ): AxiosInstance {
   if (!account.v3ApiKey) {

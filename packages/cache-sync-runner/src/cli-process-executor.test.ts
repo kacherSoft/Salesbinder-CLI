@@ -4,12 +4,14 @@ import { createCliExecutor, type CliExecutorOptions } from './cli-process-execut
 
 interface FakeChild extends EventEmitter {
   stdout: PassThrough | null;
+  stderr: PassThrough | null;
   kill: jest.Mock<boolean, [NodeJS.Signals]>;
 }
 
 function fakeChild(captureOutput = true): FakeChild {
   const child = new EventEmitter() as FakeChild;
   child.stdout = captureOutput ? new PassThrough() : null;
+  child.stderr = captureOutput ? new PassThrough() : null;
   child.kill = jest.fn((_signal: NodeJS.Signals) => true);
   return child;
 }
@@ -28,7 +30,22 @@ test('captures status output and resolves nonzero child exits', async () => {
   const result = executor.execute(['cache', 'status'], true);
   child.stdout?.end('{"status":"ready"}');
   child.emit('close', 1);
-  await expect(result).resolves.toEqual({ code: 1, output: '{"status":"ready"}' });
+  await expect(result).resolves.toEqual({ code: 1, output: '{"status":"ready"}', errorOutput: '' });
+});
+
+test('captures and continues streaming sanitized stderr terminal JSON', async () => {
+  const child = fakeChild();
+  const write = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  const executor = createCliExecutor(executorOptions(child));
+  const result = executor.execute(['cache', 'sync-v3'], true);
+  child.stderr?.end('{"error":true,"code":"lock_busy"}\n');
+  child.emit('close', 1);
+  await expect(result).resolves.toMatchObject({
+    code: 1,
+    errorOutput: expect.stringContaining('lock_busy'),
+  });
+  expect(write).toHaveBeenCalled();
+  write.mockRestore();
 });
 
 test('does not propagate DEBUG into production CLI children', async () => {

@@ -29,7 +29,7 @@ export function registerCacheV3SyncCommand(cache: Command, program: Command): vo
           throw new OfficialV3SyncCommandError(
             'SALESBINDER_DB_URL is required; sync-v3 is PostgreSQL-only.'
           );
-        const account = sdk.loadConfig(program.opts().account || 'default');
+        const account = sdk.loadV3Config(program.opts().account || 'default');
         const binding = sdk.createSalesBinderAccountBinding(account.subdomain);
         const v3ApiKey = process.env.SALESBINDER_V3_API_KEY ?? account.v3ApiKey;
         if (!options.status && !v3ApiKey?.trim())
@@ -89,7 +89,9 @@ export function registerCacheV3SyncCommand(cache: Command, program: Command): vo
           error instanceof OfficialV3SyncCommandError
             ? error.message
             : safeOfficialError(error, lockLoss.isLost());
-        console.error(formatJson({ error: true, message }));
+        console.error(
+          formatJson({ error: true, code: machineOutcomeCode(error, lockLoss.isLost()), message })
+        );
         process.exitCode = 1;
       } finally {
         try {
@@ -181,4 +183,39 @@ function safeOfficialError(error: unknown, lostLock: boolean): string {
   if (status === 401 || status === 403)
     return `Sync-v3 stopped: API authorization failed (${status}).`;
   return `Sync-v3 ${code}. Check cache sync-v3 --status; use --resume after resolving the failure.`;
+}
+
+function machineOutcomeCode(error: unknown, lostLock: boolean): string {
+  if (lostLock) return 'sync_failed';
+  if (error instanceof OfficialV3SyncCommandError) {
+    if (error.message.includes('Another cache writer')) return 'lock_busy';
+    if (error.message.includes('required') || error.message.includes('configuration'))
+      return 'configuration_error';
+    return 'configuration_error';
+  }
+  const source = error as { code?: unknown; response?: { status?: unknown } } | null;
+  const wrappedCode = typeof source?.code === 'string' ? source.code : '';
+  if (wrappedCode === 'authentication_failed') return 'authorization_failed';
+  if (wrappedCode === 'rebuild_required' || wrappedCode === 'account_mismatch')
+    return 'reconcile_required';
+  if (
+    [
+      'invalid_account',
+      'invalid_options',
+      'since_required',
+      'since_state_exists',
+      'no_run_to_resume',
+      'resume_required',
+      'resume_cursor_missing',
+    ].includes(wrappedCode)
+  )
+    return 'configuration_error';
+  const status = Number(source?.response?.status);
+  if (status === 401 || status === 403) return 'authorization_failed';
+  if (
+    status === 409 ||
+    (typeof source?.code === 'string' && /reconcile|cursor_expired|full_refresh/i.test(source.code))
+  )
+    return 'reconcile_required';
+  return 'sync_failed';
 }

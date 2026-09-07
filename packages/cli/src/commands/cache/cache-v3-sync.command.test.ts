@@ -26,6 +26,7 @@ jest.mock(
       }
     },
     loadConfig: mockLoadConfig,
+    loadV3Config: mockLoadConfig,
     createSalesBinderAccountBinding: jest.fn(() => ({ accountIdentity: 'salesbinder:example' })),
     createOfficialV3SyncService: mockCreateService,
     readOfficialV3SyncStatus: mockStatus,
@@ -36,10 +37,11 @@ jest.mock(
 describe('cache sync-v3 option handling', () => {
   let parseSince: typeof import('./cache-v3-sync.command.js').parseSince;
   let registerCacheV3SyncCommand: typeof import('./cache-v3-sync.command.js').registerCacheV3SyncCommand;
-  beforeAll(
-    async () =>
-      ({ parseSince, registerCacheV3SyncCommand } = await import('./cache-v3-sync.command.js'))
-  );
+  beforeAll(async () => {
+    const module = await import('./cache-v3-sync.command.js');
+    parseSince = module.parseSince;
+    registerCacheV3SyncCommand = module.registerCacheV3SyncCommand;
+  });
   afterEach(() => {
     process.exitCode = undefined;
     delete process.env.SALESBINDER_V3_API_KEY;
@@ -207,10 +209,14 @@ describe('cache sync-v3 option handling', () => {
     const program = new Command().option('--account <account>');
     const cache = program.command('cache');
     registerCacheV3SyncCommand(cache, program);
+    const errors: string[] = [];
+    jest.spyOn(console, 'error').mockImplementation((value) => errors.push(String(value)));
     await program.parseAsync(['node', 'test', 'cache', 'sync-v3', '--since', '1788670542']);
     expect(mockPg.releaseSyncLock).toHaveBeenCalled();
     expect(mockPg.close).toHaveBeenCalled();
     expect(process.exitCode).toBe(1);
+    expect(errors.some((value) => value.includes('"code": "sync_failed"'))).toBe(true);
+    (console.error as jest.Mock).mockRestore();
   });
 
   it('preserves warning status and stops safely on lock loss', async () => {
@@ -244,5 +250,26 @@ describe('cache sync-v3 option handling', () => {
     registerCacheV3SyncCommand(lockCache, lockProgram);
     await lockProgram.parseAsync(['node', 'test', 'cache', 'sync-v3', '--resume']);
     expect(mockPg.close).toHaveBeenCalled();
+  });
+
+  it.each([
+    ['authentication_failed', 'authorization_failed'],
+    ['rebuild_required', 'reconcile_required'],
+  ])('maps wrapped SDK code %s to machine outcome %s', async (sdkCode, outcome) => {
+    process.env.SALESBINDER_DB_URL = 'postgres://example/salesbinder';
+    process.env.SALESBINDER_V3_API_KEY = 'env-v3';
+    mockCreateService.mockReturnValueOnce({
+      sync: jest.fn(async () => {
+        throw { code: sdkCode };
+      }),
+    });
+    const errors: string[] = [];
+    jest.spyOn(console, 'error').mockImplementation((value) => errors.push(String(value)));
+    const program = new Command().option('--account <account>');
+    const cache = program.command('cache');
+    registerCacheV3SyncCommand(cache, program);
+    await program.parseAsync(['node', 'test', 'cache', 'sync-v3', '--since', '1788670542']);
+    expect(errors.some((value) => value.includes(`"code": "${outcome}"`))).toBe(true);
+    (console.error as jest.Mock).mockRestore();
   });
 });
