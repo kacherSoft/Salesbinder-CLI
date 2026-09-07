@@ -16,7 +16,7 @@ export function writeContainerConfig(
       accounts: {
         [config.accountName]: {
           subdomain: config.subdomain,
-          apiKey: config.apiKey,
+          ...(config.apiKey ? { apiKey: config.apiKey } : {}),
           v3ApiKey: config.v3ApiKey,
           apiVersion: '2.0',
           timeout: 30_000,

@@ -94,7 +94,7 @@ export interface AccountRow {
   vat_number?: string | null;
   account_manager?: string | null;
   label_name?: string | null;
-  archived?: number;
+  archived?: number | null;
   last_invoiced?: string | null;
   created?: string | null;
   modified?: number | null;
@@ -895,6 +895,8 @@ export interface CacheState {
   categoryCount?: number;
   stockLocationCount?: number;
   lastAccountSync?: number;
+  /** Start of the last clean document scan; absent on legacy caches. */
+  lastDocumentSync?: number;
   lastCategorySync?: number;
   lastItemSync?: number;
   lastFullItemSync?: number;

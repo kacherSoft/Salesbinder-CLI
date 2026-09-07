@@ -117,6 +117,7 @@ export class CacheSyncProgressController {
       recordsProcessed: current?.recordsProcessed ?? 0,
       recordsTotal: current?.recordsTotal ?? null,
       indeterminate: current?.indeterminate ?? true,
+      ...pickDocumentProgress(current),
       ...pickInventoryProgress(current),
       apiVersion: observation.apiVersion === 'v3' ? '3' : '2.0',
       timestamp: Math.floor(this.now() / 1000),
@@ -237,6 +238,22 @@ export function projectCacheSyncProgress(value: unknown): CacheSyncProgress | un
       : { timestamp: safeNonNegative(value.timestamp) }),
     ...(isRecord(value.rateLimit) ? { rateLimit: pickRateLimit(value.rateLimit) } : {}),
   };
+  if (value.phaseMode === 'full' || value.phaseMode === 'delta') {
+    projected.phaseMode = value.phaseMode;
+  }
+  if (value.contextId === 4 || value.contextId === 5 || value.contextId === 11) {
+    projected.contextId = value.contextId;
+  }
+  const contextRecordsProcessed = safeNonNegative(value.contextRecordsProcessed);
+  if (contextRecordsProcessed !== undefined) {
+    projected.contextRecordsProcessed = contextRecordsProcessed;
+  }
+  if (value.contextRecordsTotal === null) {
+    projected.contextRecordsTotal = null;
+  } else {
+    const contextRecordsTotal = safeNonNegative(value.contextRecordsTotal);
+    if (contextRecordsTotal !== undefined) projected.contextRecordsTotal = contextRecordsTotal;
+  }
   if (value.mode === 'baseline' || value.mode === 'replay' || value.mode === 'incremental') {
     projected.mode = value.mode;
   }
@@ -269,7 +286,9 @@ export function projectCacheSyncProgress(value: unknown): CacheSyncProgress | un
 }
 
 function formatProgress(progress: CacheSyncProgress, now: number): string {
-  const prefix = `[cache sync] ${progress.phase}`;
+  const mode = progress.phaseMode ? ` ${progress.phaseMode}` : '';
+  const context = progress.contextId === undefined ? '' : ` context ${progress.contextId}`;
+  const prefix = `[cache sync] ${progress.phase}${mode}${context}`;
   if (progress.event === 'phase_started') return `${prefix}: started`;
   if (progress.event === 'phase_completed') return `${prefix}: completed (${countText(progress)})`;
   if (progress.event === 'waiting_rate_limit') {
@@ -293,7 +312,13 @@ function countText(progress: CacheSyncProgress): string {
     ? `, page ${progress.page}${progress.pagesTotal ? `/${progress.pagesTotal}` : ''}`
     : '';
   const pass = progress.pass ? `, pass ${progress.pass}` : '';
-  return `${count} records${page}${pass}`;
+  const contextCount =
+    progress.contextRecordsProcessed === undefined
+      ? ''
+      : progress.contextRecordsTotal === null || progress.contextRecordsTotal === undefined
+        ? `, context ${progress.contextRecordsProcessed}`
+        : `, context ${progress.contextRecordsProcessed}/${progress.contextRecordsTotal}`;
+  return `${count} records${page}${pass}${contextCount}`;
 }
 
 function boundaryKey(progress: CacheSyncProgress): string {
@@ -302,6 +327,12 @@ function boundaryKey(progress: CacheSyncProgress): string {
     progress.event,
     progress.pass,
     progress.apiVersion,
+    progress.phaseMode,
+    progress.contextId,
+    progress.contextRecordsProcessed,
+    progress.contextRecordsTotal,
+    progress.page,
+    progress.pagesTotal,
     progress.mode,
     progress.targetEventSeq,
     progress.observedThroughEventSeq,
@@ -309,6 +340,38 @@ function boundaryKey(progress: CacheSyncProgress): string {
     progress.blockedByEventSeq,
     progress.rateLimit?.waitUntil,
   ].join(':');
+}
+
+type DocumentProgressProjection = Partial<
+  Pick<
+    CacheSyncProgress,
+    | 'phaseMode'
+    | 'contextId'
+    | 'contextRecordsProcessed'
+    | 'contextRecordsTotal'
+  >
+>;
+
+function pickDocumentProgress(
+  source: CacheSyncProgress | undefined
+): DocumentProgressProjection {
+  if (!source) return {};
+  const projected: DocumentProgressProjection = {};
+  if (source.phaseMode === 'full' || source.phaseMode === 'delta') {
+    projected.phaseMode = source.phaseMode;
+  }
+  if (source.contextId === 4 || source.contextId === 5 || source.contextId === 11) {
+    projected.contextId = source.contextId;
+  }
+  const processed = safeNonNegative(source.contextRecordsProcessed);
+  if (processed !== undefined) projected.contextRecordsProcessed = processed;
+  if (source.contextRecordsTotal === null) {
+    projected.contextRecordsTotal = null;
+  } else {
+    const total = safeNonNegative(source.contextRecordsTotal);
+    if (total !== undefined) projected.contextRecordsTotal = total;
+  }
+  return projected;
 }
 
 function pickRateLimit(value: Record<string, unknown> | CacheSyncRateLimitObservation) {

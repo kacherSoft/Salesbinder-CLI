@@ -102,7 +102,44 @@ export SALESBINDER_CACHE_STALE_SECONDS=7200  # 2 hours
 
 Delta sync uses a lookback window so late SalesBinder edits are not missed. Default is `604800` seconds, or 7 days.
 
+For documents, the cutoff is `max(0, (lastDocumentSync ?? lastSync) - syncLookbackSeconds)`. This is overlap before the last clean scan, not a rolling seven-day limit from the current time. Accounts and the deleted log use their own clean scan timestamps. Clean watermarks record scan **start**, so edits arriving while a scan runs are reconsidered next time. `SALESBINDER_SYNC_LOOKBACK_SECONDS` overrides preferences and must be a non-negative safe integer; invalid values fail before the CLI opens the cache. Zero is supported, but provides no overlap for delayed source updates.
+
+The CLI resolves full/delta mode before any phase runs. An empty cache starts full; an existing cache remains delta unless `--full` or `--full-resume` is requested. Changing the local account alias never forces a full document scan; the canonical account binding remains the ownership check. `cache status` exposes `last_document_sync` separately from the global `last_sync`.
+
 Set `preferences.syncLookbackSeconds` in `~/.salesbinder/config.json` to tune this. The lookback is applied to account, document, and deleted-log delta sync. Categories still use a complete validated v3 snapshot. Inventory uses a complete v3 compatibility snapshot until the PostgreSQL cache is change-feed bound; after a verified baseline, normal inventory sync drains a fixed ledger target and hydrates only affected item IDs through v3.
+
+### Temporary document-driven offset refresh
+
+For an existing, correctly account-bound PostgreSQL cache:
+
+```bash
+salesbinder --account phuthaitech cache sync-offset --days 30
+salesbinder --account phuthaitech cache sync-offset --status
+salesbinder --account phuthaitech cache sync-offset --resume
+```
+
+This is an explicit temporary hybrid mode: **V2 `modifiedSince` discovers changed
+document IDs; V3 reads document details and the related item/variation/location
+bundles.** It does not fall back from V3 after an error. Both API credentials are
+required; `SALESBINDER_DB_URL` selects the shared cache and
+`SALESBINDER_V3_API_KEY`, when supplied, overrides the saved V3 key for this command.
+
+`--days` is a rolling window from this run's start, not overlap before a prior
+watermark. It defaults to 30 and accepts 1–365. A resume retains the original
+cutoff and unfinished tasks; an incomplete run cannot be replaced by a new one.
+Document replacement atomically queues the union of old and new item IDs.
+Item updates atomically replace only that item's API stock rows, preserving CSV
+stock and existing document payment records. Failed records remain available for
+bounded retry/resume. PO-related inventory is read after a short delay because
+source balances can settle asynchronously.
+
+This command never starts normal full inventory sync or opens the webhook ledger.
+It provides **partial, document-driven coverage**, not a full inventory baseline:
+deleted documents and direct item/variation edits are not discovered. Old full
+snapshot authority is invalidated when inventory rows change; historical full-sync
+timestamps are preserved. Dedicated offset status and counts are separate from
+the previous normal `cache sync` status. Missing V3 values remain unknown rather
+than fabricated zeros.
 
 ### Retry Backoff
 
@@ -136,7 +173,7 @@ PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `
 
 Inventory change-feed sync uses a separate PostgreSQL ledger database configured with `SALESBINDER_CHANGE_FEED_DB_URL`. The cache database and the ledger database are both one-account-per-database resources; they must be distinct database targets, and the CLI validates that they represent the same SalesBinder account before it reads or writes feed-backed inventory state. `cache status` reports only sanitized ledger reachability and progress, not raw connection details.
 
-The approved cache-sync runner lives as a private monorepo package (`packages/cache-sync-runner`) and is deployed as a separate URL-less Coolify app. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. The runner treats `cache status` as the cadence authority: normal sync runs every 900 seconds by default, weekly status drives `cache sync --full`, and repeated full attempts are throttled for 24 hours through durable PostgreSQL cache metadata shared across restarts. Feature branches stay in PRs until the runner package, Dockerfile, and docs are reviewed; only reviewed `main` commits promote to the Coolify app. See [Deployment](docs/deployment.md) for the exact disabled mode, activation gate, and rollback.
+The approved cache-sync runner lives as a private monorepo package (`packages/cache-sync-runner`) and is deployed as a separate URL-less Coolify app. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. The next runner release schedules the official V3 partial catch-up from its durable status: initialize uninitialized state once, resume incomplete/warning state, and poll clean state from the retained applied cursor. It defaults to 300 seconds, never depends on the webhook ledger, and never launches legacy `cache sync` or automatic weekly `--full`. Feature branches stay in PRs until reviewed; only reviewed `main` commits promote to the Coolify app. The currently deployed app remains disabled on the earlier verified image until that promotion and canary complete. See [Deployment](docs/deployment.md) for configuration, activation gates, and rollback.
 
 The PostgreSQL schema is created automatically on first use.
 
@@ -664,7 +701,117 @@ Every cache sync path still requires `v3ApiKey` and there is no v2 fallback for 
 
 While cache sync runs, live progress is written to stderr. Clean runs exit `0` and write one final JSON object to stdout. Runs with identifiable record-local warnings also exit `0` and return `status: success_with_warnings` with deterministic, sanitized `failed_documents` and `failed_items` lists. Each unresolved document or item gets exactly one application recovery attempt after the primary pass; recovered records disappear from the warning list, unresolved existing rows keep their last-known-good data, and unresolved new rows are omitted. A later deleted-log tombstone removes only the exact matching document context and API ID from that warning list; if this resolves every invoice warning, the corresponding document-refresh payment status completes without overwriting unrelated payment failures. Warning runs keep the last clean `lastSync`/`lastFullSync` values and set `lastSyncAttempt`, and systemic/auth/transport/storage failures still exit `1`.
 
-`cache sync --full-resume` writes a private v5 checkpoint under the per-account cache directory with restrictive permissions and resumes completed phases in this order: accounts, categories, documents, items, deleted log. Category and inventory generations and content fingerprints are checkpoint evidence, so a same-count content change invalidates stale evidence. The checkpoint is bound to the account, sync target, schema, and cache identity; checkpoints from older schemas, malformed files, and cross-account checkpoints fail closed and ask for `--reset-checkpoint`. Warning-phase results are stored too, so a resumed run can restore unresolved lists after a completed warning phase. For source integrity, an incomplete document phase replays from its first page; its stored document position is progress/diagnostic evidence, not a safe write cursor. Completed phases remain skippable. A resumed compatibility inventory phase still reruns the full atomic snapshot rather than resuming midway through it. A feed-backed inventory phase continues from durable PostgreSQL receipts and checkpoints, and can retain its document checkpoint when the inventory phase finishes with warnings.
+`cache sync --full-resume` writes a private v6 checkpoint under the per-account cache directory with restrictive permissions and resumes completed phases in this order: accounts, categories, documents, items, deleted log. Category and inventory generations and content fingerprints are checkpoint evidence, so a same-count content change invalidates stale evidence. Document phase evidence includes `lastDocumentSync`; the global watermark retains the original checkpoint's scan start even when the run resumes days later. The checkpoint is bound to the account, sync target, schema, and cache identity; older checkpoint versions (including v5), malformed files, and cross-account checkpoints fail closed and ask for `--reset-checkpoint`. Warning-phase results are stored too, so a resumed run can restore unresolved lists after a completed warning phase. For source integrity, an incomplete document phase replays from its first page; its stored document position is progress/diagnostic evidence, not a safe write cursor. Completed phases remain skippable. A resumed compatibility inventory phase still reruns the full atomic snapshot rather than resuming midway through it. A feed-backed inventory phase continues from durable PostgreSQL receipts and checkpoints, and can retain its document checkpoint when the inventory phase finishes with warnings.
+
+### Official V3 partial catch-up (`cache sync-v3`)
+
+`cache sync-v3` is an explicit, **PostgreSQL-only** partial catch-up over the
+official V3 change feed. It is separate from normal `cache sync`, the V2
+document-driven `cache sync-offset` workflow, and the inventory change-feed
+ledger; those defaults and their authority remain unchanged. It reads only
+`item`, `invoice`, `estimate`, and `purchase_order` through V3 and does not
+establish or promote a full baseline.
+
+The target database must already be bound to the selected SalesBinder account.
+Set `SALESBINDER_DB_URL` and provide a V3 key through `SALESBINDER_V3_API_KEY`
+or the account's `v3ApiKey`. The command does not use a V2 fallback and never
+refreshes the SQLite mirror.
+
+```bash
+# First partial catch-up: choose a non-future ISO timestamp with a timezone,
+# or Unix epoch seconds, within the source's 90-day retention window.
+node packages/cli/dist/cli.js --account <account> cache sync-v3 --since 2026-09-01T00:00:00Z
+
+# Resume interrupted or warning work from its persisted checkpoint.
+node packages/cli/dist/cli.js --account <account> cache sync-v3 --resume
+
+# Inspect sanitized state, counts, failures, and whether ingestion is ahead of application.
+node packages/cli/dist/cli.js --account <account> cache sync-v3 --status
+
+# Start the next clean poll from the retained applied checkpoint.
+node packages/cli/dist/cli.js --account <account> cache sync-v3
+```
+
+`--since`, `--resume`, and `--status` are mutually exclusive. `--since` is
+only accepted before this path has persisted state; use the no-option next poll
+after a clean applied checkpoint. On an already completed clean run, `--resume`
+is a no-op; it does not start a new poll. The command seals each fetched page
+and its candidate cursor in PostgreSQL before following it, then advances the applied
+checkpoint only over a contiguous, successfully handled prefix. A failed or
+unresolved task receives one bounded retry after the primary task drain, then
+yields retained warning state rather than silently advancing coverage. Already
+applied data and prior warnings remain available for inspection and resume.
+Cursor values are opaque and are intentionally not shown in command output or
+status.
+
+V3 cursors and `--since` history are retained for at most 90 days. A source
+`409` for an expired cursor/history or a changed scope requires reconciliation:
+keep the existing partial state for diagnosis, then perform a new reconciled
+full baseline before starting another official catch-up. Do not replace an
+existing partial state with a fresh `--since` value to bypass that condition.
+This path remains partial catch-up coverage even after a clean run.
+
+#### Scheduled official V3 polling
+
+The URL-less runner invokes `cache sync-v3 --status` before each cycle. `null`
+state uses `SALESBINDER_V3_SYNC_INITIAL_SINCE` exactly once; `running`, `failed`,
+or `success_with_warnings` resumes durable work; a clean `success` with an
+applied cursor and no gap starts the next no-option poll. Warning/failed state
+may have a cursor gap and is resumed. Missing initialization input, malformed
+state, an inconsistent clean-success gap, and reconciliation-required responses
+do not reset the cursor. A clean `--resume` is deliberately not used because it
+is a no-op rather than a new poll.
+
+`SALESBINDER_CACHE_SYNC_INTERVAL_SECONDS` defaults to `300` and accepts
+`60`–`604800`; `daily` and `weekly` are relative interval presets. Exact
+X-minute scheduling uses seconds, not cron division. One run remains active;
+an overrun coalesces missed ticks rather than terminating the healthy command
+or building a backlog. PostgreSQL writer-lock contention is reported as a safe
+skip. Official run/task/cursor status—not legacy full-sync timestamps—drives
+health and the next action.
+
+The runner requires account name, subdomain, V3 key, PostgreSQL cache URL, and
+PostgreSQL read mode. It does not require or access the webhook-ledger URL.
+Reference refresh reads V3 customers, prospects, suppliers, and categories;
+`SALESBINDER_API_KEY` is optional and adds the explicit V2 users-directory read.
+It is never a fallback from official V3 polling. `SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS`
+defaults to `86400`; use `0` or `disabled` to turn that job off. The runner
+passes this value to `sync-references --if-stale`; durable last-attempt time
+throttles attempts, while per-resource last-success times report freshness.
+
+Scheduled V3 covers only items, invoices, estimates, and purchase orders. The
+reference job has separate authority/freshness, and payment-history completeness
+still requires the explicit payment workflow. Neither path establishes a full
+cache baseline. A future cold bootstrap must capture `start=now` before complete
+enumeration and replay from that cursor; existing partial cache contents cannot
+be promoted merely because polling is clean.
+
+#### Salesperson-directory incident and repair boundary
+
+The one-off V3 catch-up completed 39 document tasks and 49 related item tasks
+with zero task failures, but task completion is not lossless verification: a
+salesperson-data regression was discovered in V3 document writes. A formal
+production CLI exercise has not run, and this does not establish release
+readiness.
+
+The corrective design uses an explicit repair workflow to make one governed
+V2 users GET traversal, validate the complete response, and store an
+account-bound salesperson directory. Normal V3 sync never calls V2 as an
+automatic fallback. For an ID-only V3 assignment, the writer resolves the name
+from that directory or retains an existing nonblank name only when it has the
+same assigned ID. An unknown changed or new assignment becomes a record warning;
+the old name is never inherited. The repair scans only assigned documents with
+blank/null names in contexts 4, 5, and 11: 2,791 candidates (528 estimates,
+1,717 invoices, and 546 purchase orders). The emergency name-only recovery
+updated all 2,791 rows; final independent readback found zero assigned
+blank/null-name rows across those contexts, and all 21 reported invoices are
+named. The validated directory contains 31 users; a subsequent compiled repair
+was idempotent (zero updates and zero unresolved assignments). No source
+business writes occurred—only governed V2 GET reads and the durable directory
+metadata seed. The formal official-V3 production CLI exercise remains unrun, so
+this recovery does not by itself establish that CLI release gate.
+
+Document progress includes `phaseMode`, `contextId`, context counts, and context page totals. `recordsProcessed` counts observed logical records, including rows queued for recovery; retries do not count the same record again. It is not the final successful-write count. The aggregate total stays unknown until all document context totals are known. A clean document phase advances `lastDocumentSync` only after payment refresh finalization succeeds; document warnings keep the previous document watermark, while warnings in a later phase need not replay a previously clean document scan. Account pagination must be complete and consistent before its watermark advances. Pagination drift still fails the scan, preserves its watermark and existing rows, and requires replay; a record-local warning does not establish that a changed page set was completely scanned.
 
 `cache clear` deletes category rows, category snapshot metadata, and the generation marker. PostgreSQL deliberately preserves its immutable SalesBinder account binding; use a separate database when changing accounts. SQLite also verifies its durable account binding before deleting the local file. For a legacy SQLite file created before binding markers existed, `cache clear --force-unbound` is the explicit recovery path; it works only when both markers are absent and never overrides a mismatched or partial binding.
 
@@ -805,6 +952,8 @@ When using this CLI via AI agents (Claude, ChatGPT, etc.), the CLI provides comp
 | `salesbinder analytics item-sales <id>` | Get item sales analytics                                    |
 | `salesbinder cache sync`                | Sync SalesBinder API deltas to the configured cache backend |
 | `salesbinder cache sync --pull`         | Sync to PostgreSQL, then refresh local SQLite mirror        |
+| `salesbinder cache sync-v3`             | Poll the official V3 four-resource partial catch-up         |
+| `salesbinder cache sync-references`     | Refresh separate account/category/user reference data       |
 | `salesbinder cache status`              | Check cache status                                          |
 | `salesbinder --help`                    | Show all commands                                           |
 | `salesbinder <command> --help`          | Command-specific help                                       |

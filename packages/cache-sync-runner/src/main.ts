@@ -1,33 +1,21 @@
 import { fileURLToPath } from 'node:url';
 import { createCacheSyncScheduler } from './cache-sync-scheduler.js';
 import { createCliExecutor } from './cli-process-executor.js';
-import {
-  createPostgresFullAttemptStore,
-  type FullAttemptStore,
-} from './postgres-full-attempt-store.js';
 import { validateSchedulerEnvironment } from './scheduler-config.js';
 
 async function main(): Promise<void> {
   const config = validateSchedulerEnvironment(process.env);
-  const childEnvironment = config.disabled
-    ? process.env
-    : {
-        ...process.env,
-        SALESBINDER_DB_URL: config.cacheDatabaseUrl,
-        SALESBINDER_CHANGE_FEED_DB_URL: config.changeFeedDatabaseUrl,
-        SALESBINDER_READ_BACKEND: 'postgresql',
-      };
+  const childEnvironment = { ...process.env };
+  if (!config.disabled) {
+    childEnvironment.SALESBINDER_DB_URL = config.cacheDatabaseUrl;
+    childEnvironment.SALESBINDER_READ_BACKEND = 'postgresql';
+    delete childEnvironment.SALESBINDER_CHANGE_FEED_DB_URL;
+  }
   const executor = createCliExecutor({
     env: childEnvironment,
     cliPath: fileURLToPath(new URL('../../cli/dist/cli.js', import.meta.url)),
   });
-  const fullAttemptStore: FullAttemptStore = config.disabled
-    ? { claim: async () => false, close: async () => undefined }
-    : createPostgresFullAttemptStore(config.cacheDatabaseUrl);
-  const scheduler = createCacheSyncScheduler(config, {
-    executor,
-    fullAttemptStore,
-  });
+  const scheduler = createCacheSyncScheduler(config, { executor });
   const stopInterrupt = (): void => scheduler.stop('SIGINT');
   const stopTerminate = (): void => scheduler.stop('SIGTERM');
   process.once('SIGINT', stopInterrupt);
@@ -37,9 +25,6 @@ async function main(): Promise<void> {
   } finally {
     process.removeListener('SIGINT', stopInterrupt);
     process.removeListener('SIGTERM', stopTerminate);
-    await fullAttemptStore.close().catch(() => {
-      console.warn('SalesBinder full-sync throttle shutdown failed.');
-    });
   }
 }
 

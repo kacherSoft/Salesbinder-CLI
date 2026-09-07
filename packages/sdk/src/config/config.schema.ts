@@ -16,6 +16,9 @@ export interface AccountConfig {
   timeout?: number;
 }
 
+/** Configuration needed by V3-only reads and sync; V2 credentials are intentionally absent. */
+export type V3AccountConfig = Omit<AccountConfig, 'apiKey'> & { v3ApiKey?: string };
+
 /** User preferences */
 export interface Preferences {
   /** Default records per page (1-100 for items, 1-200 for others) */

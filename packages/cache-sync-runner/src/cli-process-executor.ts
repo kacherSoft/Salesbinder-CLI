@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 export interface CommandResult {
   code: number;
   output: string;
+  errorOutput?: string;
 }
 
 export interface CliExecutor {
@@ -10,13 +11,13 @@ export interface CliExecutor {
   stop(signal?: NodeJS.Signals): void;
 }
 
-type ChildLike = Pick<ChildProcess, 'kill' | 'once' | 'stdout'>;
+type ChildLike = Pick<ChildProcess, 'kill' | 'once' | 'stdout' | 'stderr'>;
 type SpawnChild = (
   executable: string,
   args: string[],
   options: {
     env: NodeJS.ProcessEnv;
-    stdio: 'inherit' | ['ignore', 'pipe', 'inherit'];
+    stdio: 'inherit' | ['ignore', 'pipe', 'pipe'];
   }
 ) => ChildLike;
 
@@ -45,15 +46,23 @@ export function createCliExecutor(options: CliExecutorOptions): CliExecutor {
     execute(args: string[], captureOutput: boolean): Promise<CommandResult> {
       return new Promise((resolve) => {
         let output = '';
+        let errorOutput = '';
         let settled = false;
         const child = spawnChild(process.execPath, [options.cliPath, ...args], {
           env: childEnvironment,
-          stdio: captureOutput ? ['ignore', 'pipe', 'inherit'] : 'inherit',
+          stdio: captureOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit',
         });
         activeChild = child;
         child.stdout?.setEncoding('utf8');
         child.stdout?.on('data', (chunk: string | Buffer) => {
           output = `${output}${chunk}`.slice(0, 1_048_576);
+        });
+        child.stderr?.setEncoding('utf8');
+        child.stderr?.on('data', (chunk: string | Buffer) => {
+          const text = String(chunk);
+          // Progress can be long-lived; retain the terminal diagnostic JSON rather than its oldest logs.
+          errorOutput = `${errorOutput}${text}`.slice(-1_048_576);
+          process.stderr.write(text);
         });
         const finish = (code: number): void => {
           if (settled) return;
@@ -61,7 +70,7 @@ export function createCliExecutor(options: CliExecutorOptions): CliExecutor {
           if (forcedStop !== null) cancelSchedule(forcedStop);
           forcedStop = null;
           if (activeChild === child) activeChild = null;
-          resolve({ code, output });
+          resolve({ code, output, errorOutput });
         };
         child.once('error', () => finish(1));
         child.once('close', (code) => finish(code ?? 1));

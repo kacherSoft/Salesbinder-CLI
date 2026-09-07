@@ -1,6 +1,8 @@
 import { PostgresCacheService } from '../postgres-cache.service.js';
 import { createCategoryFingerprint } from '../category-indexer.service.js';
 import { createInventorySnapshotFingerprint } from '../types.js';
+import { SALESPERSON_DIRECTORY_META_KEY, SALESPERSON_DIRECTORY_SOURCE } from '../salesperson-directory.js';
+import type { SalespersonDirectoryInput } from '../salesperson-directory.js';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import type {
@@ -256,7 +258,7 @@ const payloadDocumentMutations = (statements: string[]): string[] =>
     )
   );
 
-type QueryResult = { rows: unknown[] };
+type QueryResult = { rows: unknown[]; rowCount?: number };
 type QueryHandler = (sql: string, params?: unknown[]) => Promise<QueryResult>;
 type PostgresSyncLockOptions = { onLost?: (error: Error) => void | Promise<void> };
 type SyncLockAwarePostgresCacheService = PostgresCacheService & {
@@ -2192,6 +2194,14 @@ describe('PostgresCacheService inventory authority', () => {
 });
 
 describe('PostgresCacheService atomic document bundles', () => {
+  const userA = 'b16f844f-4b40-4f05-a468-407106563e03';
+  const userB = '1d3cf02c-d275-4488-b206-7f18a43a4a49';
+  const directory = {
+    accountIdentity: binding.accountIdentity,
+    source: SALESPERSON_DIRECTORY_SOURCE,
+    fetchedAt: 1788670542,
+    users: [{ userId: userA, displayName: 'Sales User A' }],
+  } satisfies SalespersonDirectoryInput;
   const document: DocumentRow = {
     doc_id: 'api-doc',
     api_doc_id: 'api-doc',
@@ -2268,6 +2278,206 @@ describe('PostgresCacheService atomic document bundles', () => {
     expect(statements.at(-1)).toBe('COMMIT');
   });
 
+  it.each([null, ''])('resolves assigned blank salesperson names from the directory', async (name) => {
+    const { service, query } = makeService(async (sql, params) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (params?.[0] === SALESPERSON_DIRECTORY_META_KEY) {
+        return { rows: [{ value: JSON.stringify({ version: 1, ...directory }) }] };
+      }
+      if (sql.includes('WHERE api_doc_id = $1')) return { rows: [] };
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) return { rows: [] };
+      return { rows: [] };
+    });
+
+    await service.replaceDocumentBundle({ ...document, user_id: userA, salesperson_name: name }, []);
+
+    const documentInsert = query.mock.calls.find(([sql]) =>
+      String(sql).startsWith('INSERT INTO documents')
+    );
+    expect(documentInsert?.[1]?.[14]).toBe(userA);
+    expect(documentInsert?.[1]?.[15]).toBe('Sales User A');
+  });
+
+  it('preserves a same-ID existing name but never inherits it for a changed ID', async () => {
+    const existing = { doc_id: 'stored-doc', api_doc_id: document.api_doc_id, user_id: userA, salesperson_name: 'Existing User A' };
+    const preserved = makeService(async (sql) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('WHERE api_doc_id = $1')) return { rows: [existing] };
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) return { rows: [existing] };
+      if (sql.includes('SELECT value FROM cache_meta')) return { rows: [] };
+      return { rows: [] };
+    });
+
+    await preserved.service.replaceDocumentBundle({ ...document, user_id: userA }, []);
+    const insert = preserved.query.mock.calls.find(([sql]) =>
+      String(sql).startsWith('INSERT INTO documents')
+    );
+    expect(insert?.[1]?.[15]).toBe('Existing User A');
+
+    const changed = makeService(async (sql) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('WHERE api_doc_id = $1')) return { rows: [existing] };
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) return { rows: [existing] };
+      if (sql.includes('SELECT value FROM cache_meta')) return { rows: [] };
+      return { rows: [] };
+    });
+
+    await expect(changed.service.replaceDocumentBundle({ ...document, user_id: userB }, [])).rejects.toThrow(
+      /salesperson name is unresolved/i
+    );
+    expect(payloadDocumentMutations(changed.query.mock.calls.map(([sql]) => String(sql)))).toEqual([]);
+  });
+
+  it('clears salesperson name when the source explicitly unassigns the document', async () => {
+    const { service, query } = makeService(async (sql) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('WHERE api_doc_id = $1')) return { rows: [] };
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) return { rows: [] };
+      return { rows: [] };
+    });
+
+    await service.replaceDocumentBundle(
+      { ...document, user_id: null, salesperson_name: 'Stale Incoming Name' },
+      []
+    );
+
+    const documentInsert = query.mock.calls.find(([sql]) =>
+      String(sql).startsWith('INSERT INTO documents')
+    );
+    expect(documentInsert?.[1]?.[14]).toBeNull();
+    expect(documentInsert?.[1]?.[15]).toBeNull();
+  });
+
+  it('carries forward an omitted user ID on an existing assigned document', async () => {
+    const existing = {
+      doc_id: 'stored-doc',
+      api_doc_id: document.api_doc_id,
+      user_id: userA,
+      salesperson_name: 'Existing User A',
+    };
+    const { service, query } = makeService(async (sql) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('WHERE api_doc_id = $1')) return { rows: [existing] };
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) return { rows: [existing] };
+      if (sql.includes('SELECT value FROM cache_meta')) return { rows: [] };
+      return { rows: [] };
+    });
+
+    await service.replaceDocumentBundle({ ...document, user_id: undefined }, []);
+
+    const documentInsert = query.mock.calls.find(([sql]) =>
+      String(sql).startsWith('INSERT INTO documents')
+    );
+    expect(documentInsert?.[1]?.[14]).toBe(userA);
+    expect(documentInsert?.[1]?.[15]).toBe('Existing User A');
+  });
+
+  it('preserves an omitted-ID explicit legacy name without inventing a user ID', async () => {
+    const { service, query } = makeService(async (sql) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.includes('WHERE api_doc_id = $1')) return { rows: [] };
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) return { rows: [] };
+      return { rows: [] };
+    });
+
+    await service.replaceDocumentBundle(
+      { ...document, user_id: undefined, salesperson_name: 'Legacy Sales User' },
+      []
+    );
+
+    const documentInsert = query.mock.calls.find(([sql]) =>
+      String(sql).startsWith('INSERT INTO documents')
+    );
+    expect(documentInsert?.[1]?.[14]).toBeNull();
+    expect(documentInsert?.[1]?.[15]).toBe('Legacy Sales User');
+  });
+
+  it('fails assigned writes when the persisted salesperson directory belongs to another account', async () => {
+    const { service, query } = makeService(async (sql, params) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (params?.[0] === SALESPERSON_DIRECTORY_META_KEY) {
+        return {
+          rows: [
+            {
+              value: JSON.stringify({
+                version: 1,
+                ...directory,
+                accountIdentity: 'salesbinder:other',
+              }),
+            },
+          ],
+        };
+      }
+      if (sql.includes('WHERE api_doc_id = $1')) return { rows: [] };
+      if (sql.includes('WHERE context_id = $1 AND doc_number = $2')) return { rows: [] };
+      return { rows: [] };
+    });
+
+    await expect(service.replaceDocumentBundle({ ...document, user_id: userA }, [])).rejects.toThrow(
+      /salesperson directory account/i
+    );
+    expect(payloadDocumentMutations(query.mock.calls.map(([sql]) => String(sql)))).toEqual([]);
+  });
+
+  it('atomically persists a supplied directory and repairs only matched blank names', async () => {
+    const { service, query } = makeService(async (sql) => {
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.startsWith('SELECT user_id, COUNT(*) AS count')) {
+        return { rows: [{ user_id: userA, count: '2' }, { user_id: userB, count: '1' }] };
+      }
+      if (sql.startsWith('UPDATE documents')) return { rows: [], rowCount: 2 };
+      return { rows: [] };
+    });
+
+    await expect(service.repairMissingSalespersonNames(directory)).resolves.toEqual({
+      updatedCount: 2,
+      unresolvedUserCounts: { [userB]: 1 },
+    });
+
+    const statements = query.mock.calls.map(([sql]) => String(sql));
+    const directoryWrite = statements.findIndex((sql) => sql.startsWith('INSERT INTO cache_meta'));
+    const coverageRead = statements.findIndex((sql) => sql.startsWith('SELECT user_id, COUNT(*) AS count'));
+    const update = statements.findIndex((sql) => sql.startsWith('UPDATE documents'));
+    expect(directoryWrite).toBeGreaterThan(-1);
+    expect(directoryWrite).toBeLessThan(coverageRead);
+    expect(coverageRead).toBeLessThan(update);
+    expect(statements[update]).toContain('context_id IN (4, 5, 11)');
+    expect(statements.at(-1)).toBe('COMMIT');
+  });
+
+  it('rolls back the supplied directory when atomic repair fails', async () => {
+    const priorDirectory = JSON.stringify({
+      version: 1,
+      ...directory,
+      fetchedAt: 100,
+      users: [{ userId: userB, displayName: 'Prior Sales User' }],
+    });
+    let committedMeta = priorDirectory;
+    let transactionMeta = committedMeta;
+    const { service, query } = makeService(async (sql) => {
+      if (sql === 'BEGIN') transactionMeta = committedMeta;
+      if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
+      if (sql.startsWith('INSERT INTO cache_meta')) {
+        transactionMeta = JSON.stringify({ version: 1, ...directory });
+        return { rows: [] };
+      }
+      if (sql.startsWith('SELECT user_id, COUNT(*) AS count')) {
+        return { rows: [{ user_id: userA, count: '1' }] };
+      }
+      if (sql.startsWith('UPDATE documents')) throw new Error('injected repair failure');
+      if (sql === 'COMMIT') committedMeta = transactionMeta;
+      if (sql === 'ROLLBACK') transactionMeta = committedMeta;
+      return { rows: [] };
+    });
+
+    await expect(service.applySalespersonDirectoryRepair(directory)).rejects.toThrow(
+      'injected repair failure'
+    );
+
+    expect(committedMeta).toBe(priorDirectory);
+    expect(query.mock.calls.map(([sql]) => String(sql)).at(-1)).toBe('ROLLBACK');
+  });
+
   it('rejects a number-key takeover before document, child, or payment mutation', async () => {
     const { service, query } = makeService(async (sql) => {
       if (sql.includes('SELECT account_identity')) return { rows: [bindingRow()] };
@@ -2289,9 +2499,11 @@ describe('PostgresCacheService atomic document bundles', () => {
     const statements = query.mock.calls.map(([sql]) => String(sql));
     expect(statements).toEqual(
       expect.arrayContaining([
-        expect.stringContaining('SELECT doc_id, api_doc_id FROM documents WHERE api_doc_id'),
         expect.stringContaining(
-          'SELECT doc_id, api_doc_id FROM documents WHERE context_id = $1 AND doc_number = $2'
+          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name FROM documents WHERE api_doc_id'
+        ),
+        expect.stringContaining(
+          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name FROM documents WHERE context_id = $1 AND doc_number = $2'
         ),
         'ROLLBACK',
       ])

@@ -47,12 +47,13 @@ export interface ResumeCacheSnapshot {
   itemCount: number;
   stockLocationCount: number;
   lastAccountSync: number | null;
+  lastDocumentSync: number | null;
   lastItemSync: number | null;
   lastDeletedSync: number | null;
 }
 
 export interface FullResumeCheckpoint {
-  version: 5;
+  version: 6;
   runType: 'full-resume';
   accountName: string;
   syncTarget: FullResumeSyncTarget;
@@ -97,7 +98,7 @@ interface CacheIdentityOptions {
   databaseUrl?: string;
 }
 
-const CHECKPOINT_VERSION = 5;
+const CHECKPOINT_VERSION = 6;
 const PHASES: FullResumePhase[] = ['accounts', 'categories', 'documents', 'items', 'deleted-log'];
 const SNAPSHOT_COUNT_FIELDS: Array<keyof ResumeCacheSnapshot> = [
   'accountCount',
@@ -110,6 +111,7 @@ const SNAPSHOT_COUNT_FIELDS: Array<keyof ResumeCacheSnapshot> = [
 ];
 const SNAPSHOT_WATERMARK_FIELDS: Array<keyof ResumeCacheSnapshot> = [
   'lastAccountSync',
+  'lastDocumentSync',
   'lastItemSync',
   'lastDeletedSync',
 ];
@@ -140,6 +142,7 @@ const PHASE_FIELDS: Record<FullResumePhase, Array<keyof ResumeCacheSnapshot>> = 
   accounts: ['accountCount', 'lastAccountSync'],
   categories: ['categoryCount', ...SNAPSHOT_CATEGORY_FIELDS],
   documents: [
+    'lastDocumentSync',
     'documentCount',
     'itemDocumentCount',
     'paymentTransactionCount',

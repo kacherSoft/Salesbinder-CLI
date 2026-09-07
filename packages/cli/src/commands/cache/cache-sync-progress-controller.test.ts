@@ -201,6 +201,65 @@ describe('CacheSyncProgressController', () => {
       rateLimit: { waitMs: 1000 },
     });
   });
+
+  it('projects document mode and context counters without inventing an aggregate total', () => {
+    const projected = projectCacheSyncProgress({
+      ...progress({
+        phaseMode: 'delta',
+        contextId: 5,
+        contextRecordsProcessed: 2841,
+        contextRecordsTotal: 847,
+        page: 57,
+        pagesTotal: 17,
+        recordsProcessed: 2841,
+        recordsTotal: null,
+        indeterminate: true,
+      }),
+      phaseMode: 'full',
+      contextId: 4,
+      contextRecordsProcessed: 41,
+      contextRecordsTotal: null,
+    });
+
+    expect(projected).toEqual(
+      expect.objectContaining({
+        phaseMode: 'full',
+        contextId: 4,
+        contextRecordsProcessed: 41,
+        contextRecordsTotal: null,
+        recordsProcessed: 2841,
+        recordsTotal: null,
+        indeterminate: true,
+      })
+    );
+  });
+
+  it('renders document mode, context, and context count', () => {
+    const writes: string[] = [];
+    const controller = new CacheSyncProgressController({
+      reporter: { emit: () => undefined },
+      stderr: { write: (line) => writes.push(line) },
+      isTTY: false,
+      now: () => 0,
+    });
+
+    controller.onProgressEvent(
+      progress({
+        event: 'page_completed',
+        phaseMode: 'delta',
+        contextId: 5,
+        contextRecordsProcessed: 12,
+        contextRecordsTotal: 827,
+        recordsProcessed: 2841,
+        recordsTotal: null,
+        page: 17,
+        pagesTotal: 17,
+      })
+    );
+
+    expect(writes.join('')).toContain('documents delta context 5');
+    expect(writes.join('')).toContain('2841 records, page 17/17, context 12/827');
+  });
 });
 
 describe('deriveCacheSyncHealth', () => {

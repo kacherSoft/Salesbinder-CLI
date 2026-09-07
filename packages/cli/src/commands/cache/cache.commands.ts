@@ -45,6 +45,9 @@ import {
   type PreparedInventorySync,
 } from './cache-sync-orchestrator.js';
 import { registerCacheStatusCommand } from './cache-status.command.js';
+import { registerCacheOffsetSyncCommand } from './cache-offset-sync.command.js';
+import { registerCacheV3SyncCommand } from './cache-v3-sync.command.js';
+import { registerCacheReferencesSyncCommand } from './cache-references-sync.command.js';
 
 type ActiveFullResume = {
   checkpoint: FullResumeCheckpoint;
@@ -64,6 +67,9 @@ type PostgresSyncLockService = CacheService & {
 export function registerCacheCommands(program: Command): void {
   const cache = program.command('cache').description('Local cache management');
   registerCachePaymentSyncCommand(cache, program);
+  registerCacheOffsetSyncCommand(cache, program);
+  registerCacheV3SyncCommand(cache, program);
+  registerCacheReferencesSyncCommand(cache, program);
 
   // Sync command
   cache
@@ -125,6 +131,7 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             SQLiteCacheService,
             pullFromPostgres,
             loadPreferences,
+            resolveSyncLookbackSeconds,
             loadConfig,
             createSalesBinderAccountBinding,
             CACHE_SCHEMA_VERSION,
@@ -139,7 +146,11 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             );
           }
           const accountBinding = createSalesBinderAccountBinding(accountConfig.subdomain);
-          const effectiveFull = Boolean(options.full || options.fullResume);
+          const prefs = loadPreferences();
+          const lookbackEnv = process.env[['SALESBINDER', 'SYNC', 'LOOKBACK', 'SECONDS'].join('_')];
+          const syncLookbackSeconds = resolveSyncLookbackSeconds(
+            lookbackEnv ?? prefs?.syncLookbackSeconds
+          );
           const dbUrl = process.env.SALESBINDER_DB_URL;
 
           // Determine sync target: PG if available, else SQLite
@@ -175,6 +186,12 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           }
 
           const activeCacheService = cacheService;
+          // Decide before accounts can create state in an empty cache. Local aliases
+          // are display names; the immutable account binding above owns identity.
+          const initialState = await awaitWhileSyncLockHeld(lockLoss, () =>
+            activeCacheService.getCacheState()
+          );
+          const effectiveFull = Boolean(options.full || options.fullResume || !initialState);
           if (options.fullResume || options.resetCheckpoint) {
             checkpointStore = new FullResumeCheckpointStore({
               accountName,
@@ -216,6 +233,8 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
           const syncStartedAtMs = Date.now();
           const currentSyncRunId = `sync-${syncStartedAtMs}-${randomUUID()}`;
           const startedAtSeconds = Math.floor(syncStartedAtMs / 1000);
+          // Resumed completed phases may have been scanned in an earlier attempt.
+          const safeSyncCutoff = checkpoint?.startedAt ?? startedAtSeconds;
           const syncReporter = new CacheSyncProgressReporter(cacheService, {
             runId: currentSyncRunId,
             accountName,
@@ -240,12 +259,6 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
             })
           );
 
-          // Load stale threshold from config
-          const prefs = loadPreferences();
-          const lookbackEnv = process.env[['SALESBINDER', 'SYNC', 'LOOKBACK', 'SECONDS'].join('_')];
-          const syncLookbackSeconds = lookbackEnv
-            ? parseInt(lookbackEnv, 10)
-            : (prefs?.syncLookbackSeconds ?? 604800);
           const accountIndexer = new AccountIndexerService(
             client,
             cacheService,
@@ -492,8 +505,8 @@ Use --full-resume for an on-demand checkpointed rebuild attempt.`
               ...(hasWarnings
                 ? {}
                 : {
-                    lastSync: cloudSyncFinishedAt,
-                    ...(effectiveFull ? { lastFullSync: cloudSyncFinishedAt } : {}),
+                    lastSync: safeSyncCutoff,
+                    ...(effectiveFull ? { lastFullSync: safeSyncCutoff } : {}),
                   }),
               lastSyncAttempt: cloudSyncFinishedAt,
               documentCount,
@@ -1113,7 +1126,7 @@ async function captureFullResumeCacheSnapshot(
     cacheService.getStockLocationCount(),
   ]);
   return {
-    accountName: state?.accountName ?? accountName,
+    accountName,
     schemaVersion: state?.schemaVersion ?? schemaVersion,
     accountCount,
     categoryCount,
@@ -1135,6 +1148,7 @@ async function captureFullResumeCacheSnapshot(
     itemCount,
     stockLocationCount,
     lastAccountSync: state?.lastAccountSync ?? null,
+    lastDocumentSync: state?.lastDocumentSync ?? null,
     lastItemSync: state?.lastItemSync ?? null,
     lastDeletedSync: state?.lastDeletedSync ?? null,
   };
@@ -1409,6 +1423,7 @@ function toSafeCacheSyncError(error: unknown, syncStarted: boolean): Error {
     !syncStarted &&
     (message.startsWith('SalesBinder API v3 key is required') ||
       message === 'Another cache sync is already running for this account.' ||
+      message === 'Sync lookback seconds must be a non-negative safe integer.' ||
       message.startsWith('Full-resume checkpoint at ') ||
       errorName === 'ChangeFeedConfigError' ||
       errorName === 'InventorySyncModeError' ||

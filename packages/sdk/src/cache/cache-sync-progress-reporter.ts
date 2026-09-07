@@ -142,6 +142,7 @@ export class CacheSyncProgressReporter {
       recordsProcessed: previous?.recordsProcessed ?? 0,
       recordsTotal: previous?.recordsTotal ?? null,
       indeterminate: previous?.indeterminate ?? true,
+      ...projectDocumentProgress(previous),
       ...projectInventoryProgress(previous),
       apiVersion: event.apiVersion === 'v2' ? '2.0' : '3',
       timestamp: toUnixSeconds(this.now()),
@@ -267,11 +268,44 @@ function projectProgress(event: CacheSyncProgress): CacheSyncProgress {
     recordsTotal: event.recordsTotal,
     indeterminate: event.indeterminate,
   };
+  Object.assign(projected, projectDocumentProgress(event));
   for (const key of ['pass', 'page', 'pagesTotal', 'apiVersion', 'timestamp'] as const) {
     if (event[key] !== undefined) Object.assign(projected, { [key]: event[key] });
   }
   Object.assign(projected, projectInventoryProgress(event));
   if (event.rateLimit) projected.rateLimit = projectRateLimit(event.rateLimit);
+  return projected;
+}
+
+type DocumentProgressProjection = Partial<
+  Pick<
+    CacheSyncProgress,
+    | 'phaseMode'
+    | 'contextId'
+    | 'contextRecordsProcessed'
+    | 'contextRecordsTotal'
+  >
+>;
+
+function projectDocumentProgress(
+  source: CacheSyncProgress | undefined
+): DocumentProgressProjection {
+  if (!source) return {};
+  const projected: DocumentProgressProjection = {};
+  if (source.phaseMode === 'full' || source.phaseMode === 'delta') {
+    projected.phaseMode = source.phaseMode;
+  }
+  if (source.contextId === 4 || source.contextId === 5 || source.contextId === 11) {
+    projected.contextId = source.contextId;
+  }
+  const processed = safeNonNegativeInteger(source.contextRecordsProcessed);
+  if (processed !== undefined) projected.contextRecordsProcessed = processed;
+  if (source.contextRecordsTotal === null) {
+    projected.contextRecordsTotal = null;
+  } else {
+    const total = safeNonNegativeInteger(source.contextRecordsTotal);
+    if (total !== undefined) projected.contextRecordsTotal = total;
+  }
   return projected;
 }
 

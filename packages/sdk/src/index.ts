@@ -15,7 +15,7 @@ export * from './types/deleted-log.types.js';
 export * from './config/config.schema.js';
 
 // Export config loader
-export { loadConfig, loadPreferences, listAccounts } from './config/config.loader.js';
+export { loadConfig, loadV3Config, loadPreferences, listAccounts } from './config/config.loader.js';
 
 // Export redacted transport observability and injectable limiter support.
 export { SalesBinderRateLimiter } from './client/salesbinder-rate-limiter.js';

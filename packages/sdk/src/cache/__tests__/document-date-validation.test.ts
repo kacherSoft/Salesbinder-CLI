@@ -150,6 +150,7 @@ describe('document date source validation', () => {
     const priorState = {
       lastSync: 100,
       lastFullSync: 90,
+      lastDocumentSync: 95,
       documentCount: 1,
       itemDocumentCount: 1,
       accountName: 'test',
@@ -162,13 +163,14 @@ describe('document date source validation', () => {
     const result = await new DocumentIndexerService(client, cache, 'test', undefined, 10).sync();
 
     expect(client.documents.list).toHaveBeenCalledWith(
-      expect.objectContaining({ modifiedSince: 90 })
+      expect.objectContaining({ modifiedSince: 85 })
     );
     expect(client.documents.get).toHaveBeenCalledTimes(1);
     expect(cache.replaceDocumentBundle).not.toHaveBeenCalled();
     expect(cache.setCacheState).toHaveBeenCalledWith(
       expect.objectContaining({
         lastSync: priorState.lastSync,
+        lastDocumentSync: priorState.lastDocumentSync,
         lastSyncAttempt: expect.any(Number),
       })
     );
