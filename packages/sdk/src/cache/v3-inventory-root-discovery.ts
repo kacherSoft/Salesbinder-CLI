@@ -13,12 +13,16 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_DELAY_MS = 2_000;
 const ROOT_MEMBERSHIP_DRIFT = 'V3 item membership changed during root discovery';
 const ROOT_PAGINATION_DRIFT = 'V3 item pagination changed during root discovery';
-const CANONICAL_UUID =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export interface V3InventoryRootClient {
   items: {
-    list(params: { page: number; limit: number; archived: 'all' }): Promise<V3ListResponse<V3Item>>;
+    list(params: {
+      page: number;
+      limit: number;
+      archived: 'all';
+      include_sold: true;
+    }): Promise<V3ListResponse<V3Item>>;
   };
 }
 
@@ -90,7 +94,13 @@ export class V3InventoryRootDiscovery implements V3InventoryRootDiscoveryPort {
       source = await fetchAllV3PageSnapshot(
         (page) =>
           checkedRead(
-            () => this.client.items.list({ page, limit: ROOT_PAGE_LIMIT, archived: 'all' }),
+            () =>
+              this.client.items.list({
+                page,
+                limit: ROOT_PAGE_LIMIT,
+                archived: 'all',
+                include_sold: true,
+              }),
             options
           ),
         'items',

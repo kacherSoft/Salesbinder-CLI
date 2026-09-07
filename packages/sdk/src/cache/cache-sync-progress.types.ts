@@ -1,3 +1,5 @@
+import type { DocumentContextId } from '../types/common.types.js';
+
 /** Cache sync phases exposed to live progress consumers. */
 export type CacheSyncPhase =
   | 'initializing'
@@ -52,6 +54,14 @@ export interface CacheSyncRateLimitProgress {
 export interface CacheSyncProgress {
   phase: CacheSyncPhase;
   event: CacheSyncProgressEventType;
+  /** Operation mode for phases that have a full/delta distinction. */
+  phaseMode?: 'full' | 'delta';
+  /** Document context represented by this event (4=estimate, 5=invoice, 11=PO). */
+  contextId?: DocumentContextId;
+  /** Count within the current document context, not an aggregate across contexts. */
+  contextRecordsProcessed?: number;
+  /** Context total when the source provides a coherent total; otherwise null. */
+  contextRecordsTotal?: number | null;
   pass?: number;
   page?: number;
   pagesTotal?: number | null;

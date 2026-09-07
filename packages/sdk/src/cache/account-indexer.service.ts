@@ -3,6 +3,8 @@ import { ContextId } from '../types/common.types.js';
 import type { Customer, CustomerListResponse } from '../types/customers.types.js';
 import type { CacheService } from './cache.interface.js';
 import type { CacheSyncProgress, CacheSyncProgressCallback } from './cache-sync-progress.types.js';
+import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
+import { resolveSyncLookbackSeconds } from './sync-lookback.js';
 import type { AccountRow, CacheState } from './types.js';
 import { CACHE_SCHEMA_VERSION } from './types.js';
 
@@ -19,22 +21,36 @@ export interface AccountSyncOptions {
 
 interface ContextSyncResult {
   processed: number;
-  total: number | null;
+  total: number;
+}
+
+interface AccountPaginationState {
+  count: number;
+  pages: number;
 }
 
 type AccountProgress = Omit<CacheSyncProgress, 'phase' | 'apiVersion'>;
+
+const MAX_ACCOUNT_ID_LENGTH = 256;
+const MAX_ACCOUNT_PAGES = 10_000;
+const MAX_ACCOUNT_RECORDS = 1_000_000;
 
 export class AccountIndexerService {
   constructor(
     private readonly client: SalesBinderClient,
     private readonly cache: CacheService,
     private readonly accountName: string,
-    private readonly syncLookbackSeconds = 604800
-  ) {}
+    syncLookbackSeconds: unknown = undefined
+  ) {
+    this.syncLookbackSeconds = resolveSyncLookbackSeconds(syncLookbackSeconds);
+  }
+
+  private readonly syncLookbackSeconds: number;
 
   async sync(fullOrOptions: boolean | AccountSyncOptions = false): Promise<AccountSyncResult> {
     const options = typeof fullOrOptions === 'boolean' ? { full: fullOrOptions } : fullOrOptions;
     const full = options.full ?? false;
+    const scanStartedAt = nowInSeconds();
     this.emit(options.onProgressEvent, {
       event: 'phase_started',
       recordsProcessed: 0,
@@ -45,11 +61,23 @@ export class AccountIndexerService {
     const since = full
       ? 0
       : Math.max(0, (state?.lastAccountSync ?? state?.lastSync ?? 0) - this.syncLookbackSeconds);
-    const customers = await this.syncContext(ContextId.Customer, since, 1, options.onProgressEvent);
-    const suppliers = await this.syncContext(ContextId.Supplier, since, 2, options.onProgressEvent);
-    const now = Math.floor(Date.now() / 1000);
+    const seenIds = new Set<string>();
+    const customers = await this.syncContext(
+      ContextId.Customer,
+      since,
+      1,
+      seenIds,
+      options.onProgressEvent
+    );
+    const suppliers = await this.syncContext(
+      ContextId.Supplier,
+      since,
+      2,
+      seenIds,
+      options.onProgressEvent
+    );
 
-    await this.cache.setCacheState(this.mergeState(state, now));
+    await this.cache.setCacheState(this.mergeState(state, scanStartedAt));
     const total = sumKnownTotals(customers.total, suppliers.total);
     const processed = customers.processed + suppliers.processed;
     this.emit(options.onProgressEvent, {
@@ -70,13 +98,12 @@ export class AccountIndexerService {
     contextId: ContextId,
     modifiedSince: number,
     pass: number,
+    seenIds: Set<string>,
     onProgressEvent?: CacheSyncProgressCallback
   ): Promise<ContextSyncResult> {
     let page = 1;
     let processed = 0;
-    let pagesTotal: number | null = null;
-    let recordsTotal: number | null = null;
-    let lastCompletedPage = 0;
+    let paginationState: AccountPaginationState | null = null;
     let hasMore = true;
 
     this.emit(onProgressEvent, {
@@ -91,10 +118,10 @@ export class AccountIndexerService {
         event: 'page_started',
         pass,
         page,
-        pagesTotal,
+        pagesTotal: paginationState?.pages ?? null,
         recordsProcessed: processed,
-        recordsTotal,
-        indeterminate: recordsTotal === null,
+        recordsTotal: paginationState?.count ?? null,
+        indeterminate: paginationState === null,
       });
       const response = await this.client.customers.list({
         contextId,
@@ -102,32 +129,23 @@ export class AccountIndexerService {
         page,
         pageLimit: 200,
       });
-      const accounts = this.flattenCustomers(response);
-      const reportedPages = parseOptionalCount(response.pages);
-      const reportedTotal = parseOptionalCount(response.count);
-      const coherentPages =
-        reportedPages !== null &&
-        (accounts.length === 0
-          ? reportedPages === 0 || reportedPages >= page
-          : reportedPages >= page);
-      if (page === 1) {
-        pagesTotal = coherentPages ? reportedPages : null;
-        recordsTotal = pagesTotal === null ? null : reportedTotal;
-      } else {
-        if (!coherentPages || reportedPages !== pagesTotal) pagesTotal = null;
-        if (pagesTotal === null || reportedTotal === null || reportedTotal !== recordsTotal)
-          recordsTotal = null;
-      }
+      const accounts = this.validatePageAccounts(response, contextId, seenIds);
+      paginationState = validateAccountPagination(
+        response,
+        page,
+        processed,
+        accounts.length,
+        paginationState
+      );
       if (accounts.length === 0) {
-        lastCompletedPage = page;
         this.emit(onProgressEvent, {
           event: 'page_completed',
           pass,
           page,
-          pagesTotal,
+          pagesTotal: paginationState.pages,
           recordsProcessed: processed,
-          recordsTotal,
-          indeterminate: recordsTotal === null,
+          recordsTotal: paginationState.count,
+          indeterminate: false,
         });
         break;
       }
@@ -137,49 +155,76 @@ export class AccountIndexerService {
       );
       for (let index = 0; index < accounts.length; index++) {
         processed++;
-        if (recordsTotal !== null && processed > recordsTotal) recordsTotal = null;
         this.emit(onProgressEvent, {
           event: 'record_processed',
           pass,
           page,
-          pagesTotal,
+          pagesTotal: paginationState.pages,
           recordsProcessed: processed,
-          recordsTotal,
-          indeterminate: recordsTotal === null,
+          recordsTotal: paginationState.count,
+          indeterminate: false,
         });
       }
       this.emit(onProgressEvent, {
         event: 'page_completed',
         pass,
         page,
-        pagesTotal,
+        pagesTotal: paginationState.pages,
         recordsProcessed: processed,
-        recordsTotal,
-        indeterminate: recordsTotal === null,
+        recordsTotal: paginationState.count,
+        indeterminate: false,
       });
-      lastCompletedPage = page;
-      hasMore = page < Number(response.pages ?? page);
+      hasMore = page < paginationState.pages;
       page++;
     }
 
-    recordsTotal = completedRecordTotal(processed, recordsTotal, pagesTotal, lastCompletedPage);
+    if (!paginationState || processed !== paginationState.count) {
+      throw new Error('Account pagination ended before its declared record count.');
+    }
     this.emit(onProgressEvent, {
       event: 'pass_completed',
       pass,
       recordsProcessed: processed,
-      recordsTotal,
-      indeterminate: recordsTotal === null,
+      recordsTotal: paginationState.count,
+      indeterminate: false,
     });
-    return { processed, total: recordsTotal };
+    return { processed, total: paginationState.count };
   }
 
   private emit(callback: CacheSyncProgressCallback | undefined, progress: AccountProgress): void {
     callback?.({ phase: 'accounts', apiVersion: '2.0', ...progress });
   }
 
-  private flattenCustomers(response: CustomerListResponse): Customer[] {
-    const customers = response.customers ?? [];
-    return Array.isArray(customers[0]) ? (customers as unknown as Customer[][]).flat() : customers;
+  private validatePageAccounts(
+    response: CustomerListResponse,
+    contextId: ContextId,
+    seenIds: Set<string>
+  ): Customer[] {
+    if (!isRecord(response) || !Array.isArray(response.customers)) {
+      throw new Error('Account response envelope is invalid.');
+    }
+    const envelope = response.customers as unknown[];
+    const nested = envelope.every(Array.isArray);
+    const flat = envelope.every(isRecord);
+    if (!nested && !flat) throw new Error('Account response envelope is invalid.');
+    const candidates = nested ? envelope.flat() : envelope;
+    if (!candidates.every(isRecord)) throw new Error('Account response envelope is invalid.');
+
+    const pageIds = new Set<string>();
+    for (const candidate of candidates) {
+      const id = requireCanonicalAccountId(candidate.id);
+      if (candidate.context_id != null && candidate.context_id !== contextId) {
+        throw new Error(
+          `Account context mismatch: requested ${contextId}, received ${String(candidate.context_id)}`
+        );
+      }
+      if (seenIds.has(id) || pageIds.has(id)) {
+        throw new Error('Account response contains a duplicate identity.');
+      }
+      pageIds.add(id);
+    }
+    for (const id of pageIds) seenIds.add(id);
+    return candidates as unknown as Customer[];
   }
 
   private toAccountRow(account: Customer, contextId: ContextId): AccountRow {
@@ -237,23 +282,7 @@ export class AccountIndexerService {
   }
 }
 
-function completedRecordTotal(
-  processed: number,
-  recordsTotal: number | null,
-  pagesTotal: number | null,
-  lastCompletedPage: number
-): number | null {
-  if (recordsTotal === null || pagesTotal === null || processed !== recordsTotal) return null;
-  return pagesTotal === 0
-    ? processed === 0
-      ? 0
-      : null
-    : lastCompletedPage >= pagesTotal
-      ? recordsTotal
-      : null;
-}
-
-function parseOptionalCount(value: unknown): number | null {
+function parsePaginationCount(value: unknown): number | null {
   const parsed =
     typeof value === 'number'
       ? value
@@ -263,14 +292,85 @@ function parseOptionalCount(value: unknown): number | null {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
-function sumKnownTotals(...totals: Array<number | null>): number | null {
-  return totals.every((total): total is number => total !== null)
-    ? totals.reduce<number>((sum, total) => sum + total, 0)
-    : null;
+function validateAccountPagination(
+  response: CustomerListResponse,
+  requestedPage: number,
+  processed: number,
+  pageRecordCount: number,
+  previous: AccountPaginationState | null
+): AccountPaginationState {
+  const page = parsePaginationCount(response.page);
+  const pages = parsePaginationCount(response.pages);
+  const count = parsePaginationCount(response.count);
+  if (
+    page !== requestedPage ||
+    pages === null ||
+    count === null ||
+    pages > MAX_ACCOUNT_PAGES ||
+    count > MAX_ACCOUNT_RECORDS ||
+    (previous !== null && (pages !== previous.pages || count !== previous.count))
+  ) {
+    throw new Error('Account pagination metadata is invalid or changed.');
+  }
+  if (count === 0) {
+    if (
+      requestedPage !== 1 ||
+      (pages !== 0 && pages !== 1) ||
+      pageRecordCount !== 0
+    ) {
+      throw new Error('Account pagination does not match its records.');
+    }
+    return { count, pages };
+  }
+  if (pages === 0 || requestedPage > pages || (requestedPage < pages && pageRecordCount === 0)) {
+    throw new Error('Account pagination ended before its declared final page.');
+  }
+  const prospectiveProcessed = processed + pageRecordCount;
+  if (
+    prospectiveProcessed > count ||
+    (requestedPage === pages && prospectiveProcessed !== count)
+  ) {
+    throw new Error('Account pagination record count does not match metadata.');
+  }
+  return { count, pages };
+}
+
+function requireCanonicalAccountId(value: unknown): string {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > MAX_ACCOUNT_ID_LENGTH ||
+    value !== value.trim() ||
+    hasControlCharacter(value) ||
+    hasUnpairedUtf16Surrogate(value)
+  ) {
+    throw new Error('Account identity is invalid.');
+  }
+  return value;
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x1f || codeUnit === 0x7f) return true;
+  }
+  return false;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function sumKnownTotals(...totals: number[]): number {
+  return totals.reduce((sum, total) => sum + total, 0);
 }
 
 function toUnix(value: string | undefined): number | null {
   if (!value) return null;
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? null : Math.floor(parsed.getTime() / 1000);
+}
+
+function nowInSeconds(): number {
+  return Math.floor(Date.now() / 1000);
 }

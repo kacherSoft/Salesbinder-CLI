@@ -41,7 +41,12 @@ const INVENTORY_SNAPSHOT_READ_CAPABILITY_ERROR =
 
 export interface V3InventoryClient {
   items: {
-    list(params: { page: number; limit: number; archived: 'all' }): Promise<V3ListResponse<V3Item>>;
+    list(params: {
+      page: number;
+      limit: number;
+      archived: 'all';
+      include_sold: true;
+    }): Promise<V3ListResponse<V3Item>>;
     get(itemId: string): Promise<V3Item>;
     listVariations(
       itemId: string,
@@ -368,7 +373,8 @@ export class V3InventoryIndexerService {
     onProgressEvent?: CacheSyncProgressCallback
   ): Promise<V3PageSnapshot<V3Item>> {
     return fetchAllV3PageSnapshot(
-      (page) => this.client.items.list({ page, limit: PAGE_LIMIT, archived: 'all' }),
+      (page) =>
+        this.client.items.list({ page, limit: PAGE_LIMIT, archived: 'all', include_sold: true }),
       'items',
       rootSnapshotError,
       pass === undefined

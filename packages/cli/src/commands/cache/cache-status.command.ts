@@ -66,22 +66,27 @@ export function registerCacheStatusCommand(cache: Command, program: Command): vo
 
         const activeCache = cacheService;
         const prefs = sdk.loadPreferences();
-        const indexer = new sdk.DocumentIndexerService(
-          new sdk.SalesBinderClient(accountName),
-          activeCache,
-          accountName,
-          prefs?.cacheStaleSeconds
-        );
-        const [state, syncStatus, paymentStatus, stale, counts, categoryMeta, inventoryMeta] =
+        const thresholdEnv = process.env.SALESBINDER_CACHE_STALE_SECONDS?.trim();
+        const configuredThreshold = thresholdEnv
+          ? /^\d+$/.test(thresholdEnv)
+            ? Number(thresholdEnv)
+            : Number.NaN
+          : (prefs?.cacheStaleSeconds ?? 3600);
+        const staleThreshold =
+          Number.isSafeInteger(configuredThreshold) && configuredThreshold >= 0
+            ? configuredThreshold
+            : 3600;
+        const [state, syncStatus, paymentStatus, counts, categoryMeta, inventoryMeta] =
           await Promise.all([
             activeCache.getCacheState(),
             activeCache.getSyncStatus(),
             activeCache.getPaymentSyncStatus(),
-            indexer.isCacheStale(),
             collectCacheCounts(activeCache),
             activeCache.getCategoryCacheMeta(),
             activeCache.getInventoryCacheMeta(),
           ]);
+        // Diagnostics must remain available even when API sync configuration is invalid.
+        const stale = !state || state.lastSync < Math.floor(Date.now() / 1000) - staleThreshold;
         const changeFeed = await readChangeFeedStatus({
           backend,
           cache: activeCache,
@@ -97,12 +102,16 @@ export function registerCacheStatusCommand(cache: Command, program: Command): vo
           ...(state
             ? {
                 last_sync: new Date(state.lastSync * 1000).toISOString(),
+                last_document_sync:
+                  state.lastDocumentSync === undefined
+                    ? null
+                    : new Date(state.lastDocumentSync * 1000).toISOString(),
                 last_full_sync: new Date(state.lastFullSync * 1000).toISOString(),
                 ...counts,
                 schema_version: state.schemaVersion,
                 is_stale: stale,
                 freshness: stale ? 'STALE' : 'FRESH',
-                stale_threshold_seconds: prefs?.cacheStaleSeconds || 3600,
+                stale_threshold_seconds: staleThreshold,
                 payment_sync_status: paymentStatus ?? 'not_initialized',
                 categories: categoryMeta ?? 'not_initialized',
                 inventory: inventoryMeta ?? 'not_initialized',

@@ -84,6 +84,7 @@ let terminalWriteProtected: boolean | undefined;
 let deletedLogSyncOptions: object[] = [];
 let useActualProgressReporter = false;
 let itemSyncOptions: MockProgressOptions[] = [];
+let documentSyncModes: Array<boolean | undefined> = [];
 type MockPostgresSyncLockOptions = { onLost?: (error: Error) => void };
 let outerPgLockLossCallback: ((error: Error) => void) | undefined;
 let loseOuterPgLockDuringInventory = false;
@@ -357,6 +358,7 @@ class SuccessfulAccountIndexer {
 
 class SuccessfulDocumentIndexer {
   async sync(options?: MockProgressOptions) {
+    documentSyncModes.push(options?.full);
     phaseOrder.push('documents');
     options?.onProgressEvent?.({
       phase: 'documents',
@@ -477,6 +479,9 @@ jest.mock(
     createPostgresCacheService,
     pullFromPostgres,
     loadPreferences: jest.fn(() => ({})),
+    resolveSyncLookbackSeconds: (value: unknown) =>
+      jest.requireActual('../../../../sdk/src/cache/sync-lookback.js')
+        .resolveSyncLookbackSeconds(value),
     loadConfig: (accountName: string) => mockLoadConfig(accountName),
     createSalesBinderAccountBinding: jest.fn(() => ({
       accountIdentity: 'salesbinder:example',
@@ -728,6 +733,7 @@ describe('cache sync --pull lock ordering', () => {
     deletedLogSyncOptions = [];
     useActualProgressReporter = false;
     itemSyncOptions = [];
+    documentSyncModes = [];
     outerPgLockLossCallback = undefined;
     loseOuterPgLockDuringInventory = false;
     loseOuterPgLockDuringPullSettlement = false;
@@ -739,7 +745,10 @@ describe('cache sync --pull lock ordering', () => {
     mockUuidSequence = 0;
     jest.clearAllMocks();
     mockLoadConfig.mockReturnValue({ subdomain: 'example', v3ApiKey: 'test-v3-key' });
-    outerPgService.getCacheState.mockResolvedValue(null);
+    outerPgService.getCacheState.mockResolvedValue({
+      accountName: 'default', schemaVersion: 7, lastSync: 100, lastFullSync: 90,
+      documentCount: 0, itemDocumentCount: 0,
+    } as never);
     outerPgService.setCacheState.mockImplementation(async () => undefined);
     outerPgService.setSyncStatus.mockImplementation(async () => undefined);
     outerPgService.getSyncStatus.mockResolvedValue(null);
@@ -777,6 +786,80 @@ describe('cache sync --pull lock ordering', () => {
     jest
       .requireActual<typeof import('fs')>('fs')
       .rmSync(mockHomeDirectory, { recursive: true, force: true });
+  });
+
+  it('resolves a new cache as full before accounts can create state', async () => {
+    outerPgService.getCacheState.mockResolvedValue(null);
+    await runCacheSync();
+    expect(process.exitCode).toBeUndefined();
+    expect(documentSyncModes).toEqual([true]);
+    expect(outerPgService.setSyncStatus.mock.calls[0][0].syncType).toBe('full');
+  });
+
+  it('keeps a bound shared cache delta when its writer alias changes', async () => {
+    await runCacheSync('--account', 'phuthaitech');
+    expect(process.exitCode).toBeUndefined();
+    expect(documentSyncModes).toEqual([false]);
+    expect(outerPgService.ensureAccountBinding).toHaveBeenCalled();
+    expect(outerPgService.setSyncStatus.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ accountName: 'phuthaitech', syncType: 'delta' })
+    );
+  });
+
+  it('does not enter any sync phase after a canonical binding mismatch', async () => {
+    outerPgService.ensureAccountBinding.mockRejectedValueOnce(new Error('binding mismatch'));
+    await runCacheSync();
+    expect(process.exitCode).toBe(1);
+    expect(phaseOrder).toEqual([]);
+    expect(outerPgService.setCacheState).not.toHaveBeenCalled();
+  });
+
+  it('persists the run start watermark even when later phases take a long time', async () => {
+    jest.spyOn(Date, 'now').mockImplementation(() =>
+      phaseOrder.includes('documents') ? 1_800_010_000_000 : 1_800_000_000_000
+    );
+    await runCacheSync();
+    expect(process.exitCode).toBeUndefined();
+    expect(outerPgService.setCacheState).toHaveBeenCalledWith(
+      expect.objectContaining({ lastSync: 1_800_000_000, lastSyncAttempt: 1_800_010_000 })
+    );
+  });
+
+  it('resumes legacy alias phase evidence and retains the original full scan start', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+    outerPgService.getCacheState.mockResolvedValue({
+      accountName: 'legacy-alias', schemaVersion: 7, lastSync: 100, lastFullSync: 90,
+      documentCount: 0, itemDocumentCount: 0,
+    } as never);
+    deletedLogFailure = new Error('interrupted');
+    await runFullResume();
+    expect(process.exitCode).toBe(1);
+    expect(actualFileExists(mockCheckpointPath)).toBe(true);
+    (Date.now as jest.Mock).mockReturnValue(1_801_000_000_000);
+    deletedLogFailure = null;
+    phaseOrder = [];
+    process.exitCode = undefined;
+    await runFullResume();
+    expect(process.exitCode).toBeUndefined();
+    expect(phaseOrder).toEqual(['deleted-log']);
+    expect(outerPgService.setCacheState).toHaveBeenLastCalledWith(
+      expect.objectContaining({ lastSync: 1_800_000_000, lastFullSync: 1_800_000_000 })
+    );
+  });
+
+  it('rejects invalid lookback before opening or mutating the database', async () => {
+    const previous = process.env.SALESBINDER_SYNC_LOOKBACK_SECONDS;
+    process.env.SALESBINDER_SYNC_LOOKBACK_SECONDS = '-1';
+    try {
+      await runCacheSync();
+      expect(process.exitCode).toBe(1);
+      expect(createPostgresCacheService).not.toHaveBeenCalled();
+      expect(phaseOrder).toEqual([]);
+      expectSingleSanitizedCliError('Sync lookback seconds must be a non-negative safe integer.');
+    } finally {
+      if (previous === undefined) delete process.env.SALESBINDER_SYNC_LOOKBACK_SECONDS;
+      else process.env.SALESBINDER_SYNC_LOOKBACK_SECONDS = previous;
+    }
   });
 
   it('fails closed when the PostgreSQL writer lock is lost during inventory before pull', async () => {
@@ -2105,6 +2188,38 @@ describe('cache sync --pull lock ordering', () => {
     expect(outerPgService.releaseSyncLock).not.toHaveBeenCalled();
     expect(outerPgService.close).toHaveBeenCalledTimes(1);
     expectSingleSanitizedCliError('Another cache sync is already running for this account.');
+  });
+
+  it.each(['', '   ', '0x10', '1e3'])(
+    'uses the diagnostic stale threshold default for blank or non-decimal input %j',
+    async (value) => {
+      const previous = process.env.SALESBINDER_CACHE_STALE_SECONDS;
+      process.env.SALESBINDER_CACHE_STALE_SECONDS = value;
+      try {
+        await runCacheStatus();
+        expect(process.exitCode).toBeUndefined();
+        const output = JSON.parse((console.log as jest.Mock).mock.calls[0][0]);
+        expect(output.stale_threshold_seconds).toBe(3600);
+      } finally {
+        if (previous === undefined) delete process.env.SALESBINDER_CACHE_STALE_SECONDS;
+        else process.env.SALESBINDER_CACHE_STALE_SECONDS = previous;
+      }
+    }
+  );
+
+  it('keeps cache status available when sync lookback is invalid without constructing an API client', async () => {
+    const previous = process.env.SALESBINDER_SYNC_LOOKBACK_SECONDS;
+    process.env.SALESBINDER_SYNC_LOOKBACK_SECONDS = '-1';
+    try {
+      await runCacheStatus();
+      expect(process.exitCode).toBeUndefined();
+      expect(console.log).toHaveBeenCalledTimes(1);
+      expect(clientRuntimeOptions).toEqual([]);
+      expect(outerPgService.setCacheState).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.SALESBINDER_SYNC_LOOKBACK_SECONDS;
+      else process.env.SALESBINDER_SYNC_LOOKBACK_SECONDS = previous;
+    }
   });
 
   it('projects first-sync status progress and derives stale-running health without mutation', async () => {

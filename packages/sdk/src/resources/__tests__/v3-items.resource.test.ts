@@ -47,6 +47,17 @@ describe('V3ItemsResource', () => {
     expect(result.pagination).toEqual({ page: 1, per_page: 100, total_pages: 1, total_records: 1 });
   });
 
+  it('serializes include_sold for complete inventory enumeration', async () => {
+    const get = jest.fn().mockResolvedValue({ data: listEnvelope([item], '/api/v3/items') });
+    const resource = createResource(get);
+
+    await resource.list({ page: 1, limit: 100, archived: 'all', include_sold: true });
+
+    expect(get).toHaveBeenCalledWith('/items', {
+      params: { page: 1, limit: 100, archived: 'all', include_sold: true },
+    });
+  });
+
   it('gets the direct v3 item object without a suffix', async () => {
     const get = jest.fn().mockResolvedValue({ data: item });
     const resource = createResource(get);

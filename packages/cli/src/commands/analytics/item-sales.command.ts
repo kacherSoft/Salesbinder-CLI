@@ -4,6 +4,10 @@
 
 import type { Command } from 'commander';
 import { formatJson, formatError } from '../../output/json.formatter.js';
+import {
+  ensureAnalyticsCacheBinding,
+  getAnalyticsSyncDecision,
+} from './analytics-cache-binding.js';
 
 interface AnalyticsOptions {
   forceRefresh?: boolean;
@@ -40,8 +44,10 @@ Output includes:
         const {
           SalesBinderClient,
           createCacheService,
+          createSalesBinderAccountBinding,
           DocumentIndexerService,
           DocumentContextId,
+          loadConfig,
           loadPreferences,
         } = await import('@salesbinder/sdk');
 
@@ -73,15 +79,17 @@ Output includes:
         // Check cache and sync if needed
         if (!analyticsOptions.useCachedOnly) {
           const state = await cache.getCacheState();
-          const needsSync =
-            analyticsOptions.forceRefresh ||
-            !state ||
-            state.accountName !== accountName ||
-            await indexer.isCacheStale();
+          const syncDecision = getAnalyticsSyncDecision(
+            analyticsOptions.forceRefresh === true,
+            state,
+            await indexer.isCacheStale()
+          );
 
-          if (needsSync) {
+          if (syncDecision.shouldSync) {
+            const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
+            await ensureAnalyticsCacheBinding(cache, accountBinding);
             console.error('Syncing cache...');
-            await indexer.sync({ full: analyticsOptions.forceRefresh });
+            await indexer.sync({ full: syncDecision.full });
             console.error('Sync complete');
           }
         }

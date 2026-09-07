@@ -41,11 +41,24 @@ import {
 import { PAYMENT_DETAIL_DELAY_MS } from './payment-cache.constants.js';
 import type { PaymentSyncMode } from './payment-sync.types.js';
 import type { PaymentTransactionRow } from './payment-sync.types.js';
+import { resolveSyncLookbackSeconds } from './sync-lookback.js';
 
 interface DocumentWriteResult {
   resolvedDocId: string;
   savedItems: number;
   savedPayments: number | null;
+}
+
+type DocumentSyncMode = Extract<PaymentSyncMode, 'full' | 'delta'>;
+
+interface DocumentProgressDetails {
+  phaseMode: DocumentSyncMode;
+  contextId?: DocumentContextId;
+  contextRecordsProcessed?: number;
+  contextRecordsTotal?: number | null;
+  page?: number;
+  pagesTotal?: number | null;
+  recordsTotal?: number | null;
 }
 
 const DOCUMENT_BUNDLE_CAPABILITY_ERROR = 'Document sync requires atomic document bundle support.';
@@ -74,9 +87,7 @@ export class DocumentIndexerService {
     const envValue = process.env.SALESBINDER_CACHE_STALE_SECONDS;
     this.staleThreshold = envValue ? parseInt(envValue, 10) : (staleThresholdSeconds ?? 3600);
     const lookbackValue = process.env[['SALESBINDER', 'SYNC', 'LOOKBACK', 'SECONDS'].join('_')];
-    this.syncLookbackSeconds = lookbackValue
-      ? parseInt(lookbackValue, 10)
-      : (syncLookbackSeconds ?? 604800);
+    this.syncLookbackSeconds = resolveSyncLookbackSeconds(lookbackValue ?? syncLookbackSeconds);
   }
 
   /**
@@ -85,9 +96,7 @@ export class DocumentIndexerService {
   async sync(options: SyncOptions = {}): Promise<SyncResult> {
     this.requireDocumentBundleWriter();
     const state = await this.cache.getCacheState();
-    const needsInitialSync = !state || state.accountName !== this.accountName;
-
-    if (options.full || needsInitialSync) {
+    if (options.full === true || (options.full === undefined && !state)) {
       return this.fullSync(options);
     } else {
       return this.deltaSync(options);
@@ -108,7 +117,9 @@ export class DocumentIndexerService {
    * Perform full sync - fetch all documents
    */
   private async fullSync(options: SyncOptions): Promise<SyncResult> {
+    const phaseMode = 'full' as const;
     const startTime = Date.now();
+    const phaseStartedAt = Math.floor(startTime / 1000);
     const state = await this.cache.getCacheState();
     let totalDocuments = 0;
     let totalLineItems = 0;
@@ -121,9 +132,10 @@ export class DocumentIndexerService {
     const seenIds = new Set<string>();
     const seenBusinessKeys = new Map<string, string>();
     let recordsObserved = 0;
+    let aggregateRecordsTotal: number | null = 0;
     let frozenCheckpoint: { contextId: number; page: number; docIndex: number } | null = null;
 
-    this.emitProgress(options, 'phase_started', 0);
+    this.emitProgress(options, 'phase_started', 0, { phaseMode });
 
     try {
       const contexts = [
@@ -142,10 +154,18 @@ export class DocumentIndexerService {
         let hasMore = true;
         let paginationState: DocumentPaginationState | null | undefined;
         let contextRowsFetched = 0;
+        let contextRecordsProcessed = 0;
 
         while (hasMore) {
           assertDocumentScanBounds(page, contextRowsFetched);
-          this.emitProgress(options, 'page_started', recordsObserved, page);
+          this.emitProgress(options, 'page_started', recordsObserved, {
+            phaseMode,
+            contextId: context.id,
+            contextRecordsProcessed,
+            contextRecordsTotal: paginationState?.count ?? null,
+            page,
+            pagesTotal: paginationState?.pages ?? null,
+          });
           let response: DocumentListResponse;
           try {
             response = validateDocumentListResponse(
@@ -182,6 +202,14 @@ export class DocumentIndexerService {
             if (paginationState && paginationState.count !== 0 && page <= paginationState.pages) {
               throw new Error(`Document page ${page} was empty before the declared snapshot ended`);
             }
+            this.emitProgress(options, 'page_completed', recordsObserved, {
+              phaseMode,
+              contextId: context.id,
+              contextRecordsProcessed,
+              contextRecordsTotal: paginationState?.count ?? null,
+              page,
+              pagesTotal: paginationState?.pages ?? null,
+            });
             hasMore = false;
             break;
           }
@@ -193,6 +221,7 @@ export class DocumentIndexerService {
             const checkpoint = { contextId: context.id, page, docIndex };
             if (!frozenCheckpoint) options.resume?.onDocumentCheckpoint?.(checkpoint);
             recordsObserved++;
+            contextRecordsProcessed++;
             try {
               const { resolvedDocId, savedItems, savedPayments } = await this.writeSourceDocument(
                 doc,
@@ -216,7 +245,14 @@ export class DocumentIndexerService {
               }
 
               options.onProgress?.(totalDocuments, -1);
-              this.emitProgress(options, 'record_processed', recordsObserved, page);
+              this.emitProgress(options, 'record_processed', recordsObserved, {
+                phaseMode,
+                contextId: context.id,
+                contextRecordsProcessed,
+                contextRecordsTotal: paginationState?.count ?? null,
+                page,
+                pagesTotal: paginationState?.pages ?? null,
+              });
             } catch (error) {
               if (!(error instanceof DocumentRecordError)) throw error;
               recoveryQueue.set(doc.id, {
@@ -228,11 +264,25 @@ export class DocumentIndexerService {
                 frozenCheckpoint = checkpoint;
                 options.resume?.onDocumentCheckpoint?.(checkpoint);
               }
-              this.emitProgress(options, 'record_failed_collected', recordsObserved, page);
+              this.emitProgress(options, 'record_failed_collected', recordsObserved, {
+                phaseMode,
+                contextId: context.id,
+                contextRecordsProcessed,
+                contextRecordsTotal: paginationState?.count ?? null,
+                page,
+                pagesTotal: paginationState?.pages ?? null,
+              });
             }
           }
 
-          this.emitProgress(options, 'page_completed', recordsObserved, page);
+          this.emitProgress(options, 'page_completed', recordsObserved, {
+            phaseMode,
+            contextId: context.id,
+            contextRecordsProcessed,
+            contextRecordsTotal: paginationState?.count ?? null,
+            page,
+            pagesTotal: paginationState?.pages ?? null,
+          });
           hasMore = paginationState ? page < paginationState.pages : true;
           if (!frozenCheckpoint) {
             options.resume?.onDocumentCheckpoint?.({
@@ -251,6 +301,7 @@ export class DocumentIndexerService {
             `Incomplete document snapshot: expected ${paginationState.count}, received ${contextRowsFetched}`
           );
         }
+        aggregateRecordsTotal = addKnownDocumentTotal(aggregateRecordsTotal, paginationState);
       }
 
       const recovery = await this.recoverDocuments(
@@ -258,6 +309,8 @@ export class DocumentIndexerService {
         refreshInvoicePayments,
         options,
         totalDocuments,
+        recordsObserved,
+        phaseMode,
         seenBusinessKeys
       );
       totalDocuments += recovery.documents;
@@ -266,23 +319,8 @@ export class DocumentIndexerService {
       lastPaymentCursor = recovery.lastPaymentCursor ?? lastPaymentCursor;
       const recordIssues = recovery.recordIssues;
 
-      // Update cache state
       const completedAt = nowInSeconds();
       const deferGlobalWatermark = this.indexerOptions.deferGlobalWatermark === true;
-      await this.cache.setCacheState({
-        ...state,
-        lastSync:
-          deferGlobalWatermark || recordIssues.length > 0 ? (state?.lastSync ?? 0) : completedAt,
-        lastFullSync:
-          deferGlobalWatermark || recordIssues.length > 0
-            ? (state?.lastFullSync ?? 0)
-            : completedAt,
-        lastSyncAttempt: completedAt,
-        documentCount: await this.cache.getDocumentCount(),
-        itemDocumentCount: await this.cache.getItemDocumentCount(),
-        accountName: this.accountName,
-        schemaVersion: CACHE_SCHEMA_VERSION,
-      });
       await this.completePaymentRefresh(
         'full',
         refreshInvoicePayments,
@@ -292,7 +330,28 @@ export class DocumentIndexerService {
         previousPaymentStatus?.lastSuccessfulSync,
         recordIssues
       );
-      this.emitProgress(options, 'phase_completed', recordsObserved);
+      // The scan start is the safe high-water mark: changes made during a long
+      // scan remain inside the next delta window. Warning runs advance neither
+      // the document-specific nor global clean watermark.
+      await this.cache.setCacheState({
+        ...state,
+        lastSync:
+          deferGlobalWatermark || recordIssues.length > 0 ? (state?.lastSync ?? 0) : phaseStartedAt,
+        lastFullSync:
+          deferGlobalWatermark || recordIssues.length > 0
+            ? (state?.lastFullSync ?? 0)
+            : phaseStartedAt,
+        ...(recordIssues.length === 0 ? { lastDocumentSync: phaseStartedAt } : {}),
+        lastSyncAttempt: completedAt,
+        documentCount: await this.cache.getDocumentCount(),
+        itemDocumentCount: await this.cache.getItemDocumentCount(),
+        accountName: this.accountName,
+        schemaVersion: CACHE_SCHEMA_VERSION,
+      });
+      this.emitProgress(options, 'phase_completed', recordsObserved, {
+        phaseMode,
+        recordsTotal: aggregateRecordsTotal,
+      });
 
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
@@ -328,7 +387,9 @@ export class DocumentIndexerService {
    * Perform delta sync - fetch only modified documents
    */
   private async deltaSync(options: SyncOptions): Promise<SyncResult> {
+    const phaseMode = 'delta' as const;
     const startTime = Date.now();
+    const phaseStartedAt = Math.floor(startTime / 1000);
     const state = await this.cache.getCacheState();
     if (!state) throw new Error('Delta document sync requires existing cache state');
     let documentsUpdated = 0;
@@ -343,11 +404,15 @@ export class DocumentIndexerService {
     const seenIds = new Set<string>();
     const seenBusinessKeys = new Map<string, string>();
     let recordsObserved = 0;
+    let aggregateRecordsTotal: number | null = 0;
 
-    this.emitProgress(options, 'phase_started', 0);
+    this.emitProgress(options, 'phase_started', 0, { phaseMode });
 
     try {
-      const lastSyncTime = Math.max(0, state.lastSync - this.syncLookbackSeconds);
+      const lastSyncTime = Math.max(
+        0,
+        (state.lastDocumentSync ?? state.lastSync) - this.syncLookbackSeconds
+      );
       const contexts = [
         DocumentContextId.Estimate,
         DocumentContextId.Invoice,
@@ -359,10 +424,18 @@ export class DocumentIndexerService {
         let hasMore = true;
         let paginationState: DocumentPaginationState | null | undefined;
         let contextRowsFetched = 0;
+        let contextRecordsProcessed = 0;
 
         while (hasMore) {
           assertDocumentScanBounds(page, contextRowsFetched);
-          this.emitProgress(options, 'page_started', recordsObserved, page);
+          this.emitProgress(options, 'page_started', recordsObserved, {
+            phaseMode,
+            contextId,
+            contextRecordsProcessed,
+            contextRecordsTotal: paginationState?.count ?? null,
+            page,
+            pagesTotal: paginationState?.pages ?? null,
+          });
           let response: DocumentListResponse;
           try {
             response = validateDocumentListResponse(
@@ -400,6 +473,14 @@ export class DocumentIndexerService {
             if (paginationState && paginationState.count !== 0 && page <= paginationState.pages) {
               throw new Error(`Document page ${page} was empty before the declared snapshot ended`);
             }
+            this.emitProgress(options, 'page_completed', recordsObserved, {
+              phaseMode,
+              contextId,
+              contextRecordsProcessed,
+              contextRecordsTotal: paginationState?.count ?? null,
+              page,
+              pagesTotal: paginationState?.pages ?? null,
+            });
             hasMore = false;
             break;
           }
@@ -407,6 +488,7 @@ export class DocumentIndexerService {
           for (const doc of documents) {
             assertDocumentRootIdentity(doc, contextId, seenIds, seenBusinessKeys);
             recordsObserved++;
+            contextRecordsProcessed++;
             try {
               const { resolvedDocId, savedItems, savedPayments } = await this.writeSourceDocument(
                 doc,
@@ -422,7 +504,14 @@ export class DocumentIndexerService {
               }
 
               options.onProgress?.(documentsUpdated, -1);
-              this.emitProgress(options, 'record_processed', recordsObserved, page);
+              this.emitProgress(options, 'record_processed', recordsObserved, {
+                phaseMode,
+                contextId,
+                contextRecordsProcessed,
+                contextRecordsTotal: paginationState?.count ?? null,
+                page,
+                pagesTotal: paginationState?.pages ?? null,
+              });
             } catch (error) {
               if (!(error instanceof DocumentRecordError)) throw error;
               recoveryQueue.set(doc.id, {
@@ -430,11 +519,25 @@ export class DocumentIndexerService {
                 contextId,
                 documentNumber: safeDocumentNumber(doc.document_number),
               });
-              this.emitProgress(options, 'record_failed_collected', recordsObserved, page);
+              this.emitProgress(options, 'record_failed_collected', recordsObserved, {
+                phaseMode,
+                contextId,
+                contextRecordsProcessed,
+                contextRecordsTotal: paginationState?.count ?? null,
+                page,
+                pagesTotal: paginationState?.pages ?? null,
+              });
             }
           }
 
-          this.emitProgress(options, 'page_completed', recordsObserved, page);
+          this.emitProgress(options, 'page_completed', recordsObserved, {
+            phaseMode,
+            contextId,
+            contextRecordsProcessed,
+            contextRecordsTotal: paginationState?.count ?? null,
+            page,
+            pagesTotal: paginationState?.pages ?? null,
+          });
           hasMore = paginationState ? page < paginationState.pages : true;
           page += 1;
           if (hasMore) await delay(500);
@@ -444,6 +547,7 @@ export class DocumentIndexerService {
             `Incomplete document snapshot: expected ${paginationState.count}, received ${contextRowsFetched}`
           );
         }
+        aggregateRecordsTotal = addKnownDocumentTotal(aggregateRecordsTotal, paginationState);
       }
 
       const recovery = await this.recoverDocuments(
@@ -451,6 +555,8 @@ export class DocumentIndexerService {
         refreshInvoicePayments,
         options,
         documentsUpdated,
+        recordsObserved,
+        phaseMode,
         seenBusinessKeys
       );
       documentsUpdated += recovery.documents;
@@ -459,18 +565,6 @@ export class DocumentIndexerService {
       lastPaymentCursor = recovery.lastPaymentCursor ?? lastPaymentCursor;
       const recordIssues = recovery.recordIssues;
 
-      // Update cache state
-      const updatedState: CacheState = {
-        ...state,
-        lastSync:
-          this.indexerOptions.deferGlobalWatermark === true || recordIssues.length > 0
-            ? state.lastSync
-            : nowInSeconds(),
-        lastSyncAttempt: nowInSeconds(),
-        documentCount: await this.cache.getDocumentCount(),
-        itemDocumentCount: await this.cache.getItemDocumentCount(),
-      };
-      await this.cache.setCacheState(updatedState);
       await this.completePaymentRefresh(
         'delta',
         refreshInvoicePayments,
@@ -480,7 +574,22 @@ export class DocumentIndexerService {
         previousPaymentStatus?.lastSuccessfulSync,
         recordIssues
       );
-      this.emitProgress(options, 'phase_completed', recordsObserved);
+      const updatedState: CacheState = {
+        ...state,
+        lastSync:
+          this.indexerOptions.deferGlobalWatermark === true || recordIssues.length > 0
+            ? state.lastSync
+            : phaseStartedAt,
+        ...(recordIssues.length === 0 ? { lastDocumentSync: phaseStartedAt } : {}),
+        lastSyncAttempt: nowInSeconds(),
+        documentCount: await this.cache.getDocumentCount(),
+        itemDocumentCount: await this.cache.getItemDocumentCount(),
+      };
+      await this.cache.setCacheState(updatedState);
+      this.emitProgress(options, 'phase_completed', recordsObserved, {
+        phaseMode,
+        recordsTotal: aggregateRecordsTotal,
+      });
 
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
@@ -626,6 +735,8 @@ export class DocumentIndexerService {
     refreshInvoicePayments: boolean,
     options: SyncOptions,
     startingDocuments: number,
+    recordsObservedBeforeRetry: number,
+    phaseMode: DocumentSyncMode,
     seenBusinessKeys: Map<string, string>
   ): Promise<{
     documents: number;
@@ -643,7 +754,7 @@ export class DocumentIndexerService {
     let paymentDocuments = 0;
     let lastPaymentCursor: string | null = null;
     if (entries.length > 0) {
-      this.emitProgress(options, 'retry_pass_started', 0, undefined, entries.length);
+      this.emitProgress(options, 'retry_pass_started', recordsObservedBeforeRetry, { phaseMode });
     }
 
     for (let index = 0; index < entries.length; index++) {
@@ -679,7 +790,10 @@ export class DocumentIndexerService {
           lastPaymentCursor = write.resolvedDocId;
         }
         options.onProgress?.(startingDocuments + documents, -1);
-        this.emitProgress(options, 'record_retry_succeeded', index + 1, undefined, entries.length);
+        this.emitProgress(options, 'record_retry_succeeded', recordsObservedBeforeRetry, {
+          phaseMode,
+          contextId: entry.contextId,
+        });
       } catch (error) {
         if (!(error instanceof DocumentRecordError)) throw error;
         const existing = await findExistingDocument(this.cache, lookupEntry);
@@ -692,7 +806,10 @@ export class DocumentIndexerService {
           attempts: 2,
           outcome: existing ? 'preserved_last_known_good' : 'omitted_new',
         });
-        this.emitProgress(options, 'record_retry_failed', index + 1, undefined, entries.length);
+        this.emitProgress(options, 'record_retry_failed', recordsObservedBeforeRetry, {
+          phaseMode,
+          contextId: entry.contextId,
+        });
       }
     }
 
@@ -709,14 +826,23 @@ export class DocumentIndexerService {
     options: SyncOptions,
     event: CacheSyncProgressEventType,
     recordsProcessed: number,
-    page?: number,
-    recordsTotal: number | null = null
+    details: DocumentProgressDetails
   ): void {
     if (!options.onProgressEvent) return;
+    const recordsTotal = details.recordsTotal ?? null;
     const progress: CacheSyncProgress = {
       phase: 'documents',
       event,
-      ...(page === undefined ? {} : { page }),
+      phaseMode: details.phaseMode,
+      ...(details.contextId === undefined ? {} : { contextId: details.contextId }),
+      ...(details.contextRecordsProcessed === undefined
+        ? {}
+        : { contextRecordsProcessed: details.contextRecordsProcessed }),
+      ...(details.contextRecordsTotal === undefined
+        ? {}
+        : { contextRecordsTotal: details.contextRecordsTotal }),
+      ...(details.page === undefined ? {} : { page: details.page }),
+      ...(details.pagesTotal === undefined ? {} : { pagesTotal: details.pagesTotal }),
       recordsProcessed,
       recordsTotal,
       indeterminate: recordsTotal === null,
@@ -810,4 +936,12 @@ export class DocumentIndexerService {
 function compareCodeUnitStrings(left: string, right: string): number {
   if (left === right) return 0;
   return left < right ? -1 : 1;
+}
+
+function addKnownDocumentTotal(
+  aggregate: number | null,
+  context: DocumentPaginationState | null | undefined
+): number | null {
+  if (aggregate === null || !context) return null;
+  return aggregate + context.count;
 }

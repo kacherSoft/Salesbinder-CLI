@@ -61,6 +61,32 @@ import { createCategoryFingerprint } from './category-indexer.service.js';
 import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
 import { assertCanonicalV3SourceId } from './v3-inventory-source-validation.js';
 import { PostgresInventoryChangeFeedStore } from './postgres-inventory-change-feed.store.js';
+import { PostgresDocumentOffsetStore } from './postgres-document-offset.store.js';
+import { PostgresOfficialV3SyncStore } from './postgres-official-v3-sync.store.js';
+import {
+  SALESPERSON_DIRECTORY_META_KEY,
+  assertSalespersonDirectorySnapshot,
+  hasObservedSalespersonName,
+  normalizeSalespersonDirectory,
+  resolveSalespersonAssignmentForWrite,
+  salespersonDirectoryMap,
+  type SalespersonDirectoryInput,
+  type SalespersonDirectorySnapshot,
+  type SalespersonRepairResult,
+} from './salesperson-directory.js';
+import type {
+  DocumentOffsetStore,
+  DocumentOffsetRun,
+  DocumentOffsetTask,
+  OffsetTaskKind,
+} from './document-offset-sync.types.js';
+import type {
+  OfficialV3SyncRun,
+  OfficialV3SyncState,
+  OfficialV3SyncStatusSummary,
+  OfficialV3SyncStore,
+} from './official-v3-sync.types.js';
+import { readOfficialV3SyncStatus } from './official-v3-sync-status.js';
 
 const { Pool } = pg;
 
@@ -259,7 +285,9 @@ type HeldPostgresSyncLock = {
   onLost?: (error: Error) => void | Promise<void>;
 };
 
-export class PostgresCacheService implements CacheService, InventoryChangeFeedCache {
+export class PostgresCacheService
+  implements CacheService, InventoryChangeFeedCache, DocumentOffsetStore
+{
   private pool: InstanceType<typeof Pool>;
   private opened = true;
   private readonly syncLockClients = new Map<string, HeldPostgresSyncLock>();
@@ -269,6 +297,8 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
   private readonly connectionString: string;
   private expectedBinding: CacheAccountBinding | null = null;
   private inventoryChangeFeedStore?: PostgresInventoryChangeFeedStore;
+  private documentOffsetStore?: PostgresDocumentOffsetStore;
+  private officialV3SyncStore?: PostgresOfficialV3SyncStore;
 
   constructor(connectionString: string) {
     this.connectionString = connectionString;
@@ -1038,6 +1068,86 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
     return (await this.getCategoryCacheMeta())?.storedRowCount ?? 0;
   }
 
+  async setSalespersonDirectory(input: SalespersonDirectoryInput): Promise<void> {
+    const binding = this.requireExpectedBinding();
+    const snapshot = normalizeSalespersonDirectory(input);
+    if (snapshot.accountIdentity !== binding.accountIdentity) {
+      throw new Error('Salesperson directory account does not match the PostgreSQL cache binding.');
+    }
+    await this.withVerifiedWrite(async (client) => {
+      await this.writeSalespersonDirectory(client, snapshot);
+    });
+  }
+
+  async getSalespersonDirectory(): Promise<SalespersonDirectorySnapshot | null> {
+    const binding = this.requireExpectedBinding();
+    return this.withReadOnlyTransaction(async (client) => {
+      const snapshot = await this.readSalespersonDirectory(client);
+      if (snapshot && snapshot.accountIdentity !== binding.accountIdentity) {
+        throw new Error('Salesperson directory account does not match the PostgreSQL cache binding.');
+      }
+      return snapshot;
+    });
+  }
+
+  async repairMissingSalespersonNames(
+    input?: SalespersonDirectoryInput
+  ): Promise<SalespersonRepairResult> {
+    const binding = this.requireExpectedBinding();
+    return this.withVerifiedWrite(async (client) => {
+      const directory = input
+        ? normalizeSalespersonDirectory(input)
+        : await this.readSalespersonDirectory(client);
+      if (!directory) throw new Error('Salesperson directory is not configured.');
+      if (directory.accountIdentity !== binding.accountIdentity) {
+        throw new Error('Salesperson directory account does not match the PostgreSQL cache binding.');
+      }
+      if (input) await this.writeSalespersonDirectory(client, directory);
+      const names = salespersonDirectoryMap(directory);
+      const missing = await client.query<{ user_id: string; count: string }>(
+        `SELECT user_id, COUNT(*) AS count
+         FROM documents
+         WHERE user_id IS NOT NULL
+           AND context_id IN (4, 5, 11)
+           AND BTRIM(COALESCE(salesperson_name, '')) = ''
+         GROUP BY user_id`
+      );
+      const unresolvedUserCounts: Record<string, number> = {};
+      const resolvable = missing.rows.filter((row) => {
+        if (names.has(row.user_id)) return true;
+        unresolvedUserCounts[row.user_id] = Number(row.count);
+        return false;
+      });
+      if (resolvable.length === 0) return { updatedCount: 0, unresolvedUserCounts };
+      const params = resolvable.flatMap((row) => {
+        const name = names.get(row.user_id);
+        if (!name) throw new Error('Salesperson directory is invalid.');
+        return [row.user_id, name];
+      });
+      const userPlaceholders = resolvable
+        .map((_, index) => `$${index * 2 + 1}`)
+        .join(', ');
+      const cases = resolvable
+        .map((_, index) => `WHEN $${index * 2 + 1} THEN $${index * 2 + 2}`)
+        .join(' ');
+      const updated = await client.query(
+        `UPDATE documents
+         SET salesperson_name = CASE user_id ${cases} END
+         WHERE user_id IN (${userPlaceholders})
+           AND context_id IN (4, 5, 11)
+           AND BTRIM(COALESCE(salesperson_name, '')) = ''`,
+        params
+      );
+      return { updatedCount: updated.rowCount ?? 0, unresolvedUserCounts };
+    });
+  }
+
+  async applySalespersonDirectoryRepair(
+    input: SalespersonDirectoryInput
+  ): Promise<SalespersonRepairResult> {
+    return this.repairMissingSalespersonNames(input);
+  }
+
   async insertDocument(doc: DocumentRow): Promise<void> {
     await this.withVerifiedWrite(async (client) => {
       await client.query(
@@ -1133,38 +1243,108 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
 
     await this.withVerifiedWrite(async (client) => {
       const normalizedDocument = await this.normalizeDocumentForWrite(document, client);
-      const resolvedDocId = normalizedDocument['doc_id'];
-      if (typeof resolvedDocId !== 'string' || resolvedDocId.length === 0) {
-        throw new Error('Document bundle requires a valid document ID.');
-      }
-
-      await client.query(
-        this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
-        this.valuesFor(DOCUMENT_COLUMNS, normalizedDocument)
+      await this.writeResolvedDocumentBundle(
+        client,
+        normalizedDocument,
+        itemDocuments,
+        paymentTransactions
       );
-      await client.query(`DELETE FROM item_documents WHERE doc_id = $1`, [resolvedDocId]);
-      for (const row of itemDocuments) {
+    });
+  }
+
+  private async writeResolvedDocumentBundle(
+    client: PoolClient,
+    normalizedDocument: Record<string, unknown>,
+    itemDocuments: Omit<ItemDocumentRow, 'id'>[],
+    paymentTransactions?: PaymentTransactionRow[]
+  ): Promise<void> {
+    const resolvedDocId = normalizedDocument['doc_id'];
+    if (typeof resolvedDocId !== 'string' || resolvedDocId.length === 0) {
+      throw new Error('Document bundle requires a valid document ID.');
+    }
+
+    await client.query(
+      this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'),
+      this.valuesFor(DOCUMENT_COLUMNS, normalizedDocument)
+    );
+    await client.query(`DELETE FROM item_documents WHERE doc_id = $1`, [resolvedDocId]);
+    for (const row of itemDocuments) {
+      await client.query(
+        this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
+        this.valuesFor(
+          ITEM_DOCUMENT_COLUMNS,
+          this.normalizeItemDocument({ ...row, doc_id: resolvedDocId })
+        )
+      );
+    }
+    if (paymentTransactions !== undefined) {
+      await client.query(`DELETE FROM payment_transactions WHERE doc_id = $1`, [resolvedDocId]);
+      for (const row of paymentTransactions) {
         await client.query(
-          this.insertSql('item_documents', ITEM_DOCUMENT_COLUMNS),
+          this.insertSql('payment_transactions', PAYMENT_TRANSACTION_COLUMNS),
           this.valuesFor(
-            ITEM_DOCUMENT_COLUMNS,
-            this.normalizeItemDocument({ ...row, doc_id: resolvedDocId })
+            PAYMENT_TRANSACTION_COLUMNS,
+            this.normalizePaymentTransaction({ ...row, doc_id: resolvedDocId })
           )
         );
       }
-      if (paymentTransactions !== undefined) {
-        await client.query(`DELETE FROM payment_transactions WHERE doc_id = $1`, [resolvedDocId]);
-        for (const row of paymentTransactions) {
-          await client.query(
-            this.insertSql('payment_transactions', PAYMENT_TRANSACTION_COLUMNS),
-            this.valuesFor(
-              PAYMENT_TRANSACTION_COLUMNS,
-              this.normalizePaymentTransaction({ ...row, doc_id: resolvedDocId })
-            )
-          );
-        }
-      }
-    });
+    }
+  }
+
+  getOffsetSyncRun(): Promise<DocumentOffsetRun | null> {
+    return this.offsetStore().getOffsetSyncRun();
+  }
+  saveOffsetSyncRun(run: DocumentOffsetRun): Promise<void> {
+    return this.offsetStore().saveOffsetSyncRun(run);
+  }
+  listOffsetSyncTasks(runId: string, kind: OffsetTaskKind): Promise<DocumentOffsetTask[]> {
+    return this.offsetStore().listOffsetSyncTasks(runId, kind);
+  }
+  saveOffsetSyncTasks(
+    runId: string,
+    kind: OffsetTaskKind,
+    tasks: DocumentOffsetTask[]
+  ): Promise<void> {
+    return this.offsetStore().saveOffsetSyncTasks(runId, kind, tasks);
+  }
+  applyOffsetDocumentBundle(
+    runId: string,
+    task: DocumentOffsetTask,
+    document: DocumentRow,
+    lines: Omit<ItemDocumentRow, 'id'>[],
+    refreshNotBefore: number
+  ): Promise<void> {
+    return this.offsetStore().applyOffsetDocumentBundle(
+      runId,
+      task,
+      document,
+      lines,
+      refreshNotBefore
+    );
+  }
+  applyOffsetInventoryBundle(
+    runId: string,
+    task: DocumentOffsetTask,
+    item: ItemRow,
+    rows: ItemStockLocationRow[]
+  ): Promise<void> {
+    return this.offsetStore().applyOffsetInventoryBundle(runId, task, item, rows);
+  }
+
+  getOfficialV3SyncStore(): OfficialV3SyncStore {
+    return this.officialSyncStore();
+  }
+
+  getOfficialV3SyncState(): Promise<OfficialV3SyncState | null> {
+    return this.officialSyncStore().getState();
+  }
+
+  getOfficialV3SyncRun(): Promise<OfficialV3SyncRun | null> {
+    return this.officialSyncStore().getRun();
+  }
+
+  getOfficialV3SyncStatus(): Promise<OfficialV3SyncStatusSummary | null> {
+    return readOfficialV3SyncStatus(this.officialSyncStore());
   }
 
   async insertItemDocument(item: Omit<ItemDocumentRow, 'id'>): Promise<void> {
@@ -1413,6 +1593,16 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
       await client.query(`DELETE FROM item_stock_locations WHERE item_id = $1`, [itemId]);
       await this.invalidateInventoryAuthority(client);
     });
+  }
+
+  /**
+   * Atomically replace one item's API v3 stock subtree without touching CSV stock rows.
+   * This is intentionally narrower than replaceItemStockLocations(), whose historical
+   * contract replaces every source row for an item.
+   */
+  async replaceApiInventoryBundle(item: ItemRow, rows: ItemStockLocationRow[]): Promise<void> {
+    this.assertApiInventoryBundle(item, rows);
+    await this.withVerifiedWrite((client) => this.writeApiInventoryBundle(client, item, rows));
   }
 
   async replaceInventorySnapshot(snapshot: InventorySnapshot): Promise<void> {
@@ -2284,7 +2474,8 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
 
   private async invalidateInventoryAuthority(
     client: PoolClient,
-    persistState = true
+    persistState = true,
+    clearAllProvenance = false
   ): Promise<CacheState | null> {
     const stateResult = await client.query<{ value: string }>(
       `SELECT value FROM cache_meta WHERE key = 'state' FOR UPDATE`
@@ -2292,7 +2483,11 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
     const currentState = this.parseCacheState(stateResult.rows[0]?.value);
     await client.query(`DELETE FROM cache_meta WHERE key = $1`, [INVENTORY_SNAPSHOT_META_KEY]);
     if (!currentState) return null;
-    if (currentState.inventorySourceApiVersion !== '3') return currentState;
+    if (
+      currentState.inventorySourceApiVersion === undefined ||
+      (!clearAllProvenance && currentState.inventorySourceApiVersion !== '3')
+    )
+      return currentState;
     const nextState = { ...currentState };
     delete nextState.inventorySourceApiVersion;
     if (persistState && currentState.inventorySourceApiVersion !== undefined) {
@@ -2366,6 +2561,109 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
         this.assertValidInventorySnapshot(snapshot, binding.accountIdentity);
       },
     }));
+  }
+
+  private offsetStore(): PostgresDocumentOffsetStore {
+    return (this.documentOffsetStore ??= new PostgresDocumentOffsetStore({
+      withVerifiedWrite: (run) => this.withVerifiedWrite(run),
+      withReadOnlyTransaction: (run) => this.withReadOnlyTransaction(run),
+      accountIdentity: () => this.requireExpectedBinding().accountIdentity,
+      resolveDocument: async (client, doc) =>
+        (await this.normalizeDocumentForWrite(doc, client)) as unknown as DocumentRow,
+      writeDocument: (client, doc, lines) =>
+        this.writeResolvedDocumentBundle(client, doc as unknown as Record<string, unknown>, lines),
+      validateInventory: (item, rows) => this.assertApiInventoryBundle(item, rows),
+      writeInventory: (client, item, rows) => this.writeApiInventoryBundle(client, item, rows),
+    }));
+  }
+
+  private officialSyncStore(): PostgresOfficialV3SyncStore {
+    return (this.officialV3SyncStore ??= new PostgresOfficialV3SyncStore({
+      withVerifiedWrite: (run) => this.withVerifiedWrite(run),
+      withReadOnlyTransaction: (run) => this.withReadOnlyTransaction(run),
+      accountIdentity: () => this.requireExpectedBinding().accountIdentity,
+      resolveDocument: async (client, doc) =>
+        (await this.normalizeDocumentForWrite(doc, client)) as unknown as DocumentRow,
+      resolveDocumentIdByApiId: (client, apiDocId) =>
+        this.resolveApiOwnedDocumentId(client, apiDocId),
+      writeDocument: (client, doc, lines) =>
+        this.writeResolvedDocumentBundle(client, doc as unknown as Record<string, unknown>, lines),
+      deleteDocument: (client, docId) => this.deleteDocumentInTransaction(client, docId),
+      validateInventory: (item, rows) => this.assertApiInventoryBundle(item, rows),
+      writeInventory: (client, item, rows) => this.writeApiInventoryBundle(client, item, rows),
+      deleteApiInventory: (client, itemId) => this.deleteApiInventoryBundle(client, itemId),
+    }));
+  }
+
+  private assertApiInventoryBundle(item: ItemRow, rows: ItemStockLocationRow[]): void {
+    const issue = inventorySnapshotRowsIssue([item], rows);
+    if (issue !== null) throw new Error(`API inventory bundle is invalid: ${issue}.`);
+  }
+
+  private async writeApiInventoryBundle(
+    client: PoolClient,
+    item: ItemRow,
+    rows: ItemStockLocationRow[]
+  ): Promise<void> {
+    // Reject a generated v3 stock identity that would overwrite CSV or another item's row.
+    if (rows.length) {
+      const collision = await client.query(
+        `SELECT stock_row_id FROM item_stock_locations WHERE stock_row_id = ANY($1::text[])
+         AND (cache_source <> 'api' OR item_id <> $2)`,
+        [rows.map((row) => row.stock_row_id), item.item_id]
+      );
+      if (collision.rows.length) throw new Error('API inventory stock identity conflict.');
+    }
+    await client.query(
+      this.upsertSql('items', ITEM_COLUMNS, 'item_id'),
+      this.valuesFor(ITEM_COLUMNS, this.normalizeItem(item))
+    );
+    await client.query(
+      `DELETE FROM item_stock_locations WHERE item_id = $1 AND cache_source = 'api'`,
+      [item.item_id]
+    );
+    for (const row of rows) {
+      await client.query(
+        this.upsertSql('item_stock_locations', STOCK_COLUMNS, 'stock_row_id'),
+        this.valuesFor(STOCK_COLUMNS, this.normalizeStock(row))
+      );
+    }
+    await this.invalidateInventoryAuthority(client, true, true);
+  }
+
+  private async deleteApiInventoryBundle(client: PoolClient, itemId: string): Promise<void> {
+    await client.query(`DELETE FROM item_stock_locations WHERE item_id = $1 AND cache_source = 'api'`, [
+      itemId,
+    ]);
+    await client.query(`
+      UPDATE items AS item
+      SET cache_source = 'csv', source_api_version = NULL
+      WHERE item.item_id = $1
+        AND item.cache_source = 'api'
+        AND EXISTS (
+          SELECT 1 FROM item_stock_locations AS stock
+          WHERE stock.item_id = item.item_id AND stock.cache_source = 'csv'
+        )
+    `, [itemId]);
+    await client.query(`DELETE FROM items WHERE item_id = $1 AND cache_source = 'api'`, [itemId]);
+    await this.invalidateInventoryAuthority(client, true, true);
+  }
+
+  private async deleteDocumentInTransaction(client: PoolClient, docId: string): Promise<void> {
+    await client.query(`DELETE FROM documents WHERE doc_id = $1`, [docId]);
+  }
+
+  private async resolveApiOwnedDocumentId(
+    client: PoolClient,
+    apiDocId: string
+  ): Promise<string | null> {
+    const result = await client.query<{ doc_id: string }>(
+      `SELECT doc_id FROM documents
+       WHERE api_doc_id = $1 AND cache_source = 'api'
+       FOR UPDATE`,
+      [apiDocId]
+    );
+    return result.rows[0]?.doc_id ?? null;
   }
 
   private syncLockKey(binding: CacheAccountBinding): string {
@@ -2836,15 +3134,15 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
     assertWellFormedDocumentApiId(doc.api_doc_id);
     const existingByApiId = doc.api_doc_id
       ? (
-          await executor.query<DocumentIdentityRow>(
-            `SELECT doc_id, api_doc_id FROM documents WHERE api_doc_id = $1`,
+        await executor.query<DocumentIdentityRow>(
+            `SELECT doc_id, api_doc_id, archived, user_id, salesperson_name FROM documents WHERE api_doc_id = $1`,
             [doc.api_doc_id]
           )
         ).rows[0]
       : undefined;
     const existingByNumber = (
       await executor.query<DocumentIdentityRow>(
-        `SELECT doc_id, api_doc_id FROM documents WHERE context_id = $1 AND doc_number = $2`,
+        `SELECT doc_id, api_doc_id, archived, user_id, salesperson_name FROM documents WHERE context_id = $1 AND doc_number = $2`,
         [doc.context_id, doc.doc_number]
       )
     ).rows[0];
@@ -2858,7 +3156,61 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
       throw new Error('Cache document identity conflict.');
     }
     const existing = existingByApiId ?? existingByNumber;
-    return this.normalizeDocument(existing ? { ...doc, doc_id: existing.doc_id } : doc);
+    const needsDirectoryName =
+      !hasObservedSalespersonName(doc) &&
+      doc.user_id !== null &&
+      (doc.user_id !== undefined || existing?.user_id != null);
+    const assignment = resolveSalespersonAssignmentForWrite(
+      doc,
+      existing,
+      needsDirectoryName ? await this.readSalespersonDirectory(executor) : null
+    );
+    return this.normalizeDocument(
+      existing
+        ? {
+            ...doc,
+            doc_id: existing.doc_id,
+            archived: doc.archived == null ? existing.archived : doc.archived,
+            user_id: assignment.user_id,
+            salesperson_name: assignment.salesperson_name,
+          }
+        : { ...doc, user_id: assignment.user_id, salesperson_name: assignment.salesperson_name }
+    );
+  }
+
+  private async readSalespersonDirectory(
+    executor: QueryExecutor,
+    expectedAccountIdentity = this.requireExpectedBinding().accountIdentity
+  ): Promise<SalespersonDirectorySnapshot | null> {
+    const row = (
+      await executor.query<{ value: string }>(
+        `SELECT value FROM cache_meta WHERE key = $1`,
+        [SALESPERSON_DIRECTORY_META_KEY]
+      )
+    ).rows[0];
+    if (!row) return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.value);
+    } catch {
+      throw new Error('Salesperson directory is invalid.');
+    }
+    assertSalespersonDirectorySnapshot(parsed);
+    if (parsed.accountIdentity !== expectedAccountIdentity) {
+      throw new Error('Salesperson directory account does not match the PostgreSQL cache binding.');
+    }
+    return parsed;
+  }
+
+  private async writeSalespersonDirectory(
+    executor: QueryExecutor,
+    snapshot: SalespersonDirectorySnapshot
+  ): Promise<void> {
+    await executor.query(
+      `INSERT INTO cache_meta (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [SALESPERSON_DIRECTORY_META_KEY, JSON.stringify(snapshot)]
+    );
   }
 
   private normalizeItemDocument(item: Omit<ItemDocumentRow, 'id'>): Record<string, unknown> {
@@ -2899,6 +3251,11 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
   private coerceDocument(row: DocumentRow): DocumentRow {
     return {
       ...row,
+      modified: Number(row.modified),
+      imported_at: row.imported_at == null ? null : Number(row.imported_at),
+      total_price: row.total_price == null ? null : Number(row.total_price),
+      total_cost: row.total_cost == null ? null : Number(row.total_cost),
+      subtotal: row.subtotal == null ? null : Number(row.subtotal),
       shipped_percent: row.shipped_percent == null ? null : Number(row.shipped_percent),
     };
   }
@@ -2971,6 +3328,9 @@ export class PostgresCacheService implements CacheService, InventoryChangeFeedCa
 interface DocumentIdentityRow {
   doc_id: string;
   api_doc_id: string | null;
+  archived?: 0 | 1 | null;
+  user_id?: string | null;
+  salesperson_name?: string | null;
 }
 
 const assertWellFormedDocumentApiId = (value: unknown): void => {
@@ -2985,7 +3345,12 @@ const assertWellFormedStoredDocumentIdentity = (value: DocumentIdentityRow | und
     (typeof value.doc_id !== 'string' ||
       value.doc_id.length === 0 ||
       (value.api_doc_id !== null &&
-        (typeof value.api_doc_id !== 'string' || hasUnpairedUtf16Surrogate(value.api_doc_id))))
+        (typeof value.api_doc_id !== 'string' || hasUnpairedUtf16Surrogate(value.api_doc_id))) ||
+      (value.user_id != null &&
+        (typeof value.user_id !== 'string' || hasUnpairedUtf16Surrogate(value.user_id))) ||
+      (value.salesperson_name != null &&
+        (typeof value.salesperson_name !== 'string' ||
+          hasUnpairedUtf16Surrogate(value.salesperson_name))))
   ) {
     throw new Error('Cached document identity is invalid.');
   }

@@ -40,6 +40,7 @@ function snapshot(overrides: Partial<ResumeCacheSnapshot> = {}): ResumeCacheSnap
     itemCount: 40,
     stockLocationCount: 50,
     lastAccountSync: 100,
+    lastDocumentSync: 150,
     lastItemSync: 200,
     lastDeletedSync: 300,
     ...overrides,
@@ -151,11 +152,11 @@ describe('FullResumeCheckpointStore', () => {
     }
   });
 
-  it('creates v5 checkpoints with sanitized resumable phase results', () => {
+  it('creates current checkpoints with sanitized resumable phase results', () => {
     const store = createStore();
     const checkpoint = store.loadOrCreate();
 
-    expect(checkpoint.version).toBe(5);
+    expect(checkpoint.version).toBe(6);
     expect(checkpoint.phaseResults).toEqual({});
 
     store.markPhaseStarted(checkpoint, 'documents');
@@ -621,6 +622,7 @@ describe('FullResumeCheckpointStore', () => {
 
   it.each([
     ['accounts', { lastAccountSync: 101 }],
+    ['documents', { lastDocumentSync: 151 }],
     ['documents', { paymentSyncStatusFingerprint: 'b'.repeat(64) }],
     ['items', { lastItemSync: 201 }],
   ])('rejects deleted-log resume when completed %s authority changed', (phase, changes) => {

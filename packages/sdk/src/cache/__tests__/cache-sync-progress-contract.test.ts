@@ -133,7 +133,7 @@ describe('cache sync progress contracts', () => {
     ['pages', { count: '0' }],
     ['count', { pages: '0' }],
   ])(
-    'keeps account totals indeterminate when %s metadata is missing',
+    'rejects account pages when %s metadata is missing',
     async (_missing, response) => {
       const events: CacheSyncProgress[] = [];
       const cache = {
@@ -145,17 +145,196 @@ describe('cache sync progress contracts', () => {
         customers: { list: jest.fn(async () => ({ page: '1', customers: [], ...response })) },
       } as unknown as SalesBinderClient;
 
-      await new AccountIndexerService(client, cache, 'test').sync({
-        onProgressEvent: (event) => events.push(event),
-      });
+      await expect(
+        new AccountIndexerService(client, cache, 'test').sync({
+          onProgressEvent: (event) => events.push(event),
+        })
+      ).rejects.toThrow(/account pagination/i);
 
-      expect(events.at(-1)).toMatchObject({
-        event: 'phase_completed',
-        recordsTotal: null,
-        indeterminate: true,
-      });
+      expect(cache.batchInsertAccounts).not.toHaveBeenCalled();
+      expect(cache.setCacheState).not.toHaveBeenCalled();
+      expect(events.some(({ event }) => event === 'phase_completed')).toBe(false);
     }
   );
+
+  it.each(['0', '1'])('accepts an empty account result reported with %s total pages', async (pages) => {
+    const cache = {
+      getCacheState: jest.fn(async () => null),
+      batchInsertAccounts: jest.fn(async () => undefined),
+      setCacheState: jest.fn(async () => undefined),
+    } as unknown as CacheService;
+    const client = {
+      customers: {
+        list: jest.fn(async () => ({ count: '0', page: '1', pages, customers: [] })),
+      },
+    } as unknown as SalesBinderClient;
+
+    await expect(new AccountIndexerService(client, cache, 'test').sync()).resolves.toMatchObject({
+      accountsProcessed: 0,
+    });
+    expect(cache.batchInsertAccounts).not.toHaveBeenCalled();
+    expect(cache.setCacheState).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an empty zero-count account result with more than one page', async () => {
+    const cache = {
+      getCacheState: jest.fn(async () => null),
+      batchInsertAccounts: jest.fn(async () => undefined),
+      setCacheState: jest.fn(async () => undefined),
+    } as unknown as CacheService;
+    const client = {
+      customers: {
+        list: jest.fn(async () => ({ count: '0', page: '1', pages: '2', customers: [] })),
+      },
+    } as unknown as SalesBinderClient;
+
+    await expect(new AccountIndexerService(client, cache, 'test').sync()).rejects.toThrow(
+      /account pagination/i
+    );
+    expect(cache.batchInsertAccounts).not.toHaveBeenCalled();
+    expect(cache.setCacheState).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['wrong requested page', { count: '1', page: '2', pages: '1' }],
+    ['zero pages with a row', { count: '1', page: '1', pages: '0' }],
+    ['final count mismatch', { count: '2', page: '1', pages: '1' }],
+    ['pages above the safety bound', { count: '1', page: '1', pages: '10001' }],
+    ['count above the safety bound', { count: '1000001', page: '1', pages: '1' }],
+    ['zero count with a row', { count: '0', page: '1', pages: '1' }],
+  ])('rejects %s account pagination before cache mutation', async (_label, pagination) => {
+    const cache = {
+      getCacheState: jest.fn(async () => null),
+      batchInsertAccounts: jest.fn(async () => undefined),
+      setCacheState: jest.fn(async () => undefined),
+    } as unknown as CacheService;
+    const client = {
+      customers: {
+        list: jest.fn(async ({ contextId }: { contextId: ContextId }) => ({
+          ...pagination,
+          customers: [customer('account-1', contextId)],
+        })),
+      },
+    } as unknown as SalesBinderClient;
+
+    await expect(new AccountIndexerService(client, cache, 'test').sync()).rejects.toThrow(
+      /account pagination/i
+    );
+
+    expect(cache.batchInsertAccounts).not.toHaveBeenCalled();
+    expect(cache.setCacheState).not.toHaveBeenCalled();
+  });
+
+  it('rejects changed account pagination and duplicate identities without advancing state', async () => {
+    const cache = {
+      getCacheState: jest.fn(async () => null),
+      batchInsertAccounts: jest.fn(async () => undefined),
+      setCacheState: jest.fn(async () => undefined),
+    } as unknown as CacheService;
+    const list = jest.fn(async ({ contextId, page }: { contextId: ContextId; page: number }) =>
+      page === 1
+        ? {
+            count: '2',
+            page: '1',
+            pages: '2',
+            customers: [customer('duplicate-account', contextId)],
+          }
+        : {
+            count: '2',
+            page: '2',
+            pages: '2',
+            customers: [customer('duplicate-account', contextId)],
+          }
+    );
+
+    await expect(
+      new AccountIndexerService(
+        { customers: { list } } as unknown as SalesBinderClient,
+        cache,
+        'test'
+      ).sync()
+    ).rejects.toThrow(/duplicate/i);
+
+    expect(cache.batchInsertAccounts).toHaveBeenCalledTimes(1);
+    expect(cache.setCacheState).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['count', { count: '3', page: '2', pages: '2' }],
+    ['pages', { count: '2', page: '2', pages: '3' }],
+  ])('rejects a changed account %s after preserving only the valid page', async (_field, page2) => {
+    const cache = {
+      getCacheState: jest.fn(async () => null),
+      batchInsertAccounts: jest.fn(async () => undefined),
+      setCacheState: jest.fn(async () => undefined),
+    } as unknown as CacheService;
+    const list = jest.fn(async ({ contextId, page }: { contextId: ContextId; page: number }) =>
+      page === 1
+        ? {
+            count: '2',
+            page: '1',
+            pages: '2',
+            customers: [customer('account-1', contextId)],
+          }
+        : { ...page2, customers: [customer('account-2', contextId)] }
+    );
+
+    await expect(
+      new AccountIndexerService(
+        { customers: { list } } as unknown as SalesBinderClient,
+        cache,
+        'test'
+      ).sync()
+    ).rejects.toThrow(/account pagination/i);
+
+    expect(cache.batchInsertAccounts).toHaveBeenCalledTimes(1);
+    expect(cache.setCacheState).not.toHaveBeenCalled();
+  });
+
+  it('persists the account scan start rather than its finish time', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(100_000);
+    let liveState: CacheState = {
+      lastSync: 50,
+      lastFullSync: 40,
+      documentCount: 0,
+      itemDocumentCount: 0,
+      accountName: 'test',
+      schemaVersion: 8,
+    };
+    const cache = {
+      getCacheState: jest.fn(async () => liveState),
+      batchInsertAccounts: jest.fn(async () => undefined),
+      setCacheState: jest.fn(async (state: CacheState) => {
+        liveState = state;
+      }),
+    } as unknown as CacheService;
+    const list = jest.fn(async (_request: { modifiedSince: number }) => {
+      now.mockReturnValue(200_000);
+      return { count: '0', page: '1', pages: '0', customers: [] };
+    });
+
+    try {
+      await new AccountIndexerService(
+        { customers: { list } } as unknown as SalesBinderClient,
+        cache,
+        'test',
+        0
+      ).sync();
+      expect(liveState.lastAccountSync).toBe(100);
+      expect(list).toHaveBeenCalledTimes(2);
+      expect(list.mock.calls.every(([request]) => request.modifiedSince === 50)).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('validates account and deleted-log lookbacks at construction', () => {
+    const client = {} as SalesBinderClient;
+    const cache = {} as CacheService;
+
+    expect(() => new AccountIndexerService(client, cache, 'test', -1)).toThrow(/lookback/i);
+    expect(() => new DeletedLogSyncService(client, cache, 'test', 'junk')).toThrow(/lookback/i);
+  });
 
   it('excludes item tombstone requests and item deletes by default', async () => {
     const list = jest.fn(async ({ contextId }: { contextId: number }) =>
@@ -286,6 +465,76 @@ describe('cache sync progress contracts', () => {
       apiVersion: '2.0',
     });
     expect(JSON.stringify(events)).not.toContain('item-owned-by-v3');
+  });
+
+  it('persists the deleted-log scan start and leaves empty-cache global watermarks unclaimed', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(100_000);
+    let liveState: CacheState | null = null;
+    const cache = deletedCache({
+      getCacheState: jest.fn(async () => liveState),
+      setCacheState: jest.fn(async (state: CacheState) => {
+        liveState = state;
+      }),
+    });
+    const list = jest.fn(async () => {
+      now.mockReturnValue(200_000);
+      return { count: '0', page: '1', pages: '0', deletedlog: [] };
+    });
+
+    try {
+      await new DeletedLogSyncService(
+        { deletedLog: { list } } as unknown as SalesBinderClient,
+        cache,
+        'test',
+        0
+      ).sync();
+
+      expect(liveState).toMatchObject({
+        lastSync: 0,
+        lastFullSync: 0,
+        lastDeletedSync: 100,
+      });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('uses the previous deleted-log cutoff while persisting the scan start', async () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(100_000);
+    let liveState: CacheState = {
+      lastSync: 40,
+      lastFullSync: 30,
+      documentCount: 0,
+      itemDocumentCount: 0,
+      accountName: 'test',
+      schemaVersion: 8,
+      lastDeletedSync: 50,
+    };
+    const cache = deletedCache({
+      getCacheState: jest.fn(async () => liveState),
+      setCacheState: jest.fn(async (state: CacheState) => {
+        liveState = state;
+      }),
+    });
+    const list = jest.fn(async (_request: { deletedSince: number }) => {
+      now.mockReturnValue(200_000);
+      return { count: '0', page: '1', pages: '0', deletedlog: [] };
+    });
+
+    try {
+      await new DeletedLogSyncService(
+        { deletedLog: { list } } as unknown as SalesBinderClient,
+        cache,
+        'test',
+        0
+      ).sync();
+
+      expect(liveState.lastDeletedSync).toBe(100);
+      expect(list).toHaveBeenCalledTimes(5);
+      expect(list.mock.calls.every(([request]) => request.deletedSince === 50)).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it('rejects a cross-context deleted-log page before deleting any record', async () => {

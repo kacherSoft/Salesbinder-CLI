@@ -43,7 +43,12 @@ describe('V3InventoryIndexerService', () => {
 
     const result = await service.sync();
 
-    expect(list).toHaveBeenCalledWith({ page: 1, limit: 100, archived: 'all' });
+    expect(list).toHaveBeenCalledWith({
+      page: 1,
+      limit: 100,
+      archived: 'all',
+      include_sold: true,
+    });
     expect(list).toHaveBeenCalledTimes(3);
     expect(listVariations).toHaveBeenCalledWith(item.id, {
       page: 1,

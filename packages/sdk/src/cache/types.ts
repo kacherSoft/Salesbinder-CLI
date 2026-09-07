@@ -895,6 +895,8 @@ export interface CacheState {
   categoryCount?: number;
   stockLocationCount?: number;
   lastAccountSync?: number;
+  /** Start of the last clean document scan; absent on legacy caches. */
+  lastDocumentSync?: number;
   lastCategorySync?: number;
   lastItemSync?: number;
   lastFullItemSync?: number;

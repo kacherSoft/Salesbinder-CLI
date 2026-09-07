@@ -301,6 +301,101 @@ describe('CacheSyncProgressReporter', () => {
     expect(JSON.stringify(statuses.at(-1))).not.toMatch(/Authorization|Bearer|secret|Infinity/);
   });
 
+  it('preserves document mode and context counters while rejecting invalid context fields', async () => {
+    const statuses: CacheSyncStatus[] = [];
+    const reporter = new CacheSyncProgressReporter(
+      cacheWithWriter(async (status) => {
+        statuses.push(status);
+      }),
+      context,
+      { now: () => 100_000 }
+    );
+
+    await reporter.markRunning();
+    reporter.emit(
+      progress('phase_completed', {
+        phaseMode: 'delta',
+        contextId: 5,
+        contextRecordsProcessed: 12,
+        contextRecordsTotal: 827,
+        page: 17,
+        pagesTotal: 17,
+        recordsProcessed: 12,
+        recordsTotal: null,
+        indeterminate: true,
+      })
+    );
+    await reporter.flush();
+
+    expect(statuses.at(-1)?.progress).toEqual(
+      expect.objectContaining({
+        phaseMode: 'delta',
+        contextId: 5,
+        contextRecordsProcessed: 12,
+        contextRecordsTotal: 827,
+        page: 17,
+        pagesTotal: 17,
+        recordsTotal: null,
+        indeterminate: true,
+      })
+    );
+
+    reporter.emit({
+      ...progress('phase_completed'),
+      phaseMode: 'delta',
+      contextId: 999 as never,
+      contextRecordsProcessed: Number.POSITIVE_INFINITY,
+      contextRecordsTotal: 'secret' as never,
+    } as unknown as CacheSyncProgress);
+    await reporter.flush();
+    expect(statuses.at(-1)?.progress).not.toHaveProperty('contextId', 999);
+    expect(statuses.at(-1)?.progress).not.toHaveProperty('contextRecordsProcessed');
+    expect(statuses.at(-1)?.progress).not.toHaveProperty('contextRecordsTotal');
+  });
+
+  it('carries document scope through a rate-limit wait without changing aggregate totals', async () => {
+    const statuses: CacheSyncStatus[] = [];
+    const reporter = new CacheSyncProgressReporter(
+      cacheWithWriter(async (status) => {
+        statuses.push(status);
+      }),
+      context,
+      { now: () => 100_000 }
+    );
+
+    await reporter.markRunning();
+    reporter.emit(
+      progress('record_processed', {
+        phaseMode: 'full',
+        contextId: 4,
+        contextRecordsProcessed: 50,
+        contextRecordsTotal: null,
+        recordsProcessed: 50,
+        recordsTotal: null,
+      })
+    );
+    await reporter.flush();
+    reporter.emitRateLimit('documents', {
+      type: 'wait',
+      apiVersion: 'v2',
+      waitMs: 500,
+      waitUntil: 101,
+    });
+    await reporter.flush();
+
+    expect(statuses.at(-1)?.progress).toEqual(
+      expect.objectContaining({
+        event: 'waiting_rate_limit',
+        phaseMode: 'full',
+        contextId: 4,
+        contextRecordsProcessed: 50,
+        contextRecordsTotal: null,
+        recordsProcessed: 50,
+        recordsTotal: null,
+      })
+    );
+  });
+
   it('writes a terminal status last and ignores all later progress or terminal attempts', async () => {
     let now = 100_000;
     const statuses: CacheSyncStatus[] = [];

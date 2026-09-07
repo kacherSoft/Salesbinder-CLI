@@ -56,6 +56,9 @@ describe('V3InventoryBaselineService', () => {
       harness.order.indexOf('items.list')
     );
     expect(harness.order.filter((entry) => entry === 'items.list')).toHaveLength(2);
+    expect(harness.client.items.list).toHaveBeenCalledWith(
+      expect.objectContaining({ archived: 'all', include_sold: true })
+    );
     expect(harness.order.lastIndexOf('items.list')).toBeLessThan(
       harness.order.indexOf('items.getMany')
     );

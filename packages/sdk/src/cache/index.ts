@@ -87,3 +87,14 @@ export type {
   CsvImportResult,
   CsvImportWarnings,
 } from './csv-cache-import.types.js';
+export { resolveSyncLookbackSeconds } from './sync-lookback.js';
+export * from './document-offset-sync.types.js';
+export * from './document-offset-sync.service.js';
+export { createDocumentOffsetSyncService } from './document-offset-client.factory.js';
+export * from './official-v3-sync.types.js';
+export * from './official-v3-sync.service.js';
+export { readOfficialV3SyncStatus } from './official-v3-sync-status.js';
+export { createOfficialV3SyncService } from './official-v3-sync-client.factory.js';
+export { PostgresOfficialV3SyncStore } from './postgres-official-v3-sync.store.js';
+export type { PostgresOfficialV3SyncStoreOptions } from './postgres-official-v3-sync.store.js';
+export * from './salesperson-directory.js';

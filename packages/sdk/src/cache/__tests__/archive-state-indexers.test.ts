@@ -239,7 +239,9 @@ describe('cache archive-state indexers', () => {
       getStockLocationCount: jest.fn(async () => 0),
     } as any;
     const emptyClient = {
-      customers: { list: jest.fn(async () => ({ customers: [] })) },
+      customers: {
+        list: jest.fn(async () => ({ count: '0', page: '1', pages: '0', customers: [] })),
+      },
       items: { list: jest.fn(async () => ({ items: [] })) },
     } as any;
 

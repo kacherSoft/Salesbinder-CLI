@@ -6,6 +6,7 @@ import type { CacheSyncProgress, CacheSyncProgressCallback } from './cache-sync-
 import type { CacheState } from './types.js';
 import { CACHE_SCHEMA_VERSION } from './types.js';
 import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
+import { resolveSyncLookbackSeconds } from './sync-lookback.js';
 
 export interface DeletedLogSyncResult {
   deletedRecordsProcessed: number;
@@ -46,14 +47,18 @@ export class DeletedLogSyncService {
     private readonly client: SalesBinderClient,
     private readonly cache: CacheService,
     private readonly accountName: string,
-    private readonly syncLookbackSeconds = 604800
+    syncLookbackSeconds: unknown = undefined
   ) {
+    this.syncLookbackSeconds = resolveSyncLookbackSeconds(syncLookbackSeconds);
     if (hasUnpairedUtf16Surrogate(accountName)) {
       throw new Error('Deleted-log account name is invalid');
     }
   }
 
+  private readonly syncLookbackSeconds: number;
+
   async sync(options: DeletedLogSyncOptions = {}): Promise<DeletedLogSyncResult> {
+    const scanStartedAt = nowInSeconds();
     const includeItemDeletes = options.includeItemDeletes === true;
     this.emit(options.onProgressEvent, {
       event: 'phase_started',
@@ -84,7 +89,7 @@ export class DeletedLogSyncService {
     }
 
     const latestState = await this.cache.getCacheState();
-    await this.cache.setCacheState(this.mergeState(latestState, Math.floor(Date.now() / 1000)));
+    await this.cache.setCacheState(this.mergeState(latestState, scanStartedAt));
     const processed = results.reduce((sum, result) => sum + result.processed, 0);
     const total = sumKnownTotals(results.map(({ total: value }) => value));
     this.emit(options.onProgressEvent, {
@@ -292,8 +297,8 @@ export class DeletedLogSyncService {
   private mergeState(state: CacheState | null, now: number): CacheState {
     return {
       ...state,
-      lastSync: state?.lastSync ?? now,
-      lastFullSync: state?.lastFullSync ?? now,
+      lastSync: state?.lastSync ?? 0,
+      lastFullSync: state?.lastFullSync ?? 0,
       documentCount: state?.documentCount ?? 0,
       itemDocumentCount: state?.itemDocumentCount ?? 0,
       accountName: state?.accountName ?? this.accountName,
@@ -374,6 +379,10 @@ function compareDocumentTombstones(
 function compareUtf16CodeUnits(left: string, right: string): number {
   if (left === right) return 0;
   return left < right ? -1 : 1;
+}
+
+function nowInSeconds(): number {
+  return Math.floor(Date.now() / 1000);
 }
 
 function requireCanonicalDeletedLogRecordId(value: unknown): string {

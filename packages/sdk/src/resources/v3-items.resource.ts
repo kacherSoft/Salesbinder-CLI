@@ -8,6 +8,8 @@ export interface V3ItemListParams {
   page?: number;
   limit?: number;
   archived?: boolean | 'all';
+  /** Include sold unique items when enumerating a complete inventory root. */
+  include_sold?: boolean;
   ids?: readonly string[];
 }
 
