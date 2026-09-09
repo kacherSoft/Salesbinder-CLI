@@ -206,9 +206,11 @@ test('validates backup restore flags, account binding, and dump checksum', async
     await writeFile(manifestFile, `${JSON.stringify(manifest)}\n`);
     await chmod(manifestFile, 0o600);
     await validateBackup(manifestFile, binding);
+    await writeFile(manifestFile, `${JSON.stringify({ ...manifest, dumpFile: 'dump.bin' })}\n`);
+    await validateBackup(manifestFile, binding);
     await writeFile(manifestFile, `${JSON.stringify({ ...manifest, fullDecodeSucceeded: false })}\n`);
     await assert.rejects(() => validateBackup(manifestFile, binding), /backup manifest is invalid/);
-    await writeFile(manifestFile, `${JSON.stringify({ ...manifest, dumpSha256: `${'0'.repeat(64)}` })}\n`);
+    await writeFile(manifestFile, `${JSON.stringify({ ...manifest, dumpFile: 'dump.bin', dumpSha256: `${'0'.repeat(64)}` })}\n`);
     await assert.rejects(() => validateBackup(manifestFile, binding), /checksum differs/);
     await writeFile(manifestFile, `${JSON.stringify(manifest)}\n`);
     await assert.rejects(() => validateBackup(manifestFile, { ...binding, accountIdentity: 'salesbinder:other' }), /backup manifest is invalid/);

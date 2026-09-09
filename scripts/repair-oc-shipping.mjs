@@ -570,10 +570,11 @@ function stableJson(value) {
 export async function validateBackup(path, binding) {
   const manifest = await readPrivate(path);
   if (!manifest || manifest.disposableRestoreSucceeded !== true || manifest.restoredBindingMatches !== true || manifest.fullDecodeSucceeded !== true || manifest.containsCredentials !== false || manifest.containsDataValues !== false || typeof manifest.dumpFile !== 'string' || !Number.isSafeInteger(manifest.dumpBytes) || !/^[0-9a-f]{64}$/.test(manifest.dumpSha256 ?? '') || manifest.accountIdentitySha256 !== sha256(binding.accountIdentity) || manifest.accountSubdomainSha256 !== sha256(binding.accountSubdomain)) throw new Error('Verified external backup manifest is invalid.');
-  const dump = await lstat(manifest.dumpFile);
+  const dumpPath = resolve(dirname(resolve(path)), manifest.dumpFile);
+  const dump = await lstat(dumpPath);
   if (!dump.isFile() || dump.isSymbolicLink() || dump.size !== manifest.dumpBytes) throw new Error('Verified external backup dump is invalid.');
   const hash = createHash('sha256');
-  for await (const chunk of createReadStream(manifest.dumpFile)) hash.update(chunk);
+  for await (const chunk of createReadStream(dumpPath)) hash.update(chunk);
   if (hash.digest('hex') !== manifest.dumpSha256) throw new Error('Verified external backup dump checksum differs.');
 }
 async function writeBeforeImages(binding, plan, cache) {
