@@ -1869,6 +1869,19 @@ describe('SQLiteCacheService', () => {
       expect(retrieved?.issue_date).toBe('2026-01-29');
     });
 
+    it('preserves an unobserved associated document and clears an explicit null on upsert', async () => {
+      await service.insertDocument({ ...testDoc, associated_document_id: 'estimate-1001' });
+
+      await service.batchInsertDocuments([{ ...testDoc, issue_date: '2026-01-29' }]);
+      expect(await service.getDocument(testDoc.doc_id)).toMatchObject({
+        issue_date: '2026-01-29',
+        associated_document_id: 'estimate-1001',
+      });
+
+      await service.insertDocument({ ...testDoc, associated_document_id: null });
+      expect((await service.getDocument(testDoc.doc_id))?.associated_document_id).toBeNull();
+    });
+
     it('preserves known archive state when a document source reports unknown', async () => {
       await service.insertDocument({ ...testDoc, archived: 1 });
       await service.insertDocument({ ...testDoc, archived: null, issue_date: '2026-01-29' });
@@ -2295,6 +2308,34 @@ describe('SQLiteCacheService', () => {
       await service.replaceDocumentBundle(updatedDocument, [], []);
       expect(await service.getItemDocuments('payment-doc-1')).toEqual([]);
       expect(await service.getPaymentTransactions('payment-doc-1')).toEqual([]);
+    });
+
+    it('preserves an unobserved associated document and clears an explicit null on bundle replacement', async () => {
+      const existingDocument: DocumentRow = {
+        doc_id: 'payment-doc-1',
+        context_id: DocumentContextId.Invoice,
+        doc_number: 9001,
+        issue_date: '2026-02-01',
+        customer_id: 'cust-1',
+        modified: 1,
+        associated_document_id: 'estimate-9001',
+      };
+      await service.insertDocument(existingDocument);
+      const { associated_document_id: _unobservedAssociation, ...unobservedDocument } = existingDocument;
+
+      await service.replaceDocumentBundle(
+        { ...unobservedDocument, issue_date: '2026-02-10', modified: 2 },
+        []
+      );
+      expect((await service.getDocument(existingDocument.doc_id))?.associated_document_id).toBe(
+        'estimate-9001'
+      );
+
+      await service.replaceDocumentBundle(
+        { ...existingDocument, modified: 3, associated_document_id: null },
+        []
+      );
+      expect((await service.getDocument(existingDocument.doc_id))?.associated_document_id).toBeNull();
     });
 
     it('rolls back the complete document, line, and payment bundle when replacement fails', async () => {

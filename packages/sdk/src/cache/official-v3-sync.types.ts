@@ -1,4 +1,6 @@
 import type { DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
+import type { OCShippingPatch } from './postgres-oc-shipping.store.js';
+import type { OCShippingWarning } from './postgres-oc-shipping-warning.store.js';
 
 export const OFFICIAL_V3_SYNC_RESOURCES = [
   'item',
@@ -96,7 +98,9 @@ export interface OfficialV3SyncStore {
     runId: string,
     task: OfficialV3SyncTask,
     document: DocumentRow,
-    lines: Omit<ItemDocumentRow, 'id'>[]
+    lines: Omit<ItemDocumentRow, 'id'>[],
+    shippingPatch?: OCShippingPatch | null,
+    shippingWarning?: OCShippingWarning | null
   ): Promise<void>;
   applyDocumentDelete(runId: string, task: OfficialV3SyncTask): Promise<void>;
   retireLegacyItemRefreshTasks(runId: string): Promise<void>;

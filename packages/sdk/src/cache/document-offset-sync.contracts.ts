@@ -7,6 +7,7 @@ import type {
   OffsetTaskKind,
 } from './document-offset-sync.types.js';
 import type { V3ExactItemHydratorService } from './v3-exact-item-hydrator.service.js';
+import type { OCShippingDocumentsReadPort } from './oc-shipping.types.js';
 
 export interface DocumentOffsetSyncProgress {
   runId: string;
@@ -28,7 +29,7 @@ export interface DocumentOffsetSyncDependencies {
   cache: Pick<CacheService, 'getDocumentByApiId' | 'getDocumentByNumber'>;
   store: DocumentOffsetStore;
   documentsV2: Pick<DocumentsResource, 'list'>;
-  documentsV3: { get(contextId: 4 | 5 | 11, id: string): Promise<unknown> };
+  documentsV3: Partial<OCShippingDocumentsReadPort> & { get(contextId: 4 | 5 | 11, id: string): Promise<unknown> };
   hydrator: Pick<V3ExactItemHydratorService, 'hydrate'>;
   /** Epoch seconds, matching persisted cache timestamps. */
   now?: () => number;

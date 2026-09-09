@@ -1,4 +1,6 @@
 import type { DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
+import type { OCShippingPatch } from './postgres-oc-shipping.store.js';
+import type { OCShippingWarning } from './postgres-oc-shipping-warning.store.js';
 
 export type OffsetTaskKind = 'document' | 'item';
 export type OffsetTaskStatus = 'pending' | 'done' | 'failed';
@@ -37,7 +39,9 @@ export interface DocumentOffsetStore {
   /** Atomically retain old/new item references, replace document lines, and complete task. */
   applyOffsetDocumentBundle(
     runId: string, task: DocumentOffsetTask, document: DocumentRow,
-    lines: Omit<ItemDocumentRow, 'id'>[], refreshNotBefore: number
+    lines: Omit<ItemDocumentRow, 'id'>[], refreshNotBefore: number,
+    shippingPatch?: OCShippingPatch | null,
+    shippingWarning?: OCShippingWarning | null
   ): Promise<void>;
   /** Atomically replace this item's API subtree and complete its durable task. */
   applyOffsetInventoryBundle(

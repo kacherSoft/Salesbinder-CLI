@@ -530,7 +530,9 @@ function v3InvoicePayload(
         name: 'Widget',
         quantity: '1.0000',
         unit_price: '10.0000',
+        unit_cost: '5.0000',
         subtotal: '10.0000',
+        total_cost: '5.0000',
       },
     ],
   };

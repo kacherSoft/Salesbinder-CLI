@@ -1,10 +1,16 @@
 import type { AxiosInstance } from 'axios';
+import type { V3ListResponse } from '../types/items.types.js';
 import { ApiResponseValidationError } from './api-response-validation.error.js';
 import { validateV3ListResponse } from './v3-items.resource.js';
 
 export interface V3DocumentGetManyResult {
   records: Record<string, unknown>[];
   omittedIds: string[];
+}
+
+export interface V3SalesOrderListParams {
+  page?: number;
+  limit?: number;
 }
 
 /** Exact-ID reads only; the supplied v3 client owns authentication and pacing. */
@@ -18,6 +24,30 @@ export class V3DocumentsReadResource {
     }
     const response = await this.client.get<unknown>(`/${route}/${id}`);
     return response.data;
+  }
+
+  async getSalesOrder(id: string): Promise<unknown> {
+    if (!isCanonicalUuid(id)) {
+      throw new TypeError('Sales order lookup requires a canonical UUID');
+    }
+    const response = await this.client.get<unknown>(`/sales-orders/${id}`);
+    return response.data;
+  }
+
+  async listSalesOrders(
+    params?: V3SalesOrderListParams
+  ): Promise<V3ListResponse<Record<string, unknown>>> {
+    const response = await this.client.get<unknown>('/sales-orders', { params });
+    const page = validateV3ListResponse<Record<string, unknown>>(response.data, 'sales orders');
+    for (const value of page.data) {
+      if (!isSalesOrderRecord(value)) {
+        throw new ApiResponseValidationError(
+          'Invalid API v3 response for sales orders: expected canonical sales order identities',
+          'identity'
+        );
+      }
+    }
+    return page;
   }
 
   async getMany(contextId: 4 | 5 | 11, ids: readonly string[]): Promise<V3DocumentGetManyResult> {
@@ -86,6 +116,10 @@ function isDocumentRecord(
     value.object === objectFor(contextId) &&
     (value.context_id === undefined || value.context_id === contextId)
   );
+}
+
+function isSalesOrderRecord(value: unknown): value is Record<string, unknown> & { id: string } {
+  return isRecord(value) && isCanonicalUuid(value.id) && value.object === 'sales_order';
 }
 
 function objectFor(contextId: 4 | 5 | 11): 'estimate' | 'invoice' | 'purchase_order' {

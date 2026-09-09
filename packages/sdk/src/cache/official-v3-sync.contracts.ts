@@ -5,6 +5,7 @@ import type {
   OfficialV3SyncStore,
 } from './official-v3-sync.types.js';
 import type { V3ExactItemHydratorService } from './v3-exact-item-hydrator.service.js';
+import type { OCShippingDocumentsReadPort } from './oc-shipping.types.js';
 
 export interface OfficialV3SyncTransport {
   read(
@@ -14,7 +15,7 @@ export interface OfficialV3SyncTransport {
   ): Promise<OfficialV3SyncPageEnvelope>;
 }
 
-export interface OfficialV3DocumentReadPort {
+export interface OfficialV3DocumentReadPort extends Partial<OCShippingDocumentsReadPort> {
   get(contextId: 4 | 5 | 11, id: string): Promise<unknown>;
 }
 

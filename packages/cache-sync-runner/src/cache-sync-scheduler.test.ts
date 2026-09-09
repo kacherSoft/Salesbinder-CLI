@@ -143,6 +143,49 @@ test('fails closed on malformed state and classifies lock contention as a skip',
   expect(infos).toEqual(['SalesBinder sync-v3 skipped: another writer holds the PostgreSQL lock.']);
 });
 
+test('reports OC shipping warnings without changing official cursor action selection', async () => {
+  const calls: string[][] = [];
+  const warnings: string[] = [];
+  const infos: string[] = [];
+  let scheduler: ReturnType<typeof createCacheSyncScheduler>;
+  scheduler = createCacheSyncScheduler(config(), {
+    executor: executor(
+      [
+        { code: 0, output: clean },
+        {
+          code: 0,
+          output: JSON.stringify({
+            run: { status: 'success' },
+            state: { cursorGap: false },
+            tasks: { applied: 2, failed: 0, pending: 0 },
+            ocShipping: {
+              status: { status: 'success_with_warnings', failed: 1 },
+              failures: [{ code: 'source_document_not_found' }],
+            },
+          }),
+        },
+      ],
+      calls
+    ),
+    warn: (message) => warnings.push(message),
+    info: (message) => infos.push(message),
+    delay: async () => scheduler.stop(),
+  });
+
+  await scheduler.run();
+
+  expect(calls).toEqual([
+    ['--account', 'account', 'cache', 'sync-v3', '--status'],
+    ['--account', 'account', 'cache', 'sync-v3'],
+  ]);
+  expect(warnings).toContain(
+    'SalesBinder OC shipping reconciliation completed with warnings; the next cycle will retry its bounded source scan.'
+  );
+  expect(infos).toContain(
+    'SalesBinder sync-v3 result: status=success; applied=2; failed=0; pending=0; cursorGap=false; ocShippingStatus=success_with_warnings; ocShippingFailed=1.'
+  );
+});
+
 test('coalesces an overrun and delegates durable reference freshness to --if-stale', async () => {
   const calls: string[][] = [];
   const times = [0, 400_000];

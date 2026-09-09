@@ -81,11 +81,7 @@ function harness() {
         else meta.set(String(params[0]), String(params[1]));
       }
       if (sql.startsWith('DELETE FROM cache_meta')) meta.delete(String(params[0]));
-      if (
-        sql.startsWith(
-          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, customer_id, account_id, account_number, customer_number, supplier_number FROM documents'
-        )
-      )
+      if (sql.startsWith('SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location'))
         return { rows: [{ doc_id: 'canonical-doc', api_doc_id: 'api-doc', archived: 1 }] };
       if (sql.startsWith('SELECT item_id FROM item_documents'))
         return { rows: [{ item_id: 'removed-item' }, { item_id: 'new-item' }] };

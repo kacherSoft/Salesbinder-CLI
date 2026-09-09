@@ -6,6 +6,9 @@ import type {
   OffsetTaskKind,
 } from './document-offset-sync.types.js';
 import type { DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
+import type { OCShippingPatch } from './postgres-oc-shipping.store.js';
+import { applyOCShippingPatch, clearOCShippingAuthority, clearOCShippingEstimateUnknown, reconcileOCShippingAuthority } from './postgres-oc-shipping.store.js';
+import { deleteOCShippingWarning, writeOCShippingWarning, type OCShippingWarning } from './postgres-oc-shipping-warning.store.js';
 import { assertCanonicalV3SourceId } from './v3-inventory-source-validation.js';
 import {
   OFFSET_CURRENT_KEY,
@@ -166,7 +169,9 @@ export class PostgresDocumentOffsetStore implements DocumentOffsetStore {
     task: DocumentOffsetTask,
     document: DocumentRow,
     lines: Omit<ItemDocumentRow, 'id'>[],
-    refreshNotBefore: number
+    refreshNotBefore: number,
+    shippingPatch?: OCShippingPatch | null,
+    shippingWarning?: OCShippingWarning | null
   ): Promise<void> {
     assertOffsetTask('document', task, true);
     assertOffsetTimestamp(refreshNotBefore);
@@ -205,6 +210,27 @@ export class PostgresDocumentOffsetStore implements DocumentOffsetStore {
         resolved,
         lines.map((line) => ({ ...line, doc_id: resolved.doc_id }))
       );
+      await reconcileOCShippingAuthority(
+        client,
+        resolved.api_doc_id ?? resolved.doc_id,
+        resolved.associated_document_id ?? null
+      );
+      if (shippingWarning) {
+        if (
+          shippingWarning.contextId !== resolved.context_id ||
+          shippingWarning.documentId !== (resolved.api_doc_id ?? resolved.doc_id)
+        ) {
+          throw new Error('OC shipping warning does not match the document task.');
+        }
+        const sourceId = resolved.api_doc_id ?? resolved.doc_id;
+        if (resolved.context_id === 5) await clearOCShippingAuthority(client, sourceId);
+        else await clearOCShippingEstimateUnknown(client, sourceId);
+        if (shippingPatch) await applyOCShippingPatch(client, shippingPatch);
+        await writeOCShippingWarning(client, shippingWarning);
+      } else {
+        if (shippingPatch) await applyOCShippingPatch(client, shippingPatch);
+        if (resolved.context_id === 4 || resolved.context_id === 5) await deleteOCShippingWarning(client, resolved.context_id, resolved.api_doc_id ?? resolved.doc_id);
+      }
       await this.complete(client, runId, 'document', task, persisted);
     });
   }

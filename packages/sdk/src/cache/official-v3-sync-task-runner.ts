@@ -3,6 +3,8 @@ import { officialV3LocalFailure } from './official-v3-sync-failure.js';
 import type { OfficialV3SyncTask } from './official-v3-sync.types.js';
 import type { V3ExactItemHydrationResult } from './v3-exact-item-hydrator.service.js';
 import { normalizeOfficialV3DocumentCacheRows } from './v3-document-cache-normalizer.js';
+import { hydrateOcShippingPatchSafely } from './oc-shipping-hydrator.js';
+import type { OCShippingDocumentsReadPort } from './oc-shipping.types.js';
 import type { NormalizedV3InventoryItem } from './v3-inventory-normalizer.js';
 
 const DOCUMENT_CONTEXTS = { invoice: 5, estimate: 4, purchase_order: 11 } as const;
@@ -242,10 +244,42 @@ async function applyDocumentHydration(
     id: task.id,
     resource,
   });
-  await execution.deps.store.applyDocumentUpsert(
-    execution.runId,
-    task,
-    normalized.docRow,
-    normalized.itemRows
-  );
+  const shipping =
+    resource === 'invoice' || resource === 'estimate'
+      ? await hydrateShippingIfConfigured(execution.deps.documents, payload)
+      : undefined;
+  if (shipping) {
+    await execution.deps.store.applyDocumentUpsert(
+      execution.runId,
+      task,
+      normalized.docRow,
+      normalized.itemRows,
+      shipping.patch,
+      shipping.issues.length
+        ? {
+            contextId: contextId as 4 | 5,
+            documentId: task.id,
+            code: 'shipping_unknown',
+            updatedAt: execution.now(),
+          }
+        : null
+    );
+  } else {
+    await execution.deps.store.applyDocumentUpsert(
+      execution.runId, task, normalized.docRow, normalized.itemRows
+    );
+  }
+}
+
+async function hydrateShippingIfConfigured(
+  documents: {
+    get(contextId: 4 | 5 | 11, id: string): Promise<unknown>;
+    getSalesOrder?: (id: string) => Promise<unknown>;
+  },
+  payload: unknown
+) {
+  // Legacy direct construction remains supported for unit consumers. Production
+  // factories always provide this port and therefore always hydrate shipping.
+  if (!documents.getSalesOrder) return undefined;
+  return hydrateOcShippingPatchSafely(documents as OCShippingDocumentsReadPort, payload);
 }

@@ -19,11 +19,15 @@ export function createDocumentOffsetSyncService(
 ): DocumentOffsetSyncService {
   const v2 = createAxiosClient({ ...account, apiVersion: '2.0' }, runtimeOptions);
   const v3 = createV3AxiosClient(account, runtimeOptions);
+  const documents = new V3DocumentsReadResource(v3);
   return new DocumentOffsetSyncService({
     cache,
     store: cache,
     documentsV2: new DocumentsResource(v2),
-    documentsV3: new V3DocumentsReadResource(v3),
+    documentsV3: {
+      get: (contextId, id) => documents.get(contextId, id),
+      getSalesOrder: async (id) => (await v3.get<unknown>(`/sales-orders/${id}`)).data,
+    },
     hydrator: new V3ExactItemHydratorService({ items: new V3ItemsResource(v3) }),
     guard,
   });
