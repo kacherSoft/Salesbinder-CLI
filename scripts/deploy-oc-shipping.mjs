@@ -153,12 +153,41 @@ function assertApplication(app) {
     app?.build_pack !== 'dockerfile' ||
     app?.dockerfile_location !== '/Dockerfile' ||
     app?.health_check_enabled !== false ||
-    (app?.fqdn !== null && app?.fqdn !== '') ||
-    app?.settings?.is_auto_deploy_enabled !== false ||
-    app?.settings?.is_preview_deployments_enabled !== false
+    (app?.fqdn !== null && app?.fqdn !== '')
   ) {
     fail('unexpected_application_identity');
   }
+}
+
+function deploymentSettings(app) {
+  const settings = app?.settings;
+  if (settings === undefined || settings === null) {
+    return {
+      autoDeployEnabled: null,
+      previewDeploymentsEnabled: null,
+      source: 'unavailable_in_api_response',
+    };
+  }
+  const autoDeployEnabled = settings.is_auto_deploy_enabled;
+  const previewDeploymentsEnabled = settings.is_preview_deployments_enabled;
+  if (
+    (autoDeployEnabled !== undefined && typeof autoDeployEnabled !== 'boolean') ||
+    (previewDeploymentsEnabled !== undefined && typeof previewDeploymentsEnabled !== 'boolean')
+  )
+    fail('invalid_deployment_settings');
+  return {
+    autoDeployEnabled: autoDeployEnabled ?? null,
+    previewDeploymentsEnabled: previewDeploymentsEnabled ?? null,
+    source:
+      autoDeployEnabled === undefined || previewDeploymentsEnabled === undefined
+        ? 'partially_available_in_api_response'
+        : 'api_response',
+  };
+}
+
+function assertNoObservedEnabledDeploymentSetting(settings) {
+  if (settings.autoDeployEnabled === true || settings.previewDeploymentsEnabled === true)
+    fail('deployment_safety_setting_enabled');
 }
 
 function assertOldRunner(app, rows, logs, deployments) {
@@ -198,7 +227,8 @@ function logSummary(value) {
 }
 
 async function readState(request) {
-  const [app, envs, deployments, logs, oldApp] = await Promise.all([
+  const [version, app, envs, deployments, logs, oldApp] = await Promise.all([
+    request('/version'),
     request(`/applications/${APP_UUID}`),
     request(`/applications/${APP_UUID}/envs`),
     request(`/deployments/applications/${APP_UUID}`),
@@ -219,7 +249,19 @@ async function readState(request) {
     assertOldRunner(oldApp, oldEnvs, oldLogs, oldDeployments);
     oldRunner = 'disabled';
   }
-  return { app, envs, deployments, logs, oldRunner };
+  const apiVersion =
+    typeof version === 'string' && /^v?\d+\.\d+\.\d+(?:-[a-z0-9.-]+)?$/i.test(version)
+      ? version
+      : null;
+  return {
+    apiVersion,
+    app,
+    deploymentSettings: deploymentSettings(app),
+    envs,
+    deployments,
+    logs,
+    oldRunner,
+  };
 }
 
 function assertNoActive(deployments) {
@@ -256,6 +298,10 @@ export async function execute(argv, dependencies) {
         days: '1,2,3,4,5,6',
         hours: '07:00-22:00',
       },
+      deploymentSettings: {
+        ...state.deploymentSettings,
+        apiVersion: state.apiVersion,
+      },
       logs: logSummary(state.logs),
       rollbackSha: PRIOR_SHA,
     };
@@ -280,6 +326,7 @@ export async function execute(argv, dependencies) {
     write(result);
     return result;
   }
+  assertNoObservedEnabledDeploymentSetting(state.deploymentSettings);
   assertNoActive(state.deployments);
   if (state.app.git_commit_sha !== PRIOR_SHA) fail('current_release_sha_mismatch');
   const mainSha = await dependencies.remoteMainSha();
@@ -294,6 +341,11 @@ export async function execute(argv, dependencies) {
     configurationHash: hash,
     environmentRows: state.envs.length,
     noActiveDeployment: true,
+    deploymentSettings: {
+      ...state.deploymentSettings,
+      apiVersion: state.apiVersion,
+      preservedByPatchBody: true,
+    },
     environmentWrites: 0,
     rollbackSha: PRIOR_SHA,
   };
@@ -308,6 +360,7 @@ export async function execute(argv, dependencies) {
     dependencies.request(`/deployments/applications/${APP_UUID}`),
   ]);
   assertApplication(pinnedApp);
+  assertNoObservedEnabledDeploymentSetting(deploymentSettings(pinnedApp));
   assertSchedulerEnvironment(pinnedEnvs);
   assertNoActive(pinnedDeployments);
   if (pinnedApp.git_commit_sha !== args.sha) fail('target_pin_verification_failed');
@@ -320,6 +373,7 @@ export async function execute(argv, dependencies) {
     targetSha: args.sha,
     configurationHash: hash,
     configurationPreserved: true,
+    deploymentSettingsPreservedByPatchBody: true,
     environmentWrites: 0,
     rollbackSha: PRIOR_SHA,
   };
@@ -353,6 +407,7 @@ function requester(settings) {
     }
     if (response.status === 404 && options.allowNotFound) return null;
     if (!response.ok) fail(`coolify_http_${response.status}`);
+    if (path === '/version' && method === 'GET') return response.text();
     try {
       return await response.json();
     } catch {

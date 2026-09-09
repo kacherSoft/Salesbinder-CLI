@@ -48,7 +48,6 @@ function app(sha = PRIOR_SHA) {
     dockerfile_location: '/Dockerfile',
     health_check_enabled: false,
     fqdn: null,
-    settings: { is_auto_deploy_enabled: false, is_preview_deployments_enabled: false },
   };
 }
 const oldApp = {
@@ -78,6 +77,7 @@ function harness({
   const writes = [];
   const request = async (path, method = 'GET', body) => {
     calls.push({ path, method, body });
+    if (path === '/version') return '4.0.0-beta.463';
     if (path === `/applications/${APP_UUID}` && method === 'PATCH') {
       pinned = true;
       return {};
@@ -210,6 +210,12 @@ test('status verifies deployment and configuration hash without emitting values'
   assert.equal(result.deployment.belongsToApp, true);
   assert.equal(result.deployment.complete, true);
   assert.equal(result.configurationPreserved, true);
+  assert.deepEqual(result.deploymentSettings, {
+    autoDeployEnabled: null,
+    previewDeploymentsEnabled: null,
+    source: 'unavailable_in_api_response',
+    apiVersion: '4.0.0-beta.463',
+  });
   assert.doesNotMatch(JSON.stringify(result), /never-print-this/);
 });
 
@@ -236,14 +242,39 @@ test('existing retired runner must prove runtime containment and deployment quie
   );
 });
 
-test('missing active-app deployment safety flags fail before mutations', async () => {
-  const h = harness({ appPatch: { settings: {} } });
+test('observed enabled deployment safety flag fails before mutations', async () => {
+  const h = harness({
+    appPatch: {
+      settings: {
+        is_auto_deploy_enabled: true,
+        is_preview_deployments_enabled: false,
+      },
+    },
+  });
   await assert.rejects(
     () => execute(['--apply', '--sha', target, '--confirm-oc-shipping-release'], h.dependencies),
-    /unexpected_application_identity/
+    /deployment_safety_setting_enabled/
   );
   assert.equal(
     h.calls.some((call) => call.method !== 'GET'),
     false
   );
+});
+
+test('status reports observed deployment safety settings without blocking diagnostics', async () => {
+  const h = harness({
+    appPatch: {
+      settings: {
+        is_auto_deploy_enabled: false,
+        is_preview_deployments_enabled: true,
+      },
+    },
+  });
+  const result = await execute(['--status'], h.dependencies);
+  assert.deepEqual(result.deploymentSettings, {
+    autoDeployEnabled: false,
+    previewDeploymentsEnabled: true,
+    source: 'api_response',
+    apiVersion: '4.0.0-beta.463',
+  });
 });
