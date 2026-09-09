@@ -4,6 +4,7 @@ import type { Item, ItemListResponse, ItemVariationLocation } from '../types/ite
 import type { CacheService } from './cache.interface.js';
 import type { CacheState, CategorySnapshot, ItemRow, ItemStockLocationRow } from './types.js';
 import { CACHE_SCHEMA_VERSION } from './types.js';
+import { resolveAvailableQuantity } from './inventory-available-quantity.js';
 
 export interface ItemSyncResult {
   itemsProcessed: number;
@@ -89,6 +90,12 @@ export class ItemIndexerService {
   }
 
   private toItemRow(item: Item, categoryNames: Map<string, string> | null = null): ItemRow {
+    const reserved = observedNumber(item.quantity_reserved);
+    const available = resolveAvailableQuantity(
+      observedNumber(item.quantity_available),
+      item.quantity,
+      reserved
+    );
     return {
       item_id: item.id,
       item_number: item.item_number,
@@ -100,8 +107,9 @@ export class ItemIndexerService {
       category_id: item.category_id ?? item.category?.id ?? null,
       category_name: categoryName(item, categoryNames),
       quantity: item.quantity,
-      quantity_reserved: observedNumber(item.quantity_reserved),
-      quantity_available: observedNumber(item.quantity_available),
+      quantity_reserved: reserved,
+      quantity_available: available.quantityAvailable,
+      quantity_available_source: available.quantityAvailableSource,
       quantity_incoming: observedNumber(item.quantity_incoming),
       in_transit: observedNumber(item.in_transit),
       threshold: item.threshold,
@@ -125,6 +133,12 @@ export class ItemIndexerService {
     }
 
     if (rows.length === 0) {
+      const reserved = observedNumber(item.quantity_reserved);
+      const available = resolveAvailableQuantity(
+        observedNumber(item.quantity_available),
+        item.quantity,
+        reserved
+      );
       rows.push({
         stock_row_id: syntheticId('api-stock', item.id, item.location?.id ?? 'default'),
         item_id: item.id,
@@ -133,8 +147,9 @@ export class ItemIndexerService {
         location_name: item.location?.name ?? null,
         category_name: categoryName(item, categoryNames),
         quantity_on_hand: requiredNumber(item.quantity, 'item.quantity'),
-        quantity_reserved: observedNumber(item.quantity_reserved),
-        quantity_available: observedNumber(item.quantity_available),
+        quantity_reserved: reserved,
+        quantity_available: available.quantityAvailable,
+        quantity_available_source: available.quantityAvailableSource,
         quantity_incoming: observedNumber(item.quantity_incoming),
         in_transit: observedNumber(item.in_transit),
         price: item.price,
@@ -155,6 +170,12 @@ export class ItemIndexerService {
     categoryNames: Map<string, string> | null,
   ): ItemStockLocationRow {
     const quantity = requiredNumber(location.quantity, 'variation location quantity');
+    const reserved = observedNumber(location.quantity_reserved);
+    const available = resolveAvailableQuantity(
+      observedNumber(location.quantity_available),
+      quantity,
+      reserved
+    );
     return {
       stock_row_id: String(location.id ?? syntheticId('api-stock', item.id, variationId, location.location_id ?? 'none')),
       item_id: item.id,
@@ -164,8 +185,9 @@ export class ItemIndexerService {
       location_id: location.location_id ?? null,
       category_name: categoryName(item, categoryNames),
       quantity_on_hand: quantity,
-      quantity_reserved: observedNumber(location.quantity_reserved),
-      quantity_available: observedNumber(location.quantity_available),
+      quantity_reserved: reserved,
+      quantity_available: available.quantityAvailable,
+      quantity_available_source: available.quantityAvailableSource,
       quantity_incoming: observedNumber(location.quantity_incoming),
       in_transit: observedNumber(location.in_transit),
       price: item.price,

@@ -82,6 +82,7 @@ export interface V3Item {
   cost?: string | null;
   quantity: number;
   quantity_reserved: number;
+  quantity_available?: number | null;
   quantity_incoming: number;
   threshold: number;
   variation_count: number;
@@ -106,6 +107,7 @@ export interface V3ItemVariationLocation {
   location_name: string | null;
   quantity: number;
   quantity_reserved: number;
+  quantity_available?: number | null;
   quantity_incoming: number;
   in_transit: number;
   threshold: number | null;
@@ -120,6 +122,7 @@ export interface V3ItemVariation {
   unit_cost_override?: string | null;
   quantity: number;
   quantity_reserved: number;
+  quantity_available?: number | null;
   quantity_incoming: number;
   in_transit: number;
   location_count: number;

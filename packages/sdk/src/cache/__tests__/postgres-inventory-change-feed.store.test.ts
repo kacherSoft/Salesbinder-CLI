@@ -365,6 +365,58 @@ describe('PostgresInventoryChangeFeedStore', () => {
     expect(replayed).toEqual(promoted);
     expect(harness.liveInventoryItems()).toEqual([item(1), item(2), item(3)]);
   });
+
+  it('upgrades legacy staged availability at its original item and stock scopes', async () => {
+    const { store, harness } = createHarness();
+    const stagedItem = {
+      ...item(1),
+      quantity: 10,
+      quantity_reserved: 2,
+      quantity_available: 6,
+      quantity_available_source: 'api' as const,
+    };
+    const stagedStock = {
+      ...stock(1),
+      quantity_on_hand: 10,
+      quantity_reserved: 2,
+      quantity_available: 6,
+      quantity_available_source: 'api' as const,
+    };
+    const runId = '44444444-4444-4444-8444-444444444444';
+    await store.beginInventoryBaselineRun({
+      ...binding,
+      runId,
+      generation: 'legacy-staging-generation',
+      startEventSeq: '50',
+      rootFingerprint: createInventoryBaselineRootFingerprint(binding.accountIdentity, [stagedItem.item_id]),
+      rootItemIds: [stagedItem.item_id],
+      expectedItemCount: 1,
+      status: 'active',
+      startedAt: 170,
+      updatedAt: 170,
+      promotedAt: null,
+      failureCode: null,
+    });
+    await store.stageInventoryBaselineItem({
+      ...binding,
+      runId,
+      item: stagedItem,
+      stockRows: [stagedStock],
+      stagedAt: 171,
+    });
+    harness.makeStagingLegacy(stagedItem.item_id);
+
+    await store.promoteInventoryBaselineRun({ ...binding, runId, promotedAt: 180 });
+
+    expect(harness.liveInventoryItems()[0]).toMatchObject({
+      quantity_available: 8,
+      quantity_available_source: 'computed',
+    });
+    expect(harness.liveInventoryStock()[0]).toMatchObject({
+      quantity_available: 6,
+      quantity_available_source: 'api',
+    });
+  });
 });
 
 function createHarness(): {
@@ -374,6 +426,8 @@ function createHarness(): {
     sql: () => string;
     liveMutationCount: () => number;
     liveInventoryItems: () => ItemRow[];
+    liveInventoryStock: () => ItemStockLocationRow[];
+    makeStagingLegacy: (itemId: string) => void;
     orphanBaselineGeneration: (generation: string) => void;
     replacePromotedMeta: (meta: InventoryCacheMeta) => void;
   };
@@ -415,6 +469,15 @@ function createHarness(): {
           )
         ).length,
       liveInventoryItems: () => data.liveItems,
+      liveInventoryStock: () => data.liveStock,
+      makeStagingLegacy: (itemId) => {
+        const stagedItem = data.stagingItems.find((row) => row.item_id === itemId)?.item_payload;
+        const stagedStock = data.stagingStock.find((row) => row.stock_payload.item_id === itemId)
+          ?.stock_payload;
+        if (!stagedItem || !stagedStock) throw new Error('Missing fake staged inventory.');
+        delete stagedItem.quantity_available_source;
+        delete stagedStock.quantity_available_source;
+      },
       orphanBaselineGeneration: (generation) => {
         requireFeed(data, bindingValuesForTest(binding)).baseline_generation = generation;
       },
@@ -923,6 +986,9 @@ function item(index = 1): ItemRow {
     item_id: `00000000-0000-4000-8000-${index.toString().padStart(12, '0')}`,
     name: `Item ${index}`,
     quantity: index,
+    quantity_reserved: null,
+    quantity_available: null,
+    quantity_available_source: null,
     cache_source: 'api',
     source_api_version: '3',
   };
@@ -935,6 +1001,7 @@ function stock(index = 1): ItemStockLocationRow {
     quantity_on_hand: index,
     quantity_reserved: null,
     quantity_available: null,
+    quantity_available_source: null,
     quantity_incoming: null,
     in_transit: null,
     cache_source: 'api',
@@ -947,8 +1014,11 @@ function paramsToItem(params: unknown[]): ItemRow {
     item_id: params[0] as string,
     name: params[2] as string,
     quantity: params[9] as number,
-    cache_source: params[22] as 'api',
-    source_api_version: params[24] as '3',
+    quantity_reserved: params[10] as number | null,
+    quantity_available: params[11] as number | null,
+    quantity_available_source: params[12] as ItemRow['quantity_available_source'],
+    cache_source: params[23] as 'api',
+    source_api_version: params[25] as '3',
   };
 }
 
@@ -959,10 +1029,11 @@ function paramsToStock(params: unknown[]): ItemStockLocationRow {
     quantity_on_hand: params[8] as number,
     quantity_reserved: params[9] as number | null,
     quantity_available: params[10] as number | null,
-    quantity_incoming: params[11] as number | null,
-    in_transit: params[12] as number | null,
-    cache_source: params[17] as 'api',
-    source_api_version: params[19] as '3',
+    quantity_available_source: params[11] as ItemStockLocationRow['quantity_available_source'],
+    quantity_incoming: params[12] as number | null,
+    in_transit: params[13] as number | null,
+    cache_source: params[18] as 'api',
+    source_api_version: params[20] as '3',
   };
 }
 

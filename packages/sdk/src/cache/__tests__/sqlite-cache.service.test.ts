@@ -177,6 +177,7 @@ describe('SQLiteCacheService', () => {
           expect.objectContaining({
             quantity_reserved: null,
             quantity_available: null,
+            quantity_available_source: null,
             quantity_incoming: null,
             in_transit: null,
           })
@@ -185,6 +186,7 @@ describe('SQLiteCacheService', () => {
           expect.objectContaining({
             quantity_reserved: 5,
             quantity_available: 17,
+            quantity_available_source: null,
             quantity_incoming: 6,
             in_transit: 7,
           })
@@ -203,6 +205,7 @@ describe('SQLiteCacheService', () => {
             quantity_on_hand: 11,
             quantity_reserved: null,
             quantity_available: null,
+            quantity_available_source: null,
             quantity_incoming: null,
             in_transit: null,
             price: 19.5,
@@ -227,6 +230,7 @@ describe('SQLiteCacheService', () => {
             quantity_on_hand: 22,
             quantity_reserved: 5,
             quantity_available: 17,
+            quantity_available_source: null,
             quantity_incoming: 6,
             in_transit: 7,
             price: 29.5,
@@ -754,6 +758,11 @@ describe('SQLiteCacheService', () => {
       await service.insertItemStockLocation(stockRow('old-api-stock', 'old-api-item'));
 
       const snapshot = inventorySnapshot('generation-success');
+      snapshot.items[0].quantity_available = 8;
+      snapshot.items[0].quantity_available_source = 'computed';
+      snapshot.stockRows[0].quantity_available = 6;
+      snapshot.stockRows[0].quantity_available_source = 'api';
+      refreshInventoryFingerprint(snapshot);
       await service.replaceInventorySnapshot(snapshot);
 
       expect(await service.getAllItems()).toEqual(
@@ -775,6 +784,12 @@ describe('SQLiteCacheService', () => {
         stockRows: [expect.objectContaining(snapshot.stockRows[0])],
         meta: snapshot.meta,
       });
+      expect(await service.getItem(snapshot.items[0].item_id)).toMatchObject({
+        quantity_available_source: 'computed',
+      });
+      expect(await service.getItemStockLocations(snapshot.items[0].item_id)).toEqual([
+        expect.objectContaining({ quantity_available_source: 'api' }),
+      ]);
       expect(rawTextMeta(testDbPath, INVENTORY_SNAPSHOT_META_KEY)).toBe(
         JSON.stringify(snapshot.meta)
       );

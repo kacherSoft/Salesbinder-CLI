@@ -1,6 +1,7 @@
 import { ApiResponseValidationError } from '../../resources/api-response-validation.error.js';
 import type { V3Item, V3ItemVariation } from '../../types/items.types.js';
 import { normalizeV3InventoryItem } from '../v3-inventory-normalizer.js';
+import { resolveAvailableQuantity } from '../inventory-available-quantity.js';
 
 describe('v3 inventory normalizer field continuity', () => {
   it('inherits explicit null variation overrides from the observed parent values', () => {
@@ -40,6 +41,67 @@ describe('v3 inventory normalizer field continuity', () => {
     );
     expect(normalized.item).toMatchObject({ price: null, cost: null });
     expect(normalized.stockRows[0]).toMatchObject({ price: null, cost: null });
+  });
+
+  it('keeps item and direct-location availability at their own scopes', () => {
+    const source = item() as V3Item & { quantity_available?: number };
+    source.variation_count = 0;
+    source.quantity = 10;
+    source.quantity_reserved = 2;
+    source.location_id = 'location-1';
+    source.location_inventory = {
+      location_id: 'location-1',
+      quantity: 10,
+      quantity_reserved: 2,
+      quantity_available: 6,
+      quantity_incoming: 0,
+      threshold: 0,
+    };
+
+    const normalized = normalizeV3InventoryItem(source, [], null);
+
+    expect(normalized.item).toMatchObject({
+      quantity_available: 8,
+      quantity_available_source: 'computed',
+    });
+    expect(normalized.stockRows[0]).toMatchObject({
+      quantity_available: 6,
+      quantity_available_source: 'api',
+    });
+  });
+
+  it('prefers observed same-scope variation availability and computes signed peers', () => {
+    const observed = variation({ quantity_available: 99 });
+    observed.quantity = 5;
+    observed.quantity_reserved = 2;
+    const computed = variation({ id: 'variation-2', quantity: 5, quantity_reserved: -2 });
+    const normalized = normalizeV3InventoryItem(item(), [observed, computed], null);
+
+    expect(normalized.stockRows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          variation_id: 'variation-1',
+          quantity_available: 99,
+          quantity_available_source: 'api',
+        }),
+        expect.objectContaining({
+          variation_id: 'variation-2',
+          quantity_available: 7,
+          quantity_available_source: 'computed',
+        }),
+      ])
+    );
+  });
+
+  it('leaves availability unknown when either computation operand is missing', () => {
+    expect(resolveAvailableQuantity(null, 5, null)).toEqual({
+      quantityAvailable: null,
+      quantityAvailableSource: null,
+    });
+    expect(resolveAvailableQuantity(null, null, -2)).toEqual({
+      quantityAvailable: null,
+      quantityAvailableSource: null,
+    });
   });
 
   it('rejects absent parent cost or price before a replacement can publish', () => {
@@ -114,7 +176,7 @@ function item(): V3Item {
 }
 
 function variation(
-  overrides: Partial<Pick<V3ItemVariation, 'unit_price_override' | 'unit_cost_override'>> = {}
+  overrides: Partial<V3ItemVariation> = {}
 ): V3ItemVariation {
   return {
     id: 'variation-1',

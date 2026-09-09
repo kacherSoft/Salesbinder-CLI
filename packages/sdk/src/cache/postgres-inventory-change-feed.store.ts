@@ -36,6 +36,7 @@ import {
 } from './types.js';
 import type { InventoryChangeFeedCache } from './change-feed-cache.interface.js';
 import { assertCanonicalV3SourceId } from './v3-inventory-source-validation.js';
+import { resolveAvailableQuantity } from './inventory-available-quantity.js';
 
 type TransactionRunner = <T>(
   run: (client: PoolClient) => Promise<T>,
@@ -62,6 +63,7 @@ const ITEM_COLUMNS = [
   'quantity',
   'quantity_reserved',
   'quantity_available',
+  'quantity_available_source',
   'quantity_incoming',
   'in_transit',
   'threshold',
@@ -89,6 +91,7 @@ const STOCK_COLUMNS = [
   'quantity_on_hand',
   'quantity_reserved',
   'quantity_available',
+  'quantity_available_source',
   'quantity_incoming',
   'in_transit',
   'price',
@@ -858,9 +861,11 @@ export class PostgresInventoryChangeFeedStore implements InventoryChangeFeedCach
          ORDER BY stock_row_id`,
         [...bindingValues(promotion), promotion.runId]
       );
-      const items = itemsResult.rows.map((row) => parseJsonRow<ItemRow>(row.item_payload));
+      const items = itemsResult.rows.map((row) =>
+        upgradeStagedItemAvailability(parseJsonRow<ItemRow>(row.item_payload))
+      );
       const stockRows = stockResult.rows.map((row) =>
-        parseJsonRow<ItemStockLocationRow>(row.stock_payload)
+        upgradeStagedStockAvailability(parseJsonRow<ItemStockLocationRow>(row.stock_payload))
       );
       if (
         items.length !== run.expectedItemCount ||
@@ -1741,6 +1746,34 @@ function valuesFor(columns: readonly string[], row: ItemRow | ItemStockLocationR
 
 function parseJsonRow<T>(value: T | string): T {
   return typeof value === 'string' ? (JSON.parse(value) as T) : value;
+}
+
+function upgradeStagedItemAvailability(item: ItemRow): ItemRow {
+  if (Object.prototype.hasOwnProperty.call(item, 'quantity_available_source')) return item;
+  const available = resolveAvailableQuantity(
+    null,
+    item.quantity,
+    item.quantity_reserved
+  );
+  return {
+    ...item,
+    quantity_available: available.quantityAvailable,
+    quantity_available_source: available.quantityAvailableSource,
+  };
+}
+
+function upgradeStagedStockAvailability(row: ItemStockLocationRow): ItemStockLocationRow {
+  if (Object.prototype.hasOwnProperty.call(row, 'quantity_available_source')) return row;
+  const available = resolveAvailableQuantity(
+    row.quantity_available,
+    row.quantity_on_hand,
+    row.quantity_reserved
+  );
+  return {
+    ...row,
+    quantity_available: available.quantityAvailable,
+    quantity_available_source: available.quantityAvailableSource,
+  };
 }
 
 function createPromotedInventoryMeta(

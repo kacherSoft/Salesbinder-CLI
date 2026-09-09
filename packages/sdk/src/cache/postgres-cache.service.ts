@@ -214,6 +214,7 @@ const ITEM_COLUMNS = [
   'quantity',
   'quantity_reserved',
   'quantity_available',
+  'quantity_available_source',
   'quantity_incoming',
   'in_transit',
   'threshold',
@@ -241,6 +242,7 @@ const STOCK_COLUMNS = [
   'quantity_on_hand',
   'quantity_reserved',
   'quantity_available',
+  'quantity_available_source',
   'quantity_incoming',
   'in_transit',
   'price',
@@ -438,6 +440,7 @@ export class PostgresCacheService
         quantity NUMERIC NULL,
         quantity_reserved NUMERIC NULL,
         quantity_available NUMERIC NULL,
+        quantity_available_source TEXT NULL,
         quantity_incoming NUMERIC NULL,
         in_transit NUMERIC NULL,
         threshold NUMERIC NULL,
@@ -464,6 +467,7 @@ export class PostgresCacheService
         quantity_on_hand NUMERIC NOT NULL DEFAULT 0,
         quantity_reserved NUMERIC NULL,
         quantity_available NUMERIC NULL,
+        quantity_available_source TEXT NULL,
         quantity_incoming NUMERIC NULL,
         in_transit NUMERIC NULL,
         price NUMERIC NULL,
@@ -568,12 +572,14 @@ export class PostgresCacheService
     await client.query(`
       ALTER TABLE items ADD COLUMN IF NOT EXISTS archived INTEGER NULL;
       ALTER TABLE items ADD COLUMN IF NOT EXISTS source_api_version TEXT NULL;
+      ALTER TABLE items ADD COLUMN IF NOT EXISTS quantity_available_source TEXT NULL;
     `);
   }
 
   private async migrateStockColumns(client: PoolClient): Promise<void> {
     await client.query(`
       ALTER TABLE item_stock_locations ADD COLUMN IF NOT EXISTS source_api_version TEXT NULL;
+      ALTER TABLE item_stock_locations ADD COLUMN IF NOT EXISTS quantity_available_source TEXT NULL;
       ALTER TABLE items ALTER COLUMN quantity_reserved DROP DEFAULT;
       ALTER TABLE items ALTER COLUMN quantity_reserved DROP NOT NULL;
       ALTER TABLE items ALTER COLUMN quantity_available DROP DEFAULT;
@@ -3351,7 +3357,12 @@ export class PostgresCacheService
   }
 
   private normalizeItem(item: ItemRow): Record<string, unknown> {
-    return { ...item, archived: item.archived ?? null, cache_source: item.cache_source ?? 'api' };
+    return {
+      ...item,
+      archived: item.archived ?? null,
+      quantity_available_source: item.quantity_available_source ?? null,
+      cache_source: item.cache_source ?? 'api',
+    };
   }
 
   private normalizeStock(row: ItemStockLocationRow): Record<string, unknown> {
@@ -3360,6 +3371,7 @@ export class PostgresCacheService
       quantity_on_hand: row.quantity_on_hand ?? 0,
       quantity_reserved: row.quantity_reserved ?? null,
       quantity_available: row.quantity_available ?? null,
+      quantity_available_source: row.quantity_available_source ?? null,
       quantity_incoming: row.quantity_incoming ?? null,
       in_transit: row.in_transit ?? null,
       cache_source: row.cache_source ?? 'api',
@@ -3556,7 +3568,9 @@ const stockRowMatchesParent = (row: ItemStockLocationRow, parent: ItemRow): bool
   (row.variation_id != null ||
     (nullableValuesEqual(row.quantity_on_hand, parent.quantity) &&
       nullableValuesEqual(row.quantity_reserved, parent.quantity_reserved) &&
-      nullableValuesEqual(row.quantity_available, parent.quantity_available) &&
+      (row.quantity_available_source != null ||
+        parent.quantity_available_source != null ||
+        nullableValuesEqual(row.quantity_available, parent.quantity_available)) &&
       nullableValuesEqual(row.quantity_incoming, parent.quantity_incoming) &&
       nullableValuesEqual(row.in_transit, parent.in_transit) &&
       nullableValuesEqual(row.barcode, parent.barcode)));
@@ -3573,6 +3587,7 @@ const isInventoryItemRow = (value: unknown): value is ItemRow => {
     isNullableCanonicalV3SourceId(value.category_id) &&
     isFiniteNumber(value.quantity) &&
     hasOnlyFiniteNullableNumbers(value, INVENTORY_ITEM_NUMERIC_FIELDS) &&
+    isQuantityAvailableSource(value.quantity_available_source) &&
     isNullableNonNegativePostgresInteger(value.item_number) &&
     isNullableBinaryFlag(value.published) &&
     isNullableBinaryFlag(value.archived) &&
@@ -3596,6 +3611,7 @@ const isInventoryStockRow = (value: unknown): value is ItemStockLocationRow => {
     isFiniteNumber(value.quantity_on_hand) &&
     isNullableFiniteNumber(value.quantity_reserved) &&
     isNullableFiniteNumber(value.quantity_available) &&
+    isQuantityAvailableSource(value.quantity_available_source) &&
     isNullableFiniteNumber(value.quantity_incoming) &&
     isNullableFiniteNumber(value.in_transit) &&
     hasOnlyFiniteNullableNumbers(value, INVENTORY_STOCK_NUMERIC_FIELDS) &&
@@ -3654,6 +3670,9 @@ const INVENTORY_STOCK_TEXT_FIELDS = [
   'category_name',
   'barcode',
 ] as const;
+
+const isQuantityAvailableSource = (value: unknown): boolean =>
+  value === 'api' || value === 'computed' || value === null || value === undefined;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;

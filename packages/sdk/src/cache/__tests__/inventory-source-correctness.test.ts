@@ -48,7 +48,8 @@ describe('inventory API source correctness', () => {
     expect(row).toMatchObject({
       quantity_on_hand: 12,
       quantity_reserved: 3,
-      quantity_available: null,
+      quantity_available: 9,
+      quantity_available_source: 'computed',
       quantity_incoming: 5,
       in_transit: 2,
     });

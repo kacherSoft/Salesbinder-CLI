@@ -5,6 +5,7 @@ import type { ItemRow, ItemStockLocationRow } from './types.js';
 import { isValidSalesBinderTimestampText } from './salesbinder-source-date-validation.js';
 import { parseSalesBinderFiniteDecimal } from './salesbinder-source-number-validation.js';
 import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
+import { resolveAvailableQuantity } from './inventory-available-quantity.js';
 
 const POSTGRES_INTEGER_MAX = 2_147_483_647;
 
@@ -31,10 +32,25 @@ export function normalizeV3InventoryItem(
   requiredJsonInteger(item.status_id, 'item status id');
   requiredJsonInteger(item.variation_count, 'item variation_count');
   const locationId = nullableCanonicalText(item.location_id, 'item location_id');
-  const quantityAvailable = validateLocationInventory(item.location_inventory, locationId);
+  const locationQuantityAvailable = validateLocationInventory(item.location_inventory, locationId);
   const categoryId = nullableCanonicalText(item.category_id, 'item category_id');
   const quantity = requiredJsonNumber(item.quantity, 'item quantity');
   const reserved = requiredJsonNumber(item.quantity_reserved, 'item reserved quantity');
+  const observedItemAvailable = optionalJsonNumber(
+    item.quantity_available,
+    'item available quantity',
+    'record'
+  );
+  const itemAvailable = resolveAvailableQuantity(
+    observedItemAvailable,
+    quantity,
+    reserved
+  );
+  const parentAvailable = resolveAvailableQuantity(
+    locationQuantityAvailable ?? observedItemAvailable,
+    quantity,
+    reserved
+  );
   const incoming = requiredJsonNumber(item.quantity_incoming, 'item incoming quantity');
   const price = requiredObservedNullableDecimal(item, 'price', 'item price', 'record');
   const cost = requiredObservedNullableDecimal(item, 'cost', 'item cost', 'record');
@@ -53,7 +69,7 @@ export function normalizeV3InventoryItem(
             locationId,
             quantity,
             reserved,
-            quantityAvailable,
+            parentAvailable,
             incoming,
             categoryName,
             price,
@@ -79,7 +95,8 @@ export function normalizeV3InventoryItem(
       category_name: categoryName,
       quantity,
       quantity_reserved: reserved,
-      quantity_available: quantityAvailable,
+      quantity_available: itemAvailable.quantityAvailable,
+      quantity_available_source: itemAvailable.quantityAvailableSource,
       quantity_incoming: incoming,
       in_transit: inTransit,
       threshold: requiredJsonNumber(item.threshold, 'item threshold'),
@@ -127,7 +144,7 @@ function parentStockRow(
   locationId: string | null,
   quantity: number,
   reserved: number,
-  quantityAvailable: number | null,
+  available: ReturnType<typeof resolveAvailableQuantity>,
   incoming: number,
   categoryName: string | null,
   price: number | null,
@@ -140,7 +157,8 @@ function parentStockRow(
     location_name: null,
     quantity_on_hand: quantity,
     quantity_reserved: reserved,
-    quantity_available: quantityAvailable,
+    quantity_available: available.quantityAvailable,
+    quantity_available_source: available.quantityAvailableSource,
     quantity_incoming: incoming,
     in_transit: null,
     ...commonStockRowFields(item, itemNumber, categoryName, price, cost, barcode),
@@ -191,6 +209,17 @@ function variationStockRows(
       'variations'
     ) ?? parentCost;
   if (locations.length === 0) {
+    const quantity = requiredJsonNumber(variation.quantity, 'variation quantity', 'variations');
+    const reserved = requiredJsonNumber(
+      variation.quantity_reserved,
+      'variation reserved quantity',
+      'variations'
+    );
+    const available = resolveAvailableQuantity(
+      optionalJsonNumber(variation.quantity_available, 'variation available quantity', 'variations'),
+      quantity,
+      reserved
+    );
     return [
       {
         stock_row_id: syntheticId('v3-variation-stock', item.id, variation.id, 'aggregate'),
@@ -198,17 +227,10 @@ function variationStockRows(
         variation_location_id: null,
         location_id: null,
         location_name: null,
-        quantity_on_hand: requiredJsonNumber(
-          variation.quantity,
-          'variation quantity',
-          'variations'
-        ),
-        quantity_reserved: requiredJsonNumber(
-          variation.quantity_reserved,
-          'variation reserved quantity',
-          'variations'
-        ),
-        quantity_available: null,
+        quantity_on_hand: quantity,
+        quantity_reserved: reserved,
+        quantity_available: available.quantityAvailable,
+        quantity_available_source: available.quantityAvailableSource,
         quantity_incoming: requiredJsonNumber(
           variation.quantity_incoming,
           'variation incoming quantity',
@@ -233,6 +255,25 @@ function variationStockRows(
       'variations'
     );
     optionalJsonNumber(location.threshold, 'variation-location threshold', 'variations');
+    const quantity = requiredJsonNumber(
+      location.quantity,
+      'variation-location quantity',
+      'variations'
+    );
+    const reserved = requiredJsonNumber(
+      location.quantity_reserved,
+      'variation-location reserved quantity',
+      'variations'
+    );
+    const available = resolveAvailableQuantity(
+      optionalJsonNumber(
+        location.quantity_available,
+        'variation-location available quantity',
+        'variations'
+      ),
+      quantity,
+      reserved
+    );
     return {
       stock_row_id: String(variationLocationId),
       variation_id: variation.id,
@@ -243,17 +284,10 @@ function variationStockRows(
         'variations'
       ),
       location_name: nullableDisplayText(location.location_name, 'variations'),
-      quantity_on_hand: requiredJsonNumber(
-        location.quantity,
-        'variation-location quantity',
-        'variations'
-      ),
-      quantity_reserved: requiredJsonNumber(
-        location.quantity_reserved,
-        'variation-location reserved quantity',
-        'variations'
-      ),
-      quantity_available: null,
+      quantity_on_hand: quantity,
+      quantity_reserved: reserved,
+      quantity_available: available.quantityAvailable,
+      quantity_available_source: available.quantityAvailableSource,
       quantity_incoming: requiredJsonNumber(
         location.quantity_incoming,
         'variation-location incoming quantity',

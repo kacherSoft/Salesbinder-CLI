@@ -116,6 +116,7 @@ export interface ItemRow {
   quantity?: number | null;
   quantity_reserved?: number | null;
   quantity_available?: number | null;
+  quantity_available_source?: QuantityAvailableSource;
   quantity_incoming?: number | null;
   in_transit?: number | null;
   threshold?: number | null;
@@ -145,6 +146,7 @@ export interface ItemStockLocationRow {
   quantity_on_hand: number;
   quantity_reserved: number | null;
   quantity_available: number | null;
+  quantity_available_source?: QuantityAvailableSource;
   quantity_incoming: number | null;
   in_transit: number | null;
   price?: number | null;
@@ -157,6 +159,7 @@ export interface ItemStockLocationRow {
 }
 
 export type ApiSourceVersion = '2.0' | '3';
+export type QuantityAvailableSource = 'api' | 'computed' | null;
 
 /** Database schema row for cache_meta table */
 export interface CacheMetaRow {
