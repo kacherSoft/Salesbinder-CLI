@@ -12,6 +12,11 @@ import {
   normalizeOfficialV3LineCost,
   type OfficialV3DocumentLineKind,
 } from './v3-document-cost-normalizer.js';
+import {
+  parseV3ConvertedDocumentRelation,
+  parseV3SourceEstimateRelation,
+  type ObservedV3DocumentRelation,
+} from './v3-document-relationship-normalizer.js';
 
 const OBJECTS = { 4: 'estimate', 5: 'invoice', 11: 'purchase_order' } as const;
 const RESOURCE_CONTEXTS = { estimate: 4, invoice: 5, purchase_order: 11 } as const;
@@ -61,6 +66,12 @@ export function normalizeV3DocumentCacheRows(
     throw new ApiResponseValidationError('V3 document business identity mismatch', 'identity');
   }
   const po = expected.contextId === 11;
+  const associatedDocument =
+    expected.contextId === 4
+      ? parseV3ConvertedDocumentRelation(payload, expected.id)
+      : expected.contextId === 5
+        ? parseV3SourceEstimateRelation(payload, expected.id)
+        : undefined;
   const assignmentKey = po ? 'assigned_user_id' : 'salesperson_id';
   if (!Object.prototype.hasOwnProperty.call(payload, assignmentKey)) throw invalid();
   const userId = optionalUuid(payload[assignmentKey]);
@@ -175,6 +186,7 @@ export function normalizeV3DocumentCacheRows(
       subtotal,
       total_cost: documentCostFromUnits(totalCostUnits),
       archived: null,
+      ...associatedDocumentFields(associatedDocument),
       external_po_number: po ? null : text(payload.purchase_order_number),
       date_sent: payload.date_sent == null ? null : date(payload.date_sent),
       shipped_percent: optionalNumber(payload.shipped_percent),
@@ -182,6 +194,13 @@ export function normalizeV3DocumentCacheRows(
     },
     itemRows,
   };
+}
+
+function associatedDocumentFields(
+  relation: ObservedV3DocumentRelation<{ id: string }> | undefined
+): { associated_document_id?: string | null } {
+  if (!relation || !relation.observed) return {};
+  return { associated_document_id: relation.value?.id ?? null };
 }
 
 function invalid(): DocumentRecordError {

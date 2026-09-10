@@ -18,6 +18,8 @@ describe('V3DocumentsReadResource', () => {
     expect(Object.getOwnPropertyNames(V3DocumentsReadResource.prototype)).toEqual([
       'constructor',
       'get',
+      'getSalesOrder',
+      'listSalesOrders',
       'getMany',
     ]);
   });
@@ -33,6 +35,29 @@ describe('V3DocumentsReadResource', () => {
       expect(get).not.toHaveBeenCalled();
     }
   );
+
+  it('reads and validates sales-order documents through their dedicated routes', async () => {
+    const client = axios.create();
+    const get = jest.spyOn(client, 'get')
+      .mockResolvedValueOnce({ data: { id, object: 'sales_order' } })
+      .mockResolvedValueOnce({ data: envelope([{ id, object: 'sales_order' }], 20) });
+    const resource = new V3DocumentsReadResource(client);
+
+    await expect(resource.getSalesOrder(id)).resolves.toEqual({ id, object: 'sales_order' });
+    await expect(resource.listSalesOrders({ page: 2, limit: 20 })).resolves.toEqual(
+      envelope([{ id, object: 'sales_order' }], 20)
+    );
+    expect(get).toHaveBeenNthCalledWith(1, `/sales-orders/${id}`);
+    expect(get).toHaveBeenNthCalledWith(2, '/sales-orders', { params: { page: 2, limit: 20 } });
+  });
+
+  it('rejects malformed sales-order list identities', async () => {
+    const client = axios.create();
+    jest.spyOn(client, 'get').mockResolvedValue({ data: envelope([{ id, object: 'invoice' }], 20) });
+    await expect(new V3DocumentsReadResource(client).listSalesOrders()).rejects.toBeInstanceOf(
+      ApiResponseValidationError
+    );
+  });
 
   it.each([
     [4, 'estimates'],

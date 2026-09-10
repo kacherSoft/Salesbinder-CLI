@@ -95,8 +95,33 @@ export * from './official-v3-sync.types.js';
 export * from './official-v3-sync.service.js';
 export { readOfficialV3SyncStatus } from './official-v3-sync-status.js';
 export { createOfficialV3SyncService } from './official-v3-sync-client.factory.js';
+export type { OfficialV3SyncRuntime } from './official-v3-sync-client.factory.js';
 export { PostgresOfficialV3SyncStore } from './postgres-official-v3-sync.store.js';
 export type { PostgresOfficialV3SyncStoreOptions } from './postgres-official-v3-sync.store.js';
+export type {
+  OCShippingPatch,
+  OCShippingPatchApplication,
+  OCShippingProvenance,
+  OCShippingReconciliationStatus,
+} from './postgres-oc-shipping.store.js';
+export { applyOCShippingPatches } from './postgres-oc-shipping-bulk.store.js';
+export type { OCShippingPatchBulkResult } from './postgres-oc-shipping-bulk.store.js';
+export type { OCShippingWarning } from './postgres-oc-shipping-warning.store.js';
+export * from './oc-shipping.types.js';
+export { createOcShippingPatch } from './oc-shipping-matcher.js';
+export { hydrateOcShippingPatch, hydrateOcShippingPatchSafely } from './oc-shipping-hydrator.js';
+export {
+  SalesOrderShippingReconciliationService,
+} from './sales-order-shipping-reconciliation.service.js';
+export type {
+  SalesOrderShippingCachePort,
+  SalesOrderShippingDocumentsPort,
+  SalesOrderShippingReconciliationDependencies,
+  SalesOrderShippingReconciliationOptions,
+  SalesOrderShippingReconciliationProgress,
+  SalesOrderShippingReconciliationResult,
+} from './sales-order-shipping-reconciliation.service.js';
+export { createSalesOrderShippingReconciliationService } from './sales-order-shipping-reconciliation.factory.js';
 export * from './salesperson-directory.js';
 export * from './reference-refresh.types.js';
 export { ReferenceRefreshService } from './reference-refresh.service.js';

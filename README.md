@@ -779,6 +779,70 @@ purchase-order cost—and never from current item-master cost.
 
 - Continuity guard: V3 cache writes require observed cost-permission fields on parent items, variations, and document lines. Missing permission/required fields produce a retryable record failure that preserves the previous bundle instead of writing `NULL` or zero; variation overrides win, and a source-unavailable `shipping_location` preserves the CSV value.
 
+#### Order-conversion shipping reconciliation
+
+V3 document detail records observed conversion links: estimates may identify a
+converted invoice or sales order, and invoices may identify their source
+estimate. An omitted relation stays unobserved and preserves an existing cached
+link; an explicit `null` clears it. Shipping is taken only from the linked
+invoice or sales order. The configured four-resource V3 feed does not subscribe
+to sales-order markers, so linked sales orders are reconciled separately with
+their own freshness check; this does not change the feed cursor contract.
+
+Line shipping is applied only for a validated, unambiguous source-line match at
+the item, variation/location, unit, and quantity scope. A missing or ambiguous
+match remains unknown rather than becoming a zero. This is active-source
+coverage, not a guarantee of complete archived-document coverage, and it does
+not change payment synchronization or payment-table scope.
+
+Related-source contract failures are recorded as durable shipping warnings
+without failing the initiating feed task. Each run retries up to 500 oldest
+pending warnings in fair rotation; sales-order freshness remains independent of
+the feed cursor.
+
+The explicit repair operator stages the source and then plans against a fresh
+cache snapshot. V2 is discovery-only: it selects reciprocal, same-customer,
+direct invoice relationships and never supplies shipment values. A completed
+canonical V3 invoice-authority stage is mandatory before dry-run or apply.
+Staging and dry-run are read-only against the cache:
+
+```bash
+# Discover active V2 estimate/invoice relationships only. Resume an incomplete stage.
+node --env-file=.env scripts/repair-oc-shipping.mjs --stage
+node --env-file=.env scripts/repair-oc-shipping.mjs --stage --resume-stage
+
+# Build the required canonical V3 invoice-authority snapshot. Resume an incomplete authority stage.
+SALESBINDER_V3_API_KEY=<v3-key> node --env-file=.env scripts/stage-oc-shipping-authorities.mjs --stage
+SALESBINDER_V3_API_KEY=<v3-key> node --env-file=.env scripts/stage-oc-shipping-authorities.mjs --resume
+
+# Stage linked sales-order details and bounded exact V3 exceptions.
+SALESBINDER_V3_API_KEY=<v3-key> node --env-file=.env scripts/repair-oc-shipping.mjs --stage-sales-orders
+SALESBINDER_V3_API_KEY=<v3-key> node --env-file=.env scripts/repair-oc-shipping.mjs --stage-v3-exceptions
+
+# After canonical V3 authority staging completes, produce the cache-accounted plan.
+node --env-file=.env scripts/repair-oc-shipping.mjs --dry-run
+
+# Apply only with a separately verified backup manifest.
+node --env-file=.env scripts/repair-oc-shipping.mjs --apply --confirm-oc-shipping-repair --backup-manifest <verified-backup-manifest>
+```
+
+Stages and before-images are private operator artifacts. Apply validates the
+backup manifest and account binding, takes the cache writer fence, preserves
+before-images, and uses compare-and-swap checks in bounded batches. Every cache
+order conversion outside validated active-source coverage, or excluded by
+identity, freshness, or line-matching validation, is reported as
+source-unverified and preserved unchanged; it is never assumed archived or
+cleared.
+
+Historical cached OCs that are known absent from active-source coverage, or
+definitively not found by an exact per-record read, are intentionally excluded
+historical data for this repair. Preserve all existing cached values, `NULL`s,
+and lifecycle metadata unchanged; do not infer or write an archive flag. Do not
+delete, recreate, backfill, or keep probing those records solely to fill shipping
+gaps; no recovery chase is required for this business disposition. Transient
+429, 5xx, network, or account-authentication failures are not evidence that a
+record is historical or safe to ignore.
+
 #### Scheduled official V3 polling
 
 The URL-less runner invokes `cache sync-v3 --status` before each cycle. `null`

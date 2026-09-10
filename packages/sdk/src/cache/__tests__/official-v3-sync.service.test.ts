@@ -229,6 +229,23 @@ describe('OfficialV3SyncService', () => {
     expect(result.state.cursorGap).toBe(false);
   });
 
+  it('does not invoke OC shipping hydration for a purchase order with a factory-shaped reader', async () => {
+    const h = harness();
+    const getSalesOrder = jest.fn(async () => { throw new Error('PO must not read a sales order'); });
+    Object.assign(h.documents, { getSalesOrder });
+    h.pages.set('since:1788670542', {
+      changes: [{ resource: 'purchase_order', id: docId, operation: 'upsert' }],
+      has_more: false,
+      next_cursor: 'cursor-po',
+    });
+    h.documents.get.mockResolvedValueOnce(documentPayload('purchase_order'));
+
+    await expect(h.service.sync({ accountIdentity, since: 1788670542 })).resolves.toMatchObject({
+      run: { status: 'success' }, tasks: { applied: 1, failed: 0 },
+    });
+    expect(getSalesOrder).not.toHaveBeenCalled();
+  });
+
   it('applies document deletes without item hydration or child tasks', async () => {
     const h = harness();
     h.pages.set('since:1788670542', {

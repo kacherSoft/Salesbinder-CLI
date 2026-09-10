@@ -13,6 +13,7 @@ import {
   type ItemStockLocationRow,
 } from '../types.js';
 import type { DocumentOffsetRun, DocumentOffsetTask } from '../document-offset-sync.types.js';
+import type { OCShippingPatch } from '../postgres-oc-shipping.store.js';
 
 const { Pool } = pg;
 
@@ -107,6 +108,99 @@ describeIfPostgres('PostgresCacheService document offset integration', () => {
       ])
     );
     await expect(readPaymentCount(ctx.pool, paymentId)).resolves.toBe(1);
+  });
+
+  it('completes an unavailable shipping task with a durable warning and clears it on recovery', async () => {
+    const ctx = await createContext('shipping-warning');
+    const estimateId = randomUUID();
+    const invoiceId = randomUUID();
+    const customerId = randomUUID();
+    const itemId = randomUUID();
+    const estimateLineId = randomUUID();
+    const task = documentTask(invoiceId, 1004);
+    const run = offsetRun();
+    const paymentId = `payment-${randomUUID()}`;
+
+    await ctx.service.insertDocument({
+      doc_id: estimateId, api_doc_id: estimateId, context_id: 4, doc_number: 1003,
+      issue_date: '2026-09-06', customer_id: customerId, modified: 20, cache_source: 'api',
+    });
+    await ctx.service.insertItemDocument({
+      doc_id: estimateId, item_id: itemId, document_item_id: estimateLineId,
+      quantity: 2, price: 5, quantity_shipped: 1,
+    });
+    await ctx.pool.query(
+      `INSERT INTO payment_transactions (transaction_id, doc_id, amount, transaction_date, imported_at)
+       VALUES ($1, $2, 5, '2026-09-06', 100)`,
+      [paymentId, estimateId]
+    );
+    await ctx.service.saveOffsetSyncRun(run);
+    await ctx.service.saveOffsetSyncTasks(run.runId, 'document', [task]);
+    const unknown = shippingPatch(estimateId, customerId, invoiceId, estimateLineId, itemId, null);
+    await ctx.service.applyOffsetDocumentBundle(
+      run.runId, task, document(task, { customer_id: customerId }), [], 250, unknown,
+      { contextId: 5, documentId: invoiceId, code: 'shipping_unknown', updatedAt: 30 }
+    );
+
+    await expect(ctx.service.listOffsetSyncTasks(run.runId, 'document')).resolves.toEqual([
+      expect.objectContaining({ id: invoiceId, status: 'done' }),
+    ]);
+    await expect(ctx.service.getOCShippingPendingWarnings()).resolves.toEqual([
+      expect.objectContaining({ contextId: 5, documentId: invoiceId }),
+    ]);
+    await expect(ctx.service.getDocument(estimateId)).resolves.toMatchObject({ shipped_percent: null });
+    await expect(readPaymentCount(ctx.pool, paymentId)).resolves.toBe(1);
+
+    await ctx.service.saveOffsetSyncRun({
+      ...run, discoveryComplete: true, status: 'success', updatedAt: 101, finishedAt: 101,
+    });
+    const recovery = offsetRun({ updatedAt: 102, startedAt: 102 });
+    await ctx.service.saveOffsetSyncRun(recovery);
+    const recoveryTask = { ...task, selectedModified: 91 };
+    await ctx.service.saveOffsetSyncTasks(recovery.runId, 'document', [recoveryTask]);
+    await ctx.service.applyOffsetDocumentBundle(
+      recovery.runId, recoveryTask, document(recoveryTask, { customer_id: customerId }), [], 260,
+      shippingPatch(estimateId, customerId, invoiceId, estimateLineId, itemId, 1)
+    );
+    await expect(ctx.service.getOCShippingPendingWarnings()).resolves.toEqual([]);
+    await expect(ctx.service.getDocument(estimateId)).resolves.toMatchObject({ shipped_percent: 50 });
+  });
+
+  it('clears stale estimate shipment values for a patchless warning while retaining the observed link', async () => {
+    const ctx = await createContext('estimate-shipping-warning');
+    const estimateId = randomUUID();
+    const invoiceId = randomUUID();
+    const task: DocumentOffsetTask = { ...documentTask(estimateId, 1005), contextId: 4 };
+    const run = offsetRun();
+    await ctx.service.insertDocument(document(task, {
+      associated_document_id: invoiceId,
+      shipped_percent: 50,
+    }));
+    await ctx.service.insertItemDocument({
+      ...line('estimate-warning-item', estimateId), quantity_shipped: 1,
+    });
+    await ctx.service.saveOffsetSyncRun(run);
+    await ctx.service.saveOffsetSyncTasks(run.runId, 'document', [task]);
+    await ctx.service.applyOffsetDocumentBundle(
+      run.runId,
+      task,
+      document(task, { associated_document_id: invoiceId }),
+      [line('estimate-warning-item', estimateId)],
+      250,
+      null,
+      { contextId: 4, documentId: estimateId, code: 'shipping_unknown', updatedAt: 100 }
+    );
+
+    await expect(ctx.service.listOffsetSyncTasks(run.runId, 'document')).resolves.toEqual([
+      expect.objectContaining({ id: estimateId, status: 'done' }),
+    ]);
+    await expect(ctx.service.getDocument(estimateId)).resolves.toMatchObject({
+      associated_document_id: invoiceId,
+      shipped_percent: null,
+    });
+    await expect(ctx.service.getItemDocuments(estimateId)).resolves.toEqual([
+      expect.objectContaining({ quantity_shipped: null }),
+    ]);
   });
 
   it('rolls back queued item tasks and document writes when the document transaction fails', async () => {
@@ -381,6 +475,28 @@ function document(task: DocumentOffsetTask, overrides: Partial<DocumentRow> = {}
 
 function line(itemId: string, docId: string): Omit<ItemDocumentRow, 'id'> {
   return { item_id: itemId, doc_id: docId, quantity: 2, price: 5, item_name: itemId };
+}
+
+function shippingPatch(
+  estimateId: string,
+  customerId: string,
+  invoiceId: string,
+  lineId: string,
+  itemId: string,
+  quantityShipped: number | null
+): OCShippingPatch {
+  return {
+    estimateId,
+    estimateNumber: 1003,
+    estimateModified: 20,
+    customerId,
+    associatedDocumentId: invoiceId,
+    sourceKind: 'invoice',
+    authorityId: invoiceId,
+    authorityModified: 30,
+    shippedPercent: quantityShipped === null ? null : 50,
+    lines: [{ documentItemId: lineId, itemId, quantity: 2, quantityShipped }],
+  };
 }
 
 function item(id: string, overrides: Partial<ItemRow> = {}): ItemRow {

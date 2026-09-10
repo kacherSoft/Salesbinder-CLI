@@ -4,6 +4,7 @@ const mockStore = { getState: jest.fn(), getRun: jest.fn(), listTasks: jest.fn()
 const mockPg = {
   verifyAccountBinding: jest.fn(async () => undefined),
   getOfficialV3SyncStore: jest.fn(() => mockStore),
+  getOCShippingReconciliationStatus: jest.fn(async () => null),
   tryAcquireSyncLock: jest.fn(async () => true),
   ensureSchema: jest.fn(async () => undefined),
   releaseSyncLock: jest.fn(async () => undefined),
@@ -13,6 +14,22 @@ const mockLoadConfig = jest.fn<{ subdomain: string; apiKey: string; v3ApiKey?: s
   () => ({ subdomain: 'example', apiKey: 'v2', v3ApiKey: 'v3' })
 );
 const mockCreateService = jest.fn();
+const mockReconcile = jest.fn(async () => ({
+  status: {
+    version: 1,
+    accountIdentity: 'salesbinder:example',
+    status: 'success',
+    startedAt: 1,
+    updatedAt: 2,
+    finishedAt: 2,
+    lastSuccessAt: 2,
+    scanned: 0,
+    applied: 0,
+    failed: 0,
+  },
+  failures: [],
+  pendingWarnings: 0,
+}));
 const mockStatus = jest.fn();
 const mockPgConstructor = jest.fn();
 jest.mock(
@@ -93,6 +110,24 @@ describe('cache sync-v3 option handling', () => {
     expect(mockPgConstructor).toHaveBeenCalledTimes(1);
     expect(mockCreateService).not.toHaveBeenCalled();
     expect(mockStatus).toHaveBeenCalledWith(mockStore);
+    expect(mockPg.getOCShippingReconciliationStatus).toHaveBeenCalled();
+    expect(mockReconcile).not.toHaveBeenCalled();
+    (console.log as jest.Mock).mockRestore();
+  });
+
+  it('preserves null official status for first-run scheduler initialization', async () => {
+    process.env.SALESBINDER_DB_URL = 'postgres://example/salesbinder';
+    mockStatus.mockResolvedValueOnce(null);
+    const program = new Command().option('--account <account>');
+    const cache = program.command('cache');
+    registerCacheV3SyncCommand(cache, program);
+    const logs: string[] = [];
+    jest.spyOn(console, 'log').mockImplementation((value) => logs.push(String(value)));
+
+    await program.parseAsync(['node', 'test', 'cache', 'sync-v3', '--status']);
+
+    expect(JSON.parse(logs.at(-1)!)).toBeNull();
+    expect(mockCreateService).not.toHaveBeenCalled();
     (console.log as jest.Mock).mockRestore();
   });
 
@@ -118,6 +153,7 @@ describe('cache sync-v3 option handling', () => {
         failures: [],
         coverage: 'partial_catch_up',
       })),
+      reconcileOCShipping: mockReconcile,
     });
     const program = new Command().option('--account <account>');
     const cache = program.command('cache');
@@ -180,7 +216,7 @@ describe('cache sync-v3 option handling', () => {
       failures: [],
       coverage: 'partial_catch_up',
     }));
-    mockCreateService.mockReturnValue({ sync });
+    mockCreateService.mockReturnValue({ sync, reconcileOCShipping: mockReconcile });
     for (const args of [['--resume'], []] as string[][]) {
       const program = new Command().option('--account <account>');
       const cache = program.command('cache');
@@ -205,6 +241,7 @@ describe('cache sync-v3 option handling', () => {
       sync: jest.fn(async () => {
         throw Object.assign(new Error('private'), { code: 'source_failed' });
       }),
+      reconcileOCShipping: mockReconcile,
     });
     const program = new Command().option('--account <account>');
     const cache = program.command('cache');
@@ -230,6 +267,7 @@ describe('cache sync-v3 option handling', () => {
         failures: [{ code: 'pending' }],
         coverage: 'partial_catch_up',
       })),
+      reconcileOCShipping: mockReconcile,
     });
     const logs: string[] = [];
     jest.spyOn(console, 'log').mockImplementation((v) => logs.push(String(v)));
@@ -252,6 +290,89 @@ describe('cache sync-v3 option handling', () => {
     expect(mockPg.close).toHaveBeenCalled();
   });
 
+  it('publishes sanitized OC shipping warnings after the official cursor succeeds', async () => {
+    process.env.SALESBINDER_DB_URL = 'postgres://example/salesbinder';
+    process.env.SALESBINDER_V3_API_KEY = 'env-v3';
+    const reconcileOCShipping = jest.fn(async () => ({
+      status: {
+        version: 1,
+        accountIdentity: 'salesbinder:example',
+        status: 'success_with_warnings',
+        startedAt: 1,
+        updatedAt: 2,
+        finishedAt: 2,
+        scanned: 1,
+        applied: 0,
+        failed: 1,
+      },
+      failures: [{ code: 'source_document_not_found', documentId: 'safe-id' }],
+      pendingWarnings: 1,
+    }));
+    mockCreateService.mockReturnValueOnce({
+      sync: jest.fn(async () => ({
+        run: { entry: { kind: 'cursor', value: 'secret' }, status: 'success' },
+        state: { cursorGap: false },
+        tasks: { failed: 0 },
+        failures: [],
+        coverage: 'partial_catch_up',
+      })),
+      reconcileOCShipping,
+    });
+    const program = new Command().option('--account <account>');
+    const cache = program.command('cache');
+    registerCacheV3SyncCommand(cache, program);
+    const logs: string[] = [];
+    jest.spyOn(console, 'log').mockImplementation((value) => logs.push(String(value)));
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await program.parseAsync(['node', 'test', 'cache', 'sync-v3']);
+
+    const output = JSON.parse(logs.at(-1)!) as {
+      run: { status: string };
+      ocShipping: { status: Record<string, unknown>; pendingWarnings: number };
+    };
+    expect(output.run.status).toBe('success');
+    expect(output.ocShipping.status).toMatchObject({
+      status: 'success_with_warnings',
+      failed: 1,
+    });
+    expect(output.ocShipping.pendingWarnings).toBe(1);
+    expect(reconcileOCShipping).toHaveBeenCalledWith(
+      expect.objectContaining({ accountIdentity: 'salesbinder:example' })
+    );
+    (console.log as jest.Mock).mockRestore();
+    (console.error as jest.Mock).mockRestore();
+  });
+
+  it('fails the command and releases the writer lock when OC reconciliation fails', async () => {
+    process.env.SALESBINDER_DB_URL = 'postgres://example/salesbinder';
+    process.env.SALESBINDER_V3_API_KEY = 'env-v3';
+    mockCreateService.mockReturnValueOnce({
+      sync: jest.fn(async () => ({
+        run: { entry: { kind: 'cursor', value: 'secret' }, status: 'success' },
+        state: {},
+        tasks: {},
+        failures: [],
+        coverage: 'partial_catch_up',
+      })),
+      reconcileOCShipping: jest.fn(async () => {
+        throw Object.assign(new Error('private'), { code: 'reconciliation_failed' });
+      }),
+    });
+    const program = new Command().option('--account <account>');
+    const cache = program.command('cache');
+    registerCacheV3SyncCommand(cache, program);
+    const errors: string[] = [];
+    jest.spyOn(console, 'error').mockImplementation((value) => errors.push(String(value)));
+
+    await program.parseAsync(['node', 'test', 'cache', 'sync-v3']);
+
+    expect(process.exitCode).toBe(1);
+    expect(mockPg.releaseSyncLock).toHaveBeenCalled();
+    expect(errors.some((value) => value.includes('reconciliation_failed'))).toBe(true);
+    (console.error as jest.Mock).mockRestore();
+  });
+
   it.each([
     ['authentication_failed', 'authorization_failed'],
     ['rebuild_required', 'reconcile_required'],
@@ -262,6 +383,7 @@ describe('cache sync-v3 option handling', () => {
       sync: jest.fn(async () => {
         throw { code: sdkCode };
       }),
+      reconcileOCShipping: mockReconcile,
     });
     const errors: string[] = [];
     jest.spyOn(console, 'error').mockImplementation((value) => errors.push(String(value)));

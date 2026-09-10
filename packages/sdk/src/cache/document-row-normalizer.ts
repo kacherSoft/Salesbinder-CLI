@@ -2,8 +2,10 @@ import type { Document } from '../types/documents.types.js';
 import type { DocumentRow, ItemDocumentRow } from './types.js';
 import { DocumentContextId } from './types.js';
 import { DocumentRecordError, validateDocumentContent } from './document-source-validation.js';
+import { hasAsciiControlCharacter } from './official-v3-sync.validation.js';
 import { toSalesBinderCalendarDateText } from './salesbinder-source-date-validation.js';
 import { parseSalesBinderFiniteDecimal } from './salesbinder-source-number-validation.js';
+import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.js';
 
 export interface NormalizedDocumentCacheRows {
   docRow: DocumentRow;
@@ -44,6 +46,7 @@ export function normalizeDocumentCacheRows(doc: Document): NormalizedDocumentCac
     total_price: requiredSourceNumber(doc.total_price),
     total_cost: requiredSourceNumber(doc.total_cost),
     subtotal: requiredSourceNumber(doc.total_price),
+    ...associatedDocumentFields(doc),
     date_sent: doc.date_sent == null ? null : toSalesBinderCalendarDateText(doc.date_sent),
     shipped_percent: normalizeOptionalNumber(doc.shipped_percent),
     is_cancelled: statusName && /cancelled|canceled/i.test(statusName) ? 1 : 0,
@@ -54,6 +57,31 @@ export function normalizeDocumentCacheRows(doc: Document): NormalizedDocumentCac
   const itemRows = (doc.document_items ?? []).flatMap((item) => normalizeItemRow(doc.id, item));
 
   return { docRow, itemRows };
+}
+
+/** The v2 SDK type does not yet advertise this observed source field. */
+function associatedDocumentFields(doc: Document): { associated_document_id?: string | null } {
+  const source = doc as Document & { associated_document_id?: unknown };
+  if (!Object.prototype.hasOwnProperty.call(source, 'associated_document_id')) return {};
+  const associatedDocumentId = source.associated_document_id;
+  if (associatedDocumentId === null || associatedDocumentId === '') {
+    return { associated_document_id: null };
+  }
+  if (!isSourceDocumentId(associatedDocumentId) || associatedDocumentId === doc.id) {
+    throw invalidDocumentRecord();
+  }
+  return { associated_document_id: associatedDocumentId };
+}
+
+function isSourceDocumentId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 256 &&
+    value === value.trim() &&
+    !hasAsciiControlCharacter(value) &&
+    !hasUnpairedUtf16Surrogate(value)
+  );
 }
 
 function normalizeItemRow(

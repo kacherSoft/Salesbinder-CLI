@@ -2,6 +2,8 @@ import type { DocumentOffsetTask, OffsetTaskKind } from './document-offset-sync.
 import type { OffsetExecution } from './document-offset-sync.contracts.js';
 import { DocumentOffsetSyncError, localOffsetFailure } from './document-offset-failure.js';
 import { normalizeV3DocumentCacheRows } from './v3-document-cache-normalizer.js';
+import { hydrateOcShippingPatchSafely } from './oc-shipping-hydrator.js';
+import type { OCShippingDocumentsReadPort } from './oc-shipping.types.js';
 import type { NormalizedV3InventoryItem } from './v3-inventory-normalizer.js';
 import { DocumentRecordError } from './document-source-validation.js';
 
@@ -38,6 +40,7 @@ async function refreshDocument(
 ): Promise<void> {
   if (!task.contextId || !task.documentNumber) throw new DocumentOffsetSyncError('invalid_task');
   let normalized: ReturnType<typeof normalizeV3DocumentCacheRows>;
+  let shipping: Awaited<ReturnType<typeof hydrateOcShippingPatchSafely>> | undefined;
   try {
     await execution.guard();
     const payload = await execution.deps.documentsV3.get(task.contextId, task.id);
@@ -49,6 +52,10 @@ async function refreshDocument(
     if (normalized.docRow.modified < (task.selectedModified ?? 0)) {
       throw new DocumentRecordError('invalid_record', 'Canonical document predates selected edit');
     }
+    shipping =
+      task.contextId === 4 || task.contextId === 5
+        ? await hydrateShippingIfConfigured(execution.deps.documentsV3, payload)
+        : undefined;
   } catch (error) {
     const code = localOffsetFailure(error);
     if (!code) throw error;
@@ -57,14 +64,38 @@ async function refreshDocument(
   }
   await execution.guard();
   // Queueing old references and publishing the new bundle are one fenced transaction.
-  await execution.deps.store.applyOffsetDocumentBundle(
-    execution.run.runId,
-    task,
-    normalized.docRow,
-    normalized.itemRows,
-    execution.now() + (task.contextId === 11 ? 30 : 0)
-  );
+  const refreshNotBefore = execution.now() + (task.contextId === 11 ? 30 : 0);
+  if (shipping) {
+    await execution.deps.store.applyOffsetDocumentBundle(
+      execution.run.runId, task, normalized.docRow, normalized.itemRows,
+      refreshNotBefore, shipping.patch,
+      shipping.issues.length
+        ? {
+            contextId: task.contextId! as 4 | 5,
+            documentId: task.id,
+            code: 'shipping_unknown',
+            updatedAt: execution.now(),
+          }
+        : null
+    );
+  } else {
+    await execution.deps.store.applyOffsetDocumentBundle(
+      execution.run.runId, task, normalized.docRow, normalized.itemRows, refreshNotBefore
+    );
+  }
   task.status = 'done';
+  delete task.errorCode;
+}
+
+async function hydrateShippingIfConfigured(
+  documents: {
+    get(contextId: 4 | 5 | 11, id: string): Promise<unknown>;
+    getSalesOrder?: (id: string) => Promise<unknown>;
+  },
+  payload: unknown
+) {
+  if (!documents.getSalesOrder) return undefined;
+  return hydrateOcShippingPatchSafely(documents as OCShippingDocumentsReadPort, payload);
 }
 
 async function refreshItem(execution: OffsetExecution, task: DocumentOffsetTask): Promise<void> {

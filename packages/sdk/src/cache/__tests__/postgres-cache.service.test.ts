@@ -2500,10 +2500,10 @@ describe('PostgresCacheService atomic document bundles', () => {
     expect(statements).toEqual(
       expect.arrayContaining([
         expect.stringContaining(
-          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE api_doc_id'
+          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, associated_document_id, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE api_doc_id'
         ),
         expect.stringContaining(
-          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE context_id = $1 AND doc_number = $2'
+          'SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, associated_document_id, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE context_id = $1 AND doc_number = $2'
         ),
         'ROLLBACK',
       ])

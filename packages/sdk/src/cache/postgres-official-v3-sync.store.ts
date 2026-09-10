@@ -1,5 +1,18 @@
 import type { PoolClient } from 'pg';
 import type { DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
+import type { OCShippingPatch } from './postgres-oc-shipping.store.js';
+import {
+  applyOCShippingPatch,
+  clearOCShippingEstimateUnknown,
+  clearOCShippingAuthority,
+  clearOCShippingDeletedSource,
+  reconcileOCShippingAuthority,
+} from './postgres-oc-shipping.store.js';
+import {
+  deleteOCShippingWarning,
+  writeOCShippingWarning,
+  type OCShippingWarning,
+} from './postgres-oc-shipping-warning.store.js';
 import type {
   OfficialV3SyncMarker,
   OfficialV3SyncPage,
@@ -191,7 +204,9 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     runId: string,
     task: OfficialV3SyncTask,
     document: DocumentRow,
-    lines: Omit<ItemDocumentRow, 'id'>[]
+    lines: Omit<ItemDocumentRow, 'id'>[],
+    shippingPatch?: OCShippingPatch | null,
+    shippingWarning?: OCShippingWarning | null
   ): Promise<void> {
     assertDocumentTask(task, document, lines);
     await this.options.withVerifiedWrite(async (client) => {
@@ -203,6 +218,25 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
         resolved,
         lines.map((line) => ({ ...line, doc_id: resolved.doc_id }))
       );
+      await reconcileOCShippingAuthority(
+        client,
+        resolved.api_doc_id ?? resolved.doc_id,
+        resolved.associated_document_id ?? null
+      );
+      if (shippingWarning) {
+        if (shippingWarning.contextId !== resolved.context_id || shippingWarning.documentId !== (resolved.api_doc_id ?? resolved.doc_id)) {
+          throw new Error('OC shipping warning does not match the document task.');
+        }
+        if (resolved.context_id === 5) await clearOCShippingAuthority(client, resolved.api_doc_id ?? resolved.doc_id);
+        else await clearOCShippingEstimateUnknown(client, resolved.api_doc_id ?? resolved.doc_id);
+        if (shippingPatch) await applyOCShippingPatch(client, shippingPatch);
+        await writeOCShippingWarning(client, shippingWarning);
+      } else {
+        if (shippingPatch) await applyOCShippingPatch(client, shippingPatch);
+        if (resolved.context_id === 4 || resolved.context_id === 5) {
+          await deleteOCShippingWarning(client, resolved.context_id, resolved.api_doc_id ?? resolved.doc_id);
+        }
+      }
       await this.complete(client, runId, persisted, 'done', task.attempts);
     });
   }
@@ -215,6 +249,9 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
       const persisted = await this.requireTask(client, runId, task);
       if (await this.completeIfStale(client, runId, persisted)) return;
       const resolvedDocId = await this.options.resolveDocumentIdByApiId(client, persisted.id);
+      await clearOCShippingDeletedSource(client, persisted.id);
+      if (persisted.resource === 'invoice') await deleteOCShippingWarning(client, 5, persisted.id);
+      if (persisted.resource === 'estimate') await deleteOCShippingWarning(client, 4, persisted.id);
       if (resolvedDocId) await this.options.deleteDocument(client, resolvedDocId);
       await this.complete(client, runId, persisted, 'done', task.attempts);
     });

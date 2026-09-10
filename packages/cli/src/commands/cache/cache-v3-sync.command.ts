@@ -5,6 +5,10 @@ import {
   createSyncLockLossGuard,
 } from './postgres-sync-lock-loss.guard.js';
 import type { OfficialV3SyncResult, OfficialV3SyncStore } from '@salesbinder/sdk';
+import type {
+  OCShippingReconciliationStatus,
+  SalesOrderShippingReconciliationResult,
+} from '@salesbinder/sdk';
 
 class OfficialV3SyncCommandError extends Error {}
 
@@ -40,7 +44,8 @@ export function registerCacheV3SyncCommand(cache: Command, program: Command): vo
         const store: OfficialV3SyncStore = pg.getOfficialV3SyncStore();
         if (options.status) {
           const status = await sdk.readOfficialV3SyncStatus(store);
-          console.log(formatJson(status));
+          const ocShipping = await pg.getOCShippingReconciliationStatus();
+          console.log(formatJson(status ? { ...status, ocShipping } : null));
           return;
         }
         lockKey = `salesbinder-cache-sync:${binding.accountIdentity}`;
@@ -83,7 +88,22 @@ export function registerCacheV3SyncCommand(cache: Command, program: Command): vo
           })
         );
         lockLoss.assertHeld();
-        console.log(formatJson(sanitizeResult(result)));
+        const reconcileOCShipping = sync.reconcileOCShipping;
+        if (!reconcileOCShipping) {
+          throw new Error('OC shipping reconciliation is unavailable for the PostgreSQL cache.');
+        }
+        console.error('[sync-v3] order-confirmation shipping reconciliation started');
+        const ocShipping = await awaitWhileSyncLockHeld(lockLoss, () =>
+          reconcileOCShipping({
+            accountIdentity: binding.accountIdentity,
+            onProgress: (progress) =>
+              console.error(
+                `[sync-v3] oc-shipping: ${progress.event}; scanned=${progress.scanned}; applied=${progress.applied}; failed=${progress.failed}`
+              ),
+          })
+        );
+        lockLoss.assertHeld();
+        console.log(formatJson(sanitizeResult(result, ocShipping)));
       } catch (error) {
         const message =
           error instanceof OfficialV3SyncCommandError
@@ -150,7 +170,10 @@ function validateSinceWindow(milliseconds: number, result: string | number): str
   return result;
 }
 
-function sanitizeResult(result: OfficialV3SyncResult): Record<string, unknown> {
+function sanitizeResult(
+  result: OfficialV3SyncResult,
+  ocShipping: SalesOrderShippingReconciliationResult
+): Record<string, unknown> {
   const run = result.run;
   return {
     run: {
@@ -168,7 +191,38 @@ function sanitizeResult(result: OfficialV3SyncResult): Record<string, unknown> {
     state: result.state,
     tasks: result.tasks,
     failures: result.failures,
+    ocShipping: sanitizeOCShipping(ocShipping),
     coverage: 'partial_catch_up',
+  };
+}
+
+function sanitizeOCShipping(
+  result: SalesOrderShippingReconciliationResult
+): Record<string, unknown> {
+  return {
+    status: sanitizeOCShippingStatus(result.status),
+    failures: result.failures.map((failure) => ({
+      code: failure.code,
+      documentId: failure.documentId,
+    })),
+    pendingWarnings: result.pendingWarnings,
+    coverage: 'active_sales_order_and_warning_reconciliation',
+  };
+}
+
+function sanitizeOCShippingStatus(status: OCShippingReconciliationStatus): Record<string, unknown> {
+  return {
+    version: status.version,
+    accountIdentity: status.accountIdentity,
+    status: status.status,
+    startedAt: status.startedAt,
+    updatedAt: status.updatedAt,
+    lastSuccessAt: status.lastSuccessAt,
+    finishedAt: status.finishedAt,
+    scanned: status.scanned,
+    applied: status.applied,
+    failed: status.failed,
+    errorCode: status.errorCode,
   };
 }
 

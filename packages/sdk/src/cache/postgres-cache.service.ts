@@ -63,6 +63,26 @@ import { assertCanonicalV3SourceId } from './v3-inventory-source-validation.js';
 import { PostgresInventoryChangeFeedStore } from './postgres-inventory-change-feed.store.js';
 import { PostgresDocumentOffsetStore } from './postgres-document-offset.store.js';
 import { PostgresOfficialV3SyncStore } from './postgres-official-v3-sync.store.js';
+import {
+  applyOCShippingPatch,
+  clearOCShippingAuthority,
+  readOCShippingKnownLinks,
+  readOCShippingReconciliationStatus,
+  writeOCShippingReconciliationStatus,
+  type OCShippingPatch,
+  type OCShippingProvenance,
+  type OCShippingReconciliationStatus,
+} from './postgres-oc-shipping.store.js';
+import {
+  applyOCShippingPatches,
+  type OCShippingPatchBulkResult,
+} from './postgres-oc-shipping-bulk.store.js';
+import {
+  deleteOCShippingWarning,
+  readOCShippingWarnings,
+  writeOCShippingWarning,
+  type OCShippingWarning,
+} from './postgres-oc-shipping-warning.store.js';
 import { PostgresReferenceRefreshStore } from './postgres-reference-refresh.store.js';
 import {
   SALESPERSON_DIRECTORY_META_KEY,
@@ -1352,15 +1372,61 @@ export class PostgresCacheService
     task: DocumentOffsetTask,
     document: DocumentRow,
     lines: Omit<ItemDocumentRow, 'id'>[],
-    refreshNotBefore: number
+    refreshNotBefore: number,
+    shippingPatch?: OCShippingPatch | null,
+    shippingWarning?: import('./postgres-oc-shipping-warning.store.js').OCShippingWarning | null
   ): Promise<void> {
     return this.offsetStore().applyOffsetDocumentBundle(
       runId,
       task,
       document,
       lines,
-      refreshNotBefore
+      refreshNotBefore,
+      shippingPatch,
+      shippingWarning
     );
+  }
+
+  async applyOCShippingPatch(shippingPatch: OCShippingPatch): Promise<import('./postgres-oc-shipping.store.js').OCShippingPatchApplication> {
+    return this.withVerifiedWrite((client) => applyOCShippingPatch(client, shippingPatch));
+  }
+
+  async applyOCShippingPatches(
+    shippingPatches: readonly OCShippingPatch[]
+  ): Promise<OCShippingPatchBulkResult> {
+    return this.withVerifiedWrite((client) => applyOCShippingPatches(client, shippingPatches));
+  }
+
+  async clearOCShippingAuthority(authorityId: string): Promise<void> {
+    await this.withVerifiedWrite((client) => clearOCShippingAuthority(client, authorityId));
+  }
+
+  async getOCShippingPendingWarnings(): Promise<readonly OCShippingWarning[]> {
+    return this.withReadOnlyTransaction((client) => readOCShippingWarnings(client));
+  }
+
+  async setOCShippingWarning(warning: OCShippingWarning): Promise<void> {
+    await this.withVerifiedWrite((client) => writeOCShippingWarning(client, warning));
+  }
+
+  async clearOCShippingWarning(contextId: 4 | 5, documentId: string): Promise<void> {
+    await this.withVerifiedWrite((client) => deleteOCShippingWarning(client, contextId, documentId));
+  }
+
+  async getOCShippingKnownLinks(): Promise<readonly OCShippingProvenance[]> {
+    return this.withReadOnlyTransaction((client) => readOCShippingKnownLinks(client));
+  }
+
+  async getOCShippingReconciliationStatus(): Promise<OCShippingReconciliationStatus | null> {
+    return this.withReadOnlyTransaction((client) => readOCShippingReconciliationStatus(client));
+  }
+
+  async setOCShippingReconciliationStatus(status: OCShippingReconciliationStatus): Promise<void> {
+    const binding = this.requireExpectedBinding();
+    if (status.accountIdentity !== binding.accountIdentity) {
+      throw new Error('OC shipping reconciliation account does not match the PostgreSQL cache binding.');
+    }
+    await this.withVerifiedWrite((client) => writeOCShippingReconciliationStatus(client, status));
   }
   applyOffsetInventoryBundle(
     runId: string,
@@ -3247,14 +3313,14 @@ export class PostgresCacheService
     const existingByApiId = doc.api_doc_id
       ? (
         await executor.query<DocumentIdentityRow>(
-            `SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE api_doc_id = $1`,
+            `SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, associated_document_id, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE api_doc_id = $1`,
             [doc.api_doc_id]
           )
         ).rows[0]
       : undefined;
     const existingByNumber = (
       await executor.query<DocumentIdentityRow>(
-        `SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE context_id = $1 AND doc_number = $2`,
+      `SELECT doc_id, api_doc_id, archived, user_id, salesperson_name, shipping_location, associated_document_id, customer_id, account_id, account_number, customer_number, supplier_number FROM documents WHERE context_id = $1 AND doc_number = $2`,
         [doc.context_id, doc.doc_number]
       )
     ).rows[0];
@@ -3288,6 +3354,9 @@ export class PostgresCacheService
             shipping_location: Object.prototype.hasOwnProperty.call(doc, 'shipping_location')
               ? doc.shipping_location
               : existing.shipping_location,
+            associated_document_id: Object.prototype.hasOwnProperty.call(doc, 'associated_document_id')
+              ? doc.associated_document_id
+              : existing.associated_document_id,
             ...this.preserveUnobservedDocumentNumbers(doc, existing),
           }
         : { ...doc, user_id: assignment.user_id, salesperson_name: assignment.salesperson_name }
@@ -3469,6 +3538,7 @@ interface DocumentIdentityRow {
   user_id?: string | null;
   salesperson_name?: string | null;
   shipping_location?: string | null;
+  associated_document_id?: string | null;
   customer_id?: string | null;
   account_id?: string | null;
   account_number?: number | null;

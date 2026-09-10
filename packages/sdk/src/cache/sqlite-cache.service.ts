@@ -772,7 +772,7 @@ export class SQLiteCacheService implements CacheService {
     const insert = this.db.prepare(this.upsertSql('documents', DOCUMENT_COLUMNS, 'doc_id'));
     const tx = this.db.transaction((documents: DocumentRow[]) => {
       for (const doc of documents)
-        insert.run(...this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocument(doc)));
+        insert.run(...this.valuesFor(DOCUMENT_COLUMNS, this.normalizeDocumentForWrite(doc)));
     });
     tx(docs);
     return Promise.resolve();
@@ -2186,11 +2186,13 @@ export class SQLiteCacheService implements CacheService {
     assertWellFormedDocumentApiId(doc.api_doc_id);
     const existingByApiId = doc.api_doc_id
       ? (this.db
-          .prepare(`SELECT doc_id, api_doc_id FROM documents WHERE api_doc_id = ?`)
+          .prepare(`SELECT doc_id, api_doc_id, associated_document_id FROM documents WHERE api_doc_id = ?`)
           .get(doc.api_doc_id) as DocumentIdentityRow | undefined)
       : undefined;
     const existingByNumber = this.db
-      .prepare(`SELECT doc_id, api_doc_id FROM documents WHERE context_id = ? AND doc_number = ?`)
+      .prepare(
+        `SELECT doc_id, api_doc_id, associated_document_id FROM documents WHERE context_id = ? AND doc_number = ?`
+      )
       .get(doc.context_id, doc.doc_number) as DocumentIdentityRow | undefined;
     assertWellFormedStoredDocumentIdentity(existingByApiId);
     assertWellFormedStoredDocumentIdentity(existingByNumber);
@@ -2202,7 +2204,17 @@ export class SQLiteCacheService implements CacheService {
       throw new Error('Cache document identity conflict.');
     }
     const existing = existingByApiId ?? existingByNumber;
-    return this.normalizeDocument(existing ? { ...doc, doc_id: existing.doc_id } : doc);
+    return this.normalizeDocument(
+      existing
+        ? {
+            ...doc,
+            doc_id: existing.doc_id,
+            ...(!hasObservedAssociatedDocumentId(doc)
+              ? { associated_document_id: existing.associated_document_id }
+              : {}),
+          }
+        : doc
+    );
   }
 
   private normalizeItemDocument(item: Omit<ItemDocumentRow, 'id'>): Record<string, unknown> {
@@ -2250,7 +2262,12 @@ export class SQLiteCacheService implements CacheService {
 interface DocumentIdentityRow {
   doc_id: string;
   api_doc_id: string | null;
+  associated_document_id: string | null;
 }
+
+const hasObservedAssociatedDocumentId = (doc: DocumentRow): boolean =>
+  Object.prototype.hasOwnProperty.call(doc, 'associated_document_id') &&
+  doc.associated_document_id !== undefined;
 
 const assertWellFormedDocumentApiId = (value: unknown): void => {
   if (value != null && (typeof value !== 'string' || hasUnpairedUtf16Surrogate(value))) {
@@ -2264,7 +2281,10 @@ const assertWellFormedStoredDocumentIdentity = (value: DocumentIdentityRow | und
     (typeof value.doc_id !== 'string' ||
       value.doc_id.length === 0 ||
       (value.api_doc_id !== null &&
-        (typeof value.api_doc_id !== 'string' || hasUnpairedUtf16Surrogate(value.api_doc_id))))
+        (typeof value.api_doc_id !== 'string' || hasUnpairedUtf16Surrogate(value.api_doc_id))) ||
+      (value.associated_document_id !== null &&
+        (typeof value.associated_document_id !== 'string' ||
+          hasUnpairedUtf16Surrogate(value.associated_document_id))))
   ) {
     throw new Error('Cached document identity is invalid.');
   }

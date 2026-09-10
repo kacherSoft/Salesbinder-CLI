@@ -107,10 +107,25 @@ function hasWarnings(result: CommandResult): boolean {
   const record = parsed as Record<string, unknown>;
   const run = record.run as Record<string, unknown> | undefined;
   const tasks = record.tasks as Record<string, unknown> | undefined;
+  const ocShipping = shippingStatus(record);
   return (
     run?.status === 'success_with_warnings' ||
     Number(tasks?.failed) > 0 ||
-    Number(tasks?.pending) > 0
+    Number(tasks?.pending) > 0 ||
+    ocShipping.status === 'success_with_warnings' ||
+    ocShipping.status === 'failed' ||
+    ocShipping.failed > 0
+  );
+}
+
+function hasShippingWarnings(result: CommandResult): boolean {
+  const parsed = parseTerminalJson(result.output);
+  if (!parsed || typeof parsed !== 'object') return false;
+  const shipping = shippingStatus(parsed as Record<string, unknown>);
+  return (
+    shipping.status === 'success_with_warnings' ||
+    shipping.status === 'failed' ||
+    shipping.failed > 0
   );
 }
 
@@ -141,7 +156,23 @@ function resultSummary(result: CommandResult): string | null {
     record.state && typeof record.state === 'object'
       ? (record.state as Record<string, unknown>)
       : {};
-  return `SalesBinder sync-v3 result: status=${status}; applied=${Number(tasks.applied) || 0}; failed=${Number(tasks.failed) || 0}; pending=${Number(tasks.pending) || 0}; cursorGap=${state.cursorGap === true}.`;
+  const ocShipping = shippingStatus(record);
+  return `SalesBinder sync-v3 result: status=${status}; applied=${Number(tasks.applied) || 0}; failed=${Number(tasks.failed) || 0}; pending=${Number(tasks.pending) || 0}; cursorGap=${state.cursorGap === true}; ocShippingStatus=${ocShipping.status}; ocShippingFailed=${ocShipping.failed}.`;
+}
+
+function shippingStatus(record: Record<string, unknown>): { status: string; failed: number } {
+  const shipping =
+    record.ocShipping && typeof record.ocShipping === 'object'
+      ? (record.ocShipping as Record<string, unknown>)
+      : {};
+  const status =
+    shipping.status && typeof shipping.status === 'object'
+      ? (shipping.status as Record<string, unknown>)
+      : {};
+  return {
+    status: typeof status.status === 'string' ? status.status : 'unavailable',
+    failed: Number(status.failed) || 0,
+  };
 }
 
 async function refreshReferences(
@@ -244,7 +275,9 @@ export function createCacheSyncScheduler(
               );
             } else if (hasWarnings(sync)) {
               warn(
-                'SalesBinder sync-v3 completed with warnings; the next cycle will resume durable work.'
+                hasShippingWarnings(sync)
+                  ? 'SalesBinder OC shipping reconciliation completed with warnings; the next cycle will retry its bounded source scan.'
+                  : 'SalesBinder sync-v3 completed with warnings; the next cycle will resume durable work.'
               );
             }
             const summary = resultSummary(sync);
