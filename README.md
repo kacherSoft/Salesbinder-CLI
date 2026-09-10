@@ -834,6 +834,15 @@ identity, freshness, or line-matching validation, is reported as
 source-unverified and preserved unchanged; it is never assumed archived or
 cleared.
 
+Historical cached OCs that are known absent from active-source coverage, or
+definitively not found by an exact per-record read, are intentionally excluded
+historical data for this repair. Preserve all existing cached values, `NULL`s,
+and lifecycle metadata unchanged; do not infer or write an archive flag. Do not
+delete, recreate, backfill, or keep probing those records solely to fill shipping
+gaps; no recovery chase is required for this business disposition. Transient
+429, 5xx, network, or account-authentication failures are not evidence that a
+record is historical or safe to ignore.
+
 #### Scheduled official V3 polling
 
 The URL-less runner invokes `cache sync-v3 --status` before each cycle. `null`
