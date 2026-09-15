@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { ApiResponseValidationError } from '../resources/api-response-validation.error.js';
 import { DocumentRecordError } from './document-source-validation.js';
+import { OCShippingContractError } from './oc-shipping.types.js';
 
 export class OfficialV3SyncError extends Error {
   constructor(readonly code: string) {
@@ -12,6 +13,7 @@ export class OfficialV3SyncError extends Error {
 export function officialV3LocalFailure(error: unknown): string | null {
   if (error instanceof ApiResponseValidationError) return 'invalid_record';
   if (error instanceof DocumentRecordError) return 'invalid_record';
+  if (error instanceof OCShippingContractError) return 'invalid_record';
   if (!axios.isAxiosError(error)) return null;
   const status = error.response?.status;
   if (status === 401 || status === 403 || status === 429 || status === 400) return null;

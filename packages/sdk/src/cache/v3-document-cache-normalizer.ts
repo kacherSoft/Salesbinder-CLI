@@ -17,6 +17,7 @@ import {
   parseV3SourceEstimateRelation,
   type ObservedV3DocumentRelation,
 } from './v3-document-relationship-normalizer.js';
+import { shippingPercentFromQuantities } from './shipping-quantity-percent.js';
 
 const OBJECTS = { 4: 'estimate', 5: 'invoice', 11: 'purchase_order' } as const;
 const RESOURCE_CONTEXTS = { estimate: 4, invoice: 5, purchase_order: 11 } as const;
@@ -153,6 +154,9 @@ export function normalizeV3DocumentCacheRows(
       },
     ];
   });
+  const shippedPercent = shippingPercentFromQuantities(
+    itemRows.map(({ quantity, quantity_shipped: quantityShipped }) => ({ quantity, quantityShipped }))
+  );
   return {
     docRow: {
       doc_id: payload.id,
@@ -189,7 +193,7 @@ export function normalizeV3DocumentCacheRows(
       ...associatedDocumentFields(associatedDocument),
       external_po_number: po ? null : text(payload.purchase_order_number),
       date_sent: payload.date_sent == null ? null : date(payload.date_sent),
-      shipped_percent: optionalNumber(payload.shipped_percent),
+      shipped_percent: shippedPercent,
       is_cancelled: status && /cancelled|canceled/i.test(status) ? 1 : 0,
     },
     itemRows,

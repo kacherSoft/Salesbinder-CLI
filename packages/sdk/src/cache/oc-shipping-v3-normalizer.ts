@@ -45,7 +45,6 @@ export function normalizeV3OCShippingSourceDocument(
     customerId: requiredUuid(record.customer_id, `${kind} customer_id`),
     lines: normalizeLines(record, kind, id),
     sourceEstimate: sourceEstimate(record, id),
-    shippedPercent: optionalPercent(record.shipped_percent),
   };
   if (kind === 'invoice') Object.assign(source, normalizeInvoiceAuthority(record));
   return source;
@@ -218,14 +217,6 @@ function optionalEpochSeconds(value: unknown, field: string): number | undefined
   if (value === undefined || value === null) return undefined;
   if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) throw invalid(`Invalid ${field}`);
   return Math.floor(Date.parse(value) / 1000);
-}
-
-function optionalPercent(value: unknown): number | null | undefined {
-  if (value === undefined) return undefined;
-  if (value === null) return null;
-  const parsed = parseSalesBinderFiniteDecimal(value);
-  if (!quantity(parsed) || parsed > 100) throw invalid('Invalid shipped_percent');
-  return parsed;
 }
 
 function optionalQuantity(value: unknown, field: string, maximum: number): number | null | undefined {

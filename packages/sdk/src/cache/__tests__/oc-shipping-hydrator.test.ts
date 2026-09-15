@@ -29,19 +29,23 @@ describe('OC shipping hydration', () => {
     });
   });
 
-  it('accepts canonical decimal text while rejecting non-finite shipping values', async () => {
+  it('derives shipping from canonical line quantities and ignores source headers', async () => {
     const result = await hydrateOcShippingPatch(
       readPort({
-        invoice: invoice({ shipped_percent: '50', lines: [line('invoice', 2, { quantity: '2.0', quantity_shipped: '1.0' })] }),
+        invoice: invoice({ shipped_percent: 200, lines: [line('invoice', 2, { quantity: '2.0', quantity_shipped: '1.0' })] }),
       }),
       estimate({ lines: [line('estimate', 1, { quantity: '2.0' })] })
     );
     expect(result.patch?.shippedPercent).toBe(50);
     expect(result.patch?.lines[0]?.quantityShipped).toBe(1);
 
-    await expect(
-      hydrateOcShippingPatch(readPort({ invoice: invoice({ shipped_percent: 'NaN' }) }), estimate())
-    ).rejects.toThrow('Invalid shipped_percent');
+    for (const header of ['200', 'NaN', undefined]) {
+      const source = invoice({ shipped_percent: header });
+      if (header === undefined) delete (source as { shipped_percent?: unknown }).shipped_percent;
+      await expect(hydrateOcShippingPatch(readPort({ invoice: source }), estimate())).resolves.toMatchObject({
+        patch: { shippedPercent: 50 },
+      });
+    }
   });
 
   it('does not infer standalone status from an omitted invoice relation', async () => {
