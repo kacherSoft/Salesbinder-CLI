@@ -2,19 +2,25 @@
 
 ## Platform
 
-The approved cache-sync runner is a private monorepo package deployed as a separate Coolify application. It has no public URL and must not expose an HTTP domain.
+The approved cache-sync runner is a private monorepo package targeting a separate URL-less Coolify application. It must not expose an HTTP domain.
 
-- Application: `SalesBinder CLI Scheduler`
-- Application UUID: `s0gcsk404kso88sc48s88wok`
+- Application: `SalesBinder Incremental Sync`
+- Application UUID: `boc8wkgsckk0o4084s84gkk8`
 - Project/environment: `PHUTHAITECH` / `dev`
-- Source: `kacherSoft/Salesbinder-CLI`, branch `main`
+- Source: installed GitHub App source ID `1`, repository `kacherSoft/Salesbinder-CLI`, branch `main`
+- Release pin: exact reviewed `main` commit, verified through deployment status.
 - Build pack: repository `Dockerfile`
-- First verified runtime commit: `f41159cb1fceed772b60eb7a43bdbdf37ac331b7`
 - Health: Coolify container state plus constant startup markers; HTTP health checks are disabled
 
-Tested `main` commit `782471f4948550b5c591fcb33f7fd1286a3aa10a` is deployed as the disabled canary. Normal and preview scopes both remain disabled, so the configured 300-second incremental cadence is not active. Actual official cache state remains 49/49 tasks complete at generation 169 with no cursor gap; no first new scheduled production cycle has run.
+Normal scope is enabled at a 300-second cache cadence, reference refresh runs with `SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS=cycle`, and preview remains disabled. Automatic work is limited to Monday–Saturday, `07:00 <= local time < 22:00`, in `Asia/Ho_Chi_Minh`; Sunday remains inactive.
 
-The activation restart is currently blocked before clone/build/start: the Coolify host's HTTPS `git ls-remote` connection to GitHub port 443 timed out after about 135 seconds and exited 128. The running CLI and cache data were unaffected. A Codex local-thread monitor named `monitor-salesbinder-incremental-sync` checks this known-disabled baseline every 10 minutes and stays quiet unless a new issue or read-only recovery signal appears; it is not a Coolify/server scheduler.
+Terminal official-V3 cursor errors such as `sync_scope_changed` or `rebuild_required` require operator reconciliation. Successful fresh reads prove current API access for those reads, but they do not prove that an old cursor remains compatible with the provider's current scope fingerprint. Old cursor rejection alone does not prove permission loss. Do not reset cursors automatically or start over from a fresh cursor on top of the existing cache.
+
+Historical app `s0gcsk404kso88sc48s88wok` is not present in the current app read. If it reappears during operations, keep it disabled and do not run it concurrently with the current app.
+
+Codex monitor `salesbinder-sync-report-gpt-5-5` is the active standalone reporting job at 11:00 and 16:00 Monday–Saturday in `Asia/Ho_Chi_Minh`. The old `monitor-salesbinder-incremental-sync` thread heartbeat is paused. These monitors are not Coolify/server schedulers.
+
+Historical note: earlier old-app activation attempts failed before clone/build/start on a GitHub `ls-remote` timeout, while the current GitHub App source built and ran successfully. That old-app timeout did not prove cache, credential, or SalesBinder API failure.
 
 The image uses a digest-pinned Node 22 base, installs production dependencies separately, runs as the unprivileged `node` user, and keeps `/app` root-owned. Startup fails before idling if the compiled CLI/SDK or native `better-sqlite3` runtime cannot load.
 
@@ -30,14 +36,14 @@ SALESBINDER_DB_URL
 SALESBINDER_READ_BACKEND=postgresql
 SALESBINDER_V3_SYNC_INITIAL_SINCE
 SALESBINDER_CACHE_SYNC_INTERVAL_SECONDS=300
-SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS=86400
+SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS=cycle
 ```
 
 Official incremental polling requires account name, subdomain, V3 key, cache PostgreSQL URL, and PostgreSQL read mode. It neither requires nor receives `SALESBINDER_CHANGE_FEED_DB_URL`. Reference refresh reads V3 customers, prospects, suppliers, and categories. `SALESBINDER_API_KEY` is optional and adds its explicit V2 users-directory portion; it is never an automatic fallback from V3.
 
 `SALESBINDER_V3_SYNC_INITIAL_SINCE` is consumed only when official status is `null`. Use a non-future timestamp inside the 90-day source retention window that belongs to this account's verified initialization. The PHUTHAITECH production boundary is `1788670542` (the original scan start), not a later repair time. Once durable state exists, the scheduler never reuses a fixed `--since`.
 
-`SALESBINDER_CACHE_SYNC_INTERVAL_SECONDS` defaults to `300`, accepts `60`–`604800`, and also accepts the relative presets `daily` and `weekly`. Use seconds for exact X-minute intervals. `SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS` defaults to `86400`; `0` or `disabled` turns reference refresh off. The runner supplies the enabled interval to `sync-references --if-stale`; durable last-attempt time throttles attempts, while resource last-success time remains the freshness signal. Poll cadence is separate from execution timeout: one healthy run may cross ticks, and missed ticks coalesce without overlap or backlog.
+`SALESBINDER_CACHE_SYNC_INTERVAL_SECONDS` defaults to `300`, accepts `60`–`604800`, and also accepts the relative presets `daily` and `weekly`. Use seconds for exact X-minute intervals. The current deployment sets `SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS=cycle`, so each eligible cache cycle invokes `sync-references` without `--if-stale`. Numeric reference intervals use `sync-references --if-stale <seconds>`; `0` or `disabled` turns reference refresh off. Poll cadence is separate from execution timeout: one healthy run may cross ticks, and missed ticks coalesce without overlap or backlog.
 
 Before credentials and canary validation are complete, set:
 
@@ -47,7 +53,7 @@ SALESBINDER_SCHEDULER_DISABLED=true
 
 This is the only supported credential-less startup. When enabling the runner, set `SALESBINDER_SCHEDULER_DISABLED=false` exactly; any other value keeps the container in disabled keepalive mode. Startup then fails closed unless the V3-only requirements above are valid. The bootstrap writes `/home/node/.salesbinder/config.json` atomically with mode `0600`, permits the V2 key to remain absent, and never logs values.
 
-Each cycle reads `cache sync-v3 --status`, then initializes null state, resumes incomplete/warning state (including its expected cursor gap), or polls clean applied-cursor state. Malformed/unreadable state, an inconsistent clean-success gap, expired history, or changed permissions requires reconciliation and never causes an automatic reset. PostgreSQL advisory locking rejects another writer as a safe skipped cycle. Legacy `cache status`, normal `cache sync`, the webhook ledger, and automatic weekly `--full` do not drive this runner.
+Each cycle reads `cache sync-v3 --status`, then initializes null state, resumes incomplete/warning state (including its expected cursor gap), or polls clean applied-cursor state. Malformed/unreadable state, an inconsistent clean-success gap, expired history, and terminal reconciliation errors such as `sync_scope_changed` or `rebuild_required` require reconciliation and never cause an automatic reset or repeated `--resume`. Reference refresh remains separately scheduled while official cursor reconciliation is pending. PostgreSQL advisory locking rejects another writer as a safe skipped cycle. Legacy `cache status`, normal `cache sync`, the webhook ledger, and automatic weekly `--full` do not drive this runner.
 
 The official feed uses one combined `item`, `invoice`, `estimate`, and `purchase_order` cursor. Feed pages default to 100 markers and the SDK accepts 1–500; this is a marker limit, not a count of complete hydrated records. Only source item markers create item work. Eligible item markers may share a root-items request in groups of at most 10 across intervening document markers, while preserving same-ID upsert/delete order; variation/location pagination and each item checkpoint remain separate. Document markers perform individual detail reads and mutate only their own bundles—document line references never queue item hydration. On legacy-state resume, unfinished derived `item_refresh` children become superseded without inventory writes or a new item-latest receipt; failed source work, completed receipts, and the cursor chain remain intact.
 
@@ -67,7 +73,7 @@ Official polling covers `item`, `invoice`, `estimate`, and `purchase_order` only
 
 The live Coolify instance is `4.0.0-beta.463`; earlier scheduled-task REST probing returned `404`. [Current Coolify documentation](https://next.coolify.io/docs/core/automation/scheduled-tasks/overview) describes scheduled tasks, but the live instance/API was not revalidated. The approved path therefore remains the existing self-scheduled URL-less runner. A future native task may invoke the same one-shot dispatcher only with its internal loop disabled. Do not run both schedulers or write directly to Coolify's internal database.
 
-To recover activation, first verify outbound DNS and TCP/HTTPS 443 from the Coolify host to GitHub. Then enable only normal scope and perform a runtime-recreating restart at the same reviewed SHA; preview must remain disabled. Confirm the enabled startup marker and the first official sync result before declaring polling active. Preserve the existing official cursor/state throughout—never reset the cursor to work around deployment or network failure.
+For deployment changes, keep only normal scope enabled and preview disabled. Confirm startup markers, exact deployed SHA, schedule values, business window, and the first official/reference results before declaring the new release healthy. Preserve the existing official cursor/state throughout; never reset the cursor to work around deployment or network failure.
 
 ## Commands
 
@@ -83,7 +89,7 @@ node packages/cli/dist/cli.js --account phuthaitech cache sync-v3
 
 # Inspect/run the separate reference refresh
 node packages/cli/dist/cli.js --account phuthaitech cache sync-references --status
-node packages/cli/dist/cli.js --account phuthaitech cache sync-references --if-stale 86400
+node packages/cli/dist/cli.js --account phuthaitech cache sync-references
 ```
 
 ## Rollback

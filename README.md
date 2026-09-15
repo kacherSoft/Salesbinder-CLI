@@ -790,15 +790,19 @@ to sales-order markers, so linked sales orders are reconciled separately with
 their own freshness check; this does not change the feed cursor contract.
 
 Line shipping is applied only for a validated, unambiguous source-line match at
-the item, variation/location, unit, and quantity scope. A missing or ambiguous
-match remains unknown rather than becoming a zero. This is active-source
-coverage, not a guarantee of complete archived-document coverage, and it does
-not change payment synchronization or payment-table scope.
+the item, variation/location, unit, and quantity scope. Source header shipping
+percentages are not authority; the compatibility `shipped_percent` field is
+derived from matched inventory-line `quantity_shipped / quantity` totals when
+all required quantities are known. A missing or ambiguous match remains unknown
+rather than becoming a zero. This is active-source coverage, not a guarantee of
+complete archived-document coverage, and it does not change payment
+synchronization or payment-table scope.
 
-Related-source contract failures are recorded as durable shipping warnings
-without failing the initiating feed task. Each run retries up to 500 oldest
-pending warnings in fair rotation; sales-order freshness remains independent of
-the feed cursor.
+Malformed shipping values on the initiating document are record-local official
+V3 failures, not run-fatal failures. Related-source contract failures are
+recorded as durable shipping warnings without failing the initiating feed task.
+Each run retries up to 500 oldest pending warnings in fair rotation; sales-order
+freshness remains independent of the feed cursor.
 
 The explicit repair operator stages the source and then plans against a fresh
 cache snapshot. V2 is discovery-only: it selects reciprocal, same-customer,

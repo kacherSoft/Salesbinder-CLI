@@ -13,6 +13,7 @@ const accountIdentity = 'salesbinder:acme';
 const itemA = '05c86ce5-c234-438b-9908-f518e42d42e4';
 const itemB = '709d2a43-12a9-4d85-a9d9-cb16e66cef53';
 const docId = 'c40e5d25-c573-48ec-aa46-9737eddf2513';
+const laterDocId = '74ce6f64-5388-4ce4-9a0e-d3ca3241cb03';
 const lineId = 'f60d6f78-7550-4ef0-bcbe-3e0ac367aa58';
 const batchIds = Array.from(
   { length: 12 },
@@ -280,6 +281,45 @@ describe('OfficialV3SyncService', () => {
     expect(h.hydrate).not.toHaveBeenCalled();
     expect(result.run.status).toBe('success');
     expect(result.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
+  });
+
+  it('contains malformed OC shipping lines as a record failure while later documents drain', async () => {
+    const h = harness();
+    Object.assign(h.documents, { getSalesOrder: jest.fn() });
+    h.pages.set('since:1788670542', {
+      changes: [
+        { resource: 'invoice', id: docId, operation: 'upsert' },
+        { resource: 'invoice', id: laterDocId, operation: 'upsert' },
+      ],
+      has_more: false,
+      next_cursor: 'cursor-1',
+    });
+    const malformed = invoice(docId);
+    ((malformed.lines as unknown[])[0] as Record<string, unknown>).quantity_shipped = '2';
+    h.documents.get
+      .mockResolvedValueOnce(malformed)
+      .mockResolvedValueOnce(invoice(laterDocId))
+      .mockResolvedValueOnce(malformed);
+
+    const result = await h.service.sync({ accountIdentity, since: 1788670542 });
+
+    expect(h.store.events).toEqual([
+      `failure:${docId}:invalid_record`,
+      `document:${laterDocId}`,
+      `failure:${docId}:invalid_record`,
+    ]);
+    expect(result).toMatchObject({
+      run: { status: 'success_with_warnings' },
+      state: { hasIngestionCursor: true, hasAppliedCursor: false, cursorGap: true },
+      tasks: { applied: 1, failed: 1, pending: 0 },
+      failures: [{ resource: 'invoice', id: docId, code: 'invalid_record' }],
+    });
+    expect(await h.store.listTasks(result.run.runId)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: docId, status: 'failed', errorCode: 'invalid_record' }),
+        expect.objectContaining({ id: laterDocId, status: 'done' }),
+      ])
+    );
   });
 
   it('resumes from original since when the first source page fails before sealing', async () => {

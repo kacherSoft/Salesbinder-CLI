@@ -52,6 +52,21 @@ test('selects strict official V3 transitions', () => {
   expect(selectSyncAction({ run: { status: 'unknown' } })).toBe('reconcile_required');
 });
 
+test('treats terminal reconciliation errors as no-sync outcomes before failed runs resume', () => {
+  for (const errorCode of [
+    'rebuild_required',
+    'invalid_cursor',
+    'sync_scope_changed',
+    'reconcile_required',
+    'cursor_expired',
+    'full_refresh_required',
+  ]) {
+    expect(selectSyncAction({ run: { status: 'failed', errorCode } })).toBe(
+      'reconcile_required'
+    );
+  }
+});
+
 test('disabled scheduler stays alive without executing commands', async () => {
   const calls: string[][] = [];
   const run = createCacheSyncScheduler({ disabled: true }, { executor: executor([], calls) });
@@ -295,6 +310,46 @@ test('runs references every eligible cycle when the explicit cycle cadence is se
   expect(calls.filter((args) => args.includes('sync-references'))).toEqual([
     ['--account', 'account', 'cache', 'sync-references'],
     ['--account', 'account', 'cache', 'sync-references'],
+  ]);
+});
+
+test('keeps reference refreshes running across terminal official reconciliation states', async () => {
+  const calls: string[][] = [];
+  const warnings: string[] = [];
+  let cycles = 0;
+  let scheduler: ReturnType<typeof createCacheSyncScheduler>;
+  scheduler = createCacheSyncScheduler(
+    config({ SALESBINDER_REFERENCE_SYNC_INTERVAL_SECONDS: 'cycle' }),
+    {
+      executor: executor(
+        [
+          { code: 0, output: JSON.stringify({ run: { status: 'failed', errorCode: 'rebuild_required' } }) },
+          { code: 0, output: JSON.stringify({ status: { run: { status: 'success' } } }) },
+          { code: 0, output: JSON.stringify({ run: { status: 'failed', errorCode: 'sync_scope_changed' } }) },
+          { code: 0, output: JSON.stringify({ status: { run: { status: 'success' } } }) },
+        ],
+        calls
+      ),
+      warn: (message) => warnings.push(message),
+      delay: async () => {
+        if (++cycles === 2) scheduler.stop();
+      },
+    }
+  );
+
+  await scheduler.run();
+
+  expect(calls).toEqual([
+    ['--account', 'account', 'cache', 'sync-v3', '--status'],
+    ['--account', 'account', 'cache', 'sync-references'],
+    ['--account', 'account', 'cache', 'sync-v3', '--status'],
+    ['--account', 'account', 'cache', 'sync-references'],
+  ]);
+  expect(calls.flat()).not.toContain('--resume');
+  expect(calls.flat()).not.toContain('--since');
+  expect(warnings).toEqual([
+    'SalesBinder sync-v3 state requires reconciliation; cursor state was not changed.',
+    'SalesBinder sync-v3 state requires reconciliation; cursor state was not changed.',
   ]);
 });
 

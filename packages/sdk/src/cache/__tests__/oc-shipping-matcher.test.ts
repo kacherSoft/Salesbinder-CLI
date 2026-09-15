@@ -26,14 +26,14 @@ describe('createOcShippingPatch', () => {
     expect(result).not.toHaveProperty('authorityId');
   });
 
-  it('maps a direct authoritative invoice by the complete immutable line scope', () => {
+  it('maps a direct authoritative invoice by complete scope and its matched quantities', () => {
     const result = createOcShippingPatch(estimate(), invoice({ shippedPercent: 0 }));
 
     expect(result).toMatchObject({
       associatedDocumentId: invoiceId,
       sourceKind: 'invoice',
       authorityId: invoiceId,
-      shippedPercent: 0,
+      shippedPercent: 50,
       lines: [{ documentItemId: lineId(1), quantityShipped: 1 }],
     });
   });
@@ -52,11 +52,13 @@ describe('createOcShippingPatch', () => {
     delete (missingScopeLine as { unitId?: unknown }).unitId;
     const missingScopeEstimate = estimate({ lines: [missingScopeLine] });
 
+    expect(createOcShippingPatch(estimate(), source)).toMatchObject({ shippedPercent: null });
     expect(createOcShippingPatch(estimate(), source).lines[0]?.quantityShipped).toBeNull();
     expect(createOcShippingPatch(duplicateEstimate, invoice()).lines.map((line) => line.quantityShipped)).toEqual([
       null,
       null,
     ]);
+    expect(createOcShippingPatch(missingScopeEstimate, invoice())).toMatchObject({ shippedPercent: null });
     expect(createOcShippingPatch(missingScopeEstimate, invoice()).lines[0]?.quantityShipped).toBeNull();
   });
 
@@ -72,6 +74,26 @@ describe('createOcShippingPatch', () => {
     const result = createOcShippingPatch(estimate(), partialInvoice, authority);
     expect(result).toMatchObject({ authorityId: orderId, shippedPercent: 75 });
     expect(result.lines[0]?.quantityShipped).toBe(1.5);
+  });
+
+  it('weights matched inventory lines and keeps zero or unknown totals unknown', () => {
+    const multiple = estimate({
+      lines: [line(1, { quantity: 2 }), line(4, { itemId: '10000000-0000-4000-8000-000000000006', quantity: 8 })],
+    });
+    const source = invoice({
+      shippedPercent: 0,
+      lines: [
+        line(2, { quantity: 2, quantityShipped: 2 }),
+        line(5, { itemId: '10000000-0000-4000-8000-000000000006', quantity: 8, quantityShipped: 2 }),
+      ],
+    });
+    expect(createOcShippingPatch(multiple, source).shippedPercent).toBe(40);
+
+    expect(
+      createOcShippingPatch(estimate({ lines: [line(1, { quantity: 0 })] }), invoice({ lines: [line(2, { quantity: 0, quantityShipped: 0 })] }))
+        .shippedPercent
+    ).toBeNull();
+    expect(createOcShippingPatch(estimate(), invoice({ lines: [line(2, { quantityShipped: null })] })).shippedPercent).toBeNull();
   });
 
   it('can produce a reportable null-shipping clear only after the converted source is proven', () => {

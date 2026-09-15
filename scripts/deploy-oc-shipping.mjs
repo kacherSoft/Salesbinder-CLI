@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 
 export const APP_UUID = 'boc8wkgsckk0o4084s84gkk8';
 export const OLD_APP_UUID = 's0gcsk404kso88sc48s88wok';
-export const PRIOR_SHA = 'dec07eb12c46aad5b51e206e8a3cf908ee4b2d1d';
+export const PRIOR_SHA = '4937a640da90174531ad3d572a262d36a4165ff1';
 export const REMOTE_REPOSITORY = 'https://github.com/kacherSoft/Salesbinder-CLI.git';
 const NAME = 'SalesBinder Incremental Sync';
 const REPOSITORIES = new Set([

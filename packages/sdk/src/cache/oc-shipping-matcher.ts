@@ -6,6 +6,7 @@ import {
   type OCShippingPatch,
   type OCShippingPatchLine,
 } from './oc-shipping.types.js';
+import { shippingPercentFromQuantities } from './shipping-quantity-percent.js';
 
 /**
  * Correlates OC inventory lines only when their immutable fulfillment scope is
@@ -27,6 +28,7 @@ export function createOcShippingPatch(
   const fulfillmentAuthority = authority ?? source;
   validateAuthority(source, fulfillmentAuthority);
 
+  const lines = matchLines(estimate.lines, fulfillmentAuthority.lines);
   return {
     estimateId: estimate.id,
     estimateNumber: estimate.number,
@@ -38,8 +40,8 @@ export function createOcShippingPatch(
     ...(fulfillmentAuthority.modified === undefined
       ? {}
       : { authorityModified: fulfillmentAuthority.modified }),
-    shippedPercent: knownPercent(fulfillmentAuthority.shippedPercent),
-    lines: matchLines(estimate.lines, fulfillmentAuthority.lines),
+    shippedPercent: shippingPercentFromQuantities(lines),
+    lines,
   };
 }
 
@@ -131,13 +133,6 @@ function validateSourceForEstimate(
     throw invalid('Invalid OC source identity');
   }
   validateLines(source.lines);
-  if (
-    source.shippedPercent !== undefined &&
-    source.shippedPercent !== null &&
-    knownPercent(source.shippedPercent) === null
-  ) {
-    throw invalid('Invalid source shipped percentage');
-  }
   if (!source.sourceEstimate.observed) throw invalid('Source estimate relation is unobserved');
   const sourceEstimate = source.sourceEstimate.value;
   if (
@@ -180,13 +175,6 @@ function validateAuthority(
     throw invalid('Invalid authority identity');
   }
   validateLines(authority.lines);
-  if (
-    authority.shippedPercent !== undefined &&
-    authority.shippedPercent !== null &&
-    knownPercent(authority.shippedPercent) === null
-  ) {
-    throw invalid('Invalid authority shipped percentage');
-  }
 }
 
 function matchLines(
@@ -270,10 +258,6 @@ function unconvertedPatch(estimate: OCShippingCanonicalEstimate): OCShippingPatc
     shippedPercent: null,
     lines: estimate.lines.map(clearLine),
   };
-}
-
-function knownPercent(value: number | null | undefined): number | null {
-  return value === undefined || value === null ? null : quantity(value) && value <= 100 ? value : null;
 }
 
 function knownQuantity(value: number | null | undefined, maximum: number): number | null {

@@ -18,8 +18,22 @@ export interface CacheSyncScheduler {
 }
 
 interface OfficialStatus {
-  run?: { status?: unknown };
+  run?: { status?: unknown; errorCode?: unknown };
   state?: { hasAppliedCursor?: unknown; cursorGap?: unknown };
+}
+
+/** Matches the CLI's reconciliation outcomes, plus the SDK's persisted invalid cursor code. */
+function requiresReconciliation(errorCode: unknown): boolean {
+  if (typeof errorCode !== 'string') return false;
+  return (
+    [
+      'account_mismatch',
+      'invalid_cursor',
+      'rebuild_required',
+      'reconcile_required',
+      'sync_scope_changed',
+    ].includes(errorCode) || /reconcile|cursor_expired|full_refresh/i.test(errorCode)
+  );
 }
 
 function parseTerminalJson(output: string): unknown | undefined {
@@ -46,6 +60,7 @@ export function selectSyncAction(status: unknown, initialSince?: string): SyncAc
   if (!status || typeof status !== 'object') return 'reconcile_required';
   const { run, state } = status as OfficialStatus;
   const runStatus = run?.status;
+  if (requiresReconciliation(run?.errorCode)) return 'reconcile_required';
   if (runStatus === 'running' || runStatus === 'failed' || runStatus === 'success_with_warnings') {
     return 'resume';
   }

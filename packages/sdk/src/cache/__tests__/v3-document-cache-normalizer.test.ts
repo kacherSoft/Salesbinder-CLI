@@ -69,7 +69,7 @@ function firstLine(doc: Record<string, unknown>): Record<string, unknown> {
 }
 
 describe('normalizeV3DocumentCacheRows', () => {
-  it('maps invoice identity, true subtotal, current shipping, and authoritative costs', () => {
+  it('maps invoice identity, quantity-derived shipping, true subtotal, and authoritative costs', () => {
     const result = normalizeV3DocumentCacheRows(invoice(), expected);
     expect(result.docRow).toMatchObject({
       doc_id: id,
@@ -99,6 +99,39 @@ describe('normalizeV3DocumentCacheRows', () => {
       }),
     ]);
     expect(Object.keys(result)).toEqual(['docRow', 'itemRows']);
+  });
+
+  it('ignores source shipping headers and derives weighted inventory shipping only', () => {
+    const doc = invoice();
+    doc.shipped_percent = 'garbage';
+    doc.lines = [
+      firstLine(doc),
+      {
+        ...firstLine(doc),
+        id: '394e9262-b64f-4e14-87b4-6b115ac339df',
+        item_id: '6dc1f4ca-2d23-4af5-9d96-6da5994cc353',
+        quantity: 8,
+        quantity_shipped: 2,
+      },
+      {
+        ...firstLine(doc),
+        id: '7f3398c4-54f2-4648-9365-789a7c757182',
+        item_id: null,
+        line_type: 'service',
+        quantity: 20,
+        quantity_shipped: 20,
+      },
+    ];
+    expect(normalizeV3DocumentCacheRows(doc, expected).docRow.shipped_percent).toBe(30);
+  });
+
+  it.each([
+    { quantity_shipped: null },
+    { quantity: 0, quantity_shipped: 0 },
+  ])('keeps shipping unknown when inventory quantities cannot yield a percentage: %j', (patch) => {
+    const doc = invoice();
+    Object.assign(firstLine(doc), patch);
+    expect(normalizeV3DocumentCacheRows(doc, expected).docRow.shipped_percent).toBeNull();
   });
 
   it('uses source line total costs for inventory and service, with sales discounts contributing zero cost', () => {
