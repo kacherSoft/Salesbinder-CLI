@@ -30,25 +30,32 @@ describe('PostgresOfficialV3SyncStore', () => {
     expect(h.task(oldDelete)).toMatchObject({ status: 'superseded' });
   });
 
-  it('applies document upserts without queueing item refresh tasks', async () => {
+  it('queues stock reconciliation children with the caller-provided eligibility time', async () => {
     const h = harness();
     const run = officialRun();
     const upsertTask = task(run.runId, 'upsert-doc', 1, 'upsert', 'invoice', apiDocId);
     h.seedRun(run);
     h.seedTask(upsertTask);
 
-    await h.store.applyDocumentUpsert(run.runId, upsertTask, document(apiDocId), [line(apiDocId, oldItemId)]);
+    await h.store.applyDocumentUpsert(
+      run.runId, upsertTask, document(apiDocId), [line(apiDocId, oldItemId)],
+      undefined, undefined, undefined, 130
+    );
 
     expect(h.documentWrites).toEqual([{ docId: apiDocId, itemIds: [oldItemId] }]);
-    expect(h.task(upsertTask)).toMatchObject({ status: 'done' });
-    expect(await h.store.listTasks(run.runId)).toHaveLength(1);
+    expect(h.task(upsertTask)).toMatchObject({ status: 'waiting_children' });
+    expect(await h.store.listTasks(run.runId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'stock_reconciliation', id: oldItemId, notBefore: 130, status: 'pending',
+      }),
+    ]));
     expect(h.client.query).not.toHaveBeenCalledWith(
       'SELECT item_id FROM item_documents WHERE doc_id = $1',
       expect.anything()
     );
   });
 
-  it('resolves document deletes through API identity without queueing old refs or touching CSV-only rows', async () => {
+  it('records stock history missing when a document delete has no durable target proof', async () => {
     const h = harness();
     const run = officialRun();
     const deleteTask = task(run.runId, 'delete-doc', 1, 'delete', 'invoice', apiDocId);
@@ -71,7 +78,7 @@ describe('PostgresOfficialV3SyncStore', () => {
     h.seedTask(missing);
     await h.store.applyDocumentDelete(run.runId, missing);
     expect(h.deletedDocuments).toEqual([localDocId]);
-    expect(h.task(missing)).toMatchObject({ status: 'done' });
+    expect(h.task(missing)).toMatchObject({ status: 'failed', errorCode: 'stock_history_missing' });
   });
 
   it('retires unfinished legacy item refresh children without inventory writes or latest item receipts', async () => {

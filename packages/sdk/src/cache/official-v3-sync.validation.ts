@@ -113,13 +113,14 @@ export function assertOfficialTask(value: unknown): asserts value is OfficialV3S
     !isPositiveInteger(task.page) ||
     !isNonNegativeInteger(task.ordinal) ||
     !isNonNegativeInteger(task.generation) ||
-    (task.kind !== 'marker' && task.kind !== 'item_refresh') ||
+    (task.kind !== 'marker' && task.kind !== 'item_refresh' && task.kind !== 'stock_reconciliation') ||
     (task.parentTaskId !== undefined && !isTaskId(task.parentTaskId)) ||
     !isResource(task.resource) ||
     !UUID.test(String(task.id)) ||
     !['upsert', 'delete', 'refresh'].includes(String(task.operation)) ||
     !['pending', 'waiting_children', 'done', 'superseded', 'failed'].includes(String(task.status)) ||
     !isNonNegativeInteger(task.attempts) ||
+    (task.notBefore !== undefined && !isNonNegativeInteger(task.notBefore)) ||
     (task.errorCode !== undefined && !SAFE_CODE.test(String(task.errorCode)))
   )
     throw persisted();

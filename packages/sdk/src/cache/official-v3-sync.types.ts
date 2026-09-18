@@ -1,6 +1,7 @@
 import type { DocumentRow, ItemDocumentRow, ItemRow, ItemStockLocationRow } from './types.js';
 import type { OCShippingPatch } from './postgres-oc-shipping.store.js';
 import type { OCShippingWarning } from './postgres-oc-shipping-warning.store.js';
+import type { OfficialV3DocumentStockSignature } from './official-v3-stock-reconciliation.js';
 
 export const OFFICIAL_V3_SYNC_RESOURCES = [
   'item',
@@ -64,7 +65,7 @@ export interface OfficialV3SyncTask {
   page: number;
   ordinal: number;
   generation: number;
-  kind: 'marker' | 'item_refresh';
+  kind: 'marker' | 'item_refresh' | 'stock_reconciliation';
   parentTaskId?: string;
   resource: OfficialV3SyncResource;
   id: string;
@@ -72,6 +73,7 @@ export interface OfficialV3SyncTask {
   status: OfficialV3SyncTaskStatus;
   attempts: number;
   errorCode?: string;
+  notBefore?: number;
 }
 
 export interface OfficialV3SyncStore {
@@ -100,9 +102,15 @@ export interface OfficialV3SyncStore {
     document: DocumentRow,
     lines: Omit<ItemDocumentRow, 'id'>[],
     shippingPatch?: OCShippingPatch | null,
-    shippingWarning?: OCShippingWarning | null
+    shippingWarning?: OCShippingWarning | null,
+    stockSignature?: OfficialV3DocumentStockSignature | null,
+    stockReconciliationNotBefore?: number
   ): Promise<void>;
-  applyDocumentDelete(runId: string, task: OfficialV3SyncTask): Promise<void>;
+  applyDocumentDelete(
+    runId: string,
+    task: OfficialV3SyncTask,
+    stockReconciliationNotBefore?: number
+  ): Promise<void>;
   retireLegacyItemRefreshTasks(runId: string): Promise<void>;
   applyItemRefresh(
     runId: string,

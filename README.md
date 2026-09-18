@@ -173,7 +173,7 @@ PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `
 
 Inventory change-feed sync uses a separate PostgreSQL ledger database configured with `SALESBINDER_CHANGE_FEED_DB_URL`. The cache database and the ledger database are both one-account-per-database resources; they must be distinct database targets, and the CLI validates that they represent the same SalesBinder account before it reads or writes feed-backed inventory state. `cache status` reports only sanitized ledger reachability and progress, not raw connection details.
 
-The approved cache-sync runner lives as a private monorepo package (`packages/cache-sync-runner`) and is deployed as a separate URL-less Coolify app. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. The next runner release schedules the official V3 partial catch-up from its durable status: initialize uninitialized state once, resume incomplete/warning state, and poll clean state from the retained applied cursor. It defaults to 300 seconds, never depends on the webhook ledger, and never launches legacy `cache sync` or automatic weekly `--full`. Feature branches stay in PRs until reviewed; only reviewed `main` commits promote to the Coolify app. The currently deployed app remains disabled on the earlier verified image until that promotion and canary complete. See [Deployment](docs/deployment.md) for configuration, activation gates, and rollback.
+The approved cache-sync runner lives as a private monorepo package (`packages/cache-sync-runner`) and is deployed as a separate URL-less Coolify app. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. The deployed normal runner schedules the official V3 partial catch-up from its durable status: initialize uninitialized state once, resume incomplete/warning state, and poll clean state from the retained applied cursor. It defaults to 300 seconds, never depends on the webhook ledger, and never launches legacy `cache sync` or automatic weekly `--full`. Feature branches stay in PRs until reviewed; only reviewed `main` commits promote to the Coolify app. See [Deployment](docs/deployment.md) for configuration, activation gates, and rollback.
 
 The PostgreSQL schema is created automatically on first use.
 
@@ -747,14 +747,37 @@ then drains pending or failed work; already completed tasks are not replayed.
 Already applied data and prior warnings remain available for inspection and resume.
 The combined feed requests `item`, `invoice`, `estimate`, and `purchase_order`
 markers together. Its page limit defaults to 100 and the SDK accepts 1–500;
-that number counts change markers, not fully hydrated records. Only source
-`item` markers create item work. Eligible item markers may group across
-intervening document markers, at most 10 distinct root IDs per root-items
-request, while preserving same-ID upsert/delete order. Variation/location
-pagination and each item's atomic checkpoint remain separate, so this is not a
-complete ten-item sync in one HTTP request. Document markers use individual
-detail reads and update only their own document bundles; they never derive item
-work from document line references.
+that number counts change markers, not fully hydrated records. Source `item`
+upsert markers create exact item hydration work, and eligible item hydrations
+may group across intervening document markers, at most 10 distinct root IDs per
+root-items request, while preserving same-ID upsert/delete order.
+Variation/location pagination and each item's atomic checkpoint remain
+separate, so this is not a complete ten-item sync in one HTTP request.
+
+Document markers hydrate their own document bundles first. The first
+observation bootstraps a stock-signature sidecar from the source payload,
+including item, location, and variation-location identity, then later runs
+compare it with the persisted signature. When bootstrapping from old cached
+document rows, the first active stock comparison queues the union of old and new
+item IDs; after the sidecar exists, exact target metadata can also prove no item
+refresh is needed. They queue durable `stock_reconciliation` item refresh
+children only when that signature changes an inventory-owning state.
+Estimate/quote changes remain document-only. Invoice stock impact is based on
+line item, quantity, location, and cancelled/deleted state; metadata-only
+invoice edits do not refresh items. Purchase-order stock impact is based on
+stock-state transitions, including sent/received states, and active line item,
+quantity, location, and received quantity; draft or open metadata edits do not
+refresh referenced items. Stock-reconciliation children carry a durable
+30-second `notBefore` delay so source-side balances can settle; the runner
+waits for that delay only when no other runnable task remains. A parent
+document task waits for these children, and the applied cursor advances only
+after the parent and its stock reconciliation children are done or superseded.
+An invoice or purchase-order delete with no sidecar and no cached document
+history is retained as a `stock_history_missing` failed task for operator review
+instead of fabricating item IDs or deleting unknown inventory; the run remains
+partial catch-up coverage until that task is resolved. Stock-reconciliation
+children are not satisfied by earlier item upsert receipts; only a later
+positive item delete receipt can supersede them.
 
 When old durable state contains document-derived `item_refresh` children,
 resume supersedes unfinished children without an inventory write or new
