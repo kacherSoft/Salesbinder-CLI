@@ -3,12 +3,14 @@ import { officialV3LocalFailure } from './official-v3-sync-failure.js';
 import type { OfficialV3SyncTask } from './official-v3-sync.types.js';
 import type { V3ExactItemHydrationResult } from './v3-exact-item-hydrator.service.js';
 import { normalizeOfficialV3DocumentCacheRows } from './v3-document-cache-normalizer.js';
+import { createOfficialV3DocumentStockSignatureFromPayload } from './official-v3-stock-reconciliation.js';
 import { hydrateOcShippingPatchSafely } from './oc-shipping-hydrator.js';
 import type { OCShippingDocumentsReadPort } from './oc-shipping.types.js';
 import type { NormalizedV3InventoryItem } from './v3-inventory-normalizer.js';
 
 const DOCUMENT_CONTEXTS = { invoice: 5, estimate: 4, purchase_order: 11 } as const;
 const ITEM_HYDRATION_BATCH_LIMIT = 10;
+const STOCK_RECONCILIATION_SETTLEMENT_SECONDS = 30;
 
 export async function drainOfficialV3Tasks(execution: OfficialV3TaskExecution): Promise<void> {
   await execution.deps.store.retireLegacyItemRefreshTasks(execution.runId);
@@ -40,9 +42,16 @@ async function drainPendingToQuiescence(execution: OfficialV3TaskExecution): Pro
     progressed = false;
     await completeWaitingParents(execution);
     const tasks = await execution.deps.store.listTasks(execution.runId);
-    const task = tasks.find((candidate) => candidate.status === 'pending');
-    if (!task) continue;
-    if (isBatchableItemUpsert(task)) {
+    const task = nextRunnableTask(tasks, execution.now());
+    if (!task) {
+      const waitMs = stockReconciliationWaitMs(tasks, execution.now());
+      if (waitMs > 0) {
+        await (execution.deps.sleep ?? defaultSleep)(waitMs);
+        progressed = true;
+      }
+      continue;
+    }
+    if (isBatchableItemHydration(task)) {
       await processItemHydrationBatch(execution, tasks, task);
     } else {
       await processTask(execution, task);
@@ -69,7 +78,11 @@ async function processTask(
   try {
     if (next.operation === 'delete') {
       if (next.resource === 'item') await execution.deps.store.applyItemDelete(execution.runId, next);
-      else await execution.deps.store.applyDocumentDelete(execution.runId, next);
+      else await execution.deps.store.applyDocumentDelete(
+        execution.runId,
+        next,
+        execution.now() + STOCK_RECONCILIATION_SETTLEMENT_SECONDS
+      );
       return;
     }
     if (next.resource === 'item') {
@@ -92,7 +105,7 @@ async function processItemHydrationBatch(
   tasks: readonly OfficialV3SyncTask[],
   first: OfficialV3SyncTask
 ): Promise<void> {
-  const selected = selectItemHydrationBatch(tasks, first);
+  const selected = selectItemHydrationBatch(tasks, first, execution.now());
   const runnable: OfficialV3SyncTask[] = [];
   for (const task of selected) {
     await execution.guard();
@@ -107,7 +120,7 @@ async function processItemHydrationBatch(
   let results: V3ExactItemHydrationResult[];
   try {
     results = await execution.deps.hydrator.hydrate(
-      runnable.map((task) => task.id),
+      uniqueTaskIds(runnable),
       { categoryNames: execution.deps.categoryNames ?? null }
     );
   } catch (error) {
@@ -140,16 +153,20 @@ async function processItemHydrationBatch(
 
 function selectItemHydrationBatch(
   tasks: readonly OfficialV3SyncTask[],
-  first: OfficialV3SyncTask
+  first: OfficialV3SyncTask,
+  now: number
 ): OfficialV3SyncTask[] {
   const selected: OfficialV3SyncTask[] = [];
   const seen = new Set<string>();
   const start = tasks.findIndex((task) => task.taskId === first.taskId);
+  const stockPhase = first.kind === 'stock_reconciliation';
   for (const task of tasks.slice(start)) {
-    if (selected.length >= ITEM_HYDRATION_BATCH_LIMIT) break;
     if (task.status !== 'pending') continue;
-    if (isBatchableItemUpsert(task)) {
-      if (seen.has(task.id)) break;
+    if (isBatchableItemHydration(task)) {
+      if (task.kind === 'stock_reconciliation' && (task.notBefore ?? 0) > now) continue;
+      if (stockPhase && seen.size >= ITEM_HYDRATION_BATCH_LIMIT && !seen.has(task.id)) continue;
+      if (!stockPhase && seen.size >= ITEM_HYDRATION_BATCH_LIMIT) break;
+      if (seen.has(task.id) && task.kind !== 'stock_reconciliation') break;
       selected.push(task);
       seen.add(task.id);
       continue;
@@ -159,20 +176,43 @@ function selectItemHydrationBatch(
   return selected;
 }
 
-function isBatchableItemUpsert(task: OfficialV3SyncTask): boolean {
+function isBatchableItemHydration(task: OfficialV3SyncTask): boolean {
   return (
     task.status === 'pending' &&
-    task.kind === 'marker' &&
     task.resource === 'item' &&
-    task.operation === 'upsert'
+    ((task.kind === 'marker' && task.operation === 'upsert') ||
+      (task.kind === 'stock_reconciliation' && task.operation === 'refresh'))
   );
+}
+
+function nextRunnableTask(
+  tasks: readonly OfficialV3SyncTask[],
+  now: number
+): OfficialV3SyncTask | undefined {
+  return tasks.find((task) => task.status === 'pending' && task.kind !== 'stock_reconciliation')
+    ?? tasks.find((task) => task.status === 'pending' && task.kind === 'stock_reconciliation' && (task.notBefore ?? 0) <= now);
+}
+
+function stockReconciliationWaitMs(tasks: readonly OfficialV3SyncTask[], now: number): number {
+  const waits = tasks
+    .filter((task) => task.status === 'pending' && task.kind === 'stock_reconciliation' && (task.notBefore ?? 0) > now)
+    .map((task) => (task.notBefore ?? now) - now);
+  return waits.length ? Math.min(Math.min(...waits) * 1000, 30_000) : 0;
+}
+
+function defaultSleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+
+function uniqueTaskIds(tasks: readonly OfficialV3SyncTask[]): string[] {
+  return [...new Set(tasks.map((task) => task.id))];
 }
 
 function itemHydrationResultMap(
   tasks: readonly OfficialV3SyncTask[],
   results: readonly V3ExactItemHydrationResult[]
 ): Map<string, V3ExactItemHydrationResult> {
-  if (results.length !== tasks.length) throw new Error('Official V3 item hydration identity mismatch');
   const expected = new Set(tasks.map((task) => task.id));
   const byId = new Map<string, V3ExactItemHydrationResult>();
   for (const result of results) {
@@ -224,12 +264,21 @@ async function applyItemHydrationResult(
   if (task.kind === 'item_refresh') {
     throw new Error('Official V3 legacy item refresh task was not retired.');
   }
-  await execution.deps.store.applyItemUpsert(
-    execution.runId,
-    task,
-    bundle.item,
-    bundle.stockRows
-  );
+  if (task.kind === 'stock_reconciliation') {
+    await execution.deps.store.applyItemRefresh(
+      execution.runId,
+      task,
+      bundle.item,
+      bundle.stockRows
+    );
+  } else {
+    await execution.deps.store.applyItemUpsert(
+      execution.runId,
+      task,
+      bundle.item,
+      bundle.stockRows
+    );
+  }
 }
 
 async function applyDocumentHydration(
@@ -248,6 +297,8 @@ async function applyDocumentHydration(
     resource === 'invoice' || resource === 'estimate'
       ? await hydrateShippingIfConfigured(execution.deps.documents, payload)
       : undefined;
+  const stockSignature = createOfficialV3DocumentStockSignatureFromPayload(payload, contextId);
+  const stockReconciliationNotBefore = execution.now() + STOCK_RECONCILIATION_SETTLEMENT_SECONDS;
   if (shipping) {
     await execution.deps.store.applyDocumentUpsert(
       execution.runId,
@@ -262,11 +313,15 @@ async function applyDocumentHydration(
             code: 'shipping_unknown',
             updatedAt: execution.now(),
           }
-        : null
+        : null,
+      stockSignature,
+      stockReconciliationNotBefore
     );
   } else {
     await execution.deps.store.applyDocumentUpsert(
-      execution.runId, task, normalized.docRow, normalized.itemRows
+      execution.runId, task, normalized.docRow, normalized.itemRows, undefined, undefined,
+      stockSignature,
+      stockReconciliationNotBefore
     );
   }
 }

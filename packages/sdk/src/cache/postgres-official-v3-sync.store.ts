@@ -25,6 +25,12 @@ import {
   OFFICIAL_V3_SYNC_RESOURCES,
 } from './official-v3-sync.types.js';
 import {
+  createOfficialV3DocumentStockSignature,
+  parseOfficialV3DocumentStockSignature,
+  stockReconciliationItemIds,
+  type OfficialV3DocumentStockSignature,
+} from './official-v3-stock-reconciliation.js';
+import {
   OFFICIAL_V3_SYNC_CURRENT_KEY,
   OFFICIAL_V3_SYNC_CURRENT_RUN_KEY,
   assertMarker,
@@ -206,13 +212,20 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     document: DocumentRow,
     lines: Omit<ItemDocumentRow, 'id'>[],
     shippingPatch?: OCShippingPatch | null,
-    shippingWarning?: OCShippingWarning | null
+    shippingWarning?: OCShippingWarning | null,
+    stockSignature?: OfficialV3DocumentStockSignature | null,
+    stockReconciliationNotBefore?: number
   ): Promise<void> {
     assertDocumentTask(task, document, lines);
     await this.options.withVerifiedWrite(async (client) => {
       const persisted = await this.requireTask(client, runId, task);
       if (await this.completeIfStale(client, runId, persisted)) return;
+      const before = await this.readDocumentStockSignature(client, persisted.id);
       const resolved = await this.options.resolveDocument(client, document);
+      const after = stockSignature ?? createOfficialV3DocumentStockSignature(resolved, lines);
+      const stockItemIds = before.source === 'fallback'
+        ? bootstrapStockReconciliationItemIds(before.signature, after)
+        : stockReconciliationItemIds(before.signature, after);
       await this.options.writeDocument(
         client,
         resolved,
@@ -237,23 +250,56 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
           await deleteOCShippingWarning(client, resolved.context_id, resolved.api_doc_id ?? resolved.doc_id);
         }
       }
-      await this.complete(client, runId, persisted, 'done', task.attempts);
+      await this.writeDocumentStockSignature(client, persisted.id, after);
+      if (stockItemIds.length > 0) {
+        await this.queueStockReconciliationTasks(
+          client, runId, persisted, stockItemIds,
+          requireStockReconciliationNotBefore(stockReconciliationNotBefore)
+        );
+        await putJson(client, officialTaskKey(runId, persisted.taskId), {
+          ...persisted,
+          status: 'waiting_children',
+          attempts: Math.max(persisted.attempts, task.attempts),
+        });
+      } else {
+        await this.complete(client, runId, persisted, 'done', task.attempts);
+      }
     });
   }
 
   async applyDocumentDelete(
     runId: string,
-    task: OfficialV3SyncTask
+    task: OfficialV3SyncTask,
+    stockReconciliationNotBefore?: number
   ): Promise<void> {
     await this.options.withVerifiedWrite(async (client) => {
       const persisted = await this.requireTask(client, runId, task);
       if (await this.completeIfStale(client, runId, persisted)) return;
       const resolvedDocId = await this.options.resolveDocumentIdByApiId(client, persisted.id);
+      const before = await this.readDocumentStockSignature(client, persisted.id);
+      const stockItemIds = stockReconciliationItemIds(before.signature, null);
+      if (!before.signature && !resolvedDocId && persisted.resource !== 'estimate') {
+        await this.saveTaskFailureInTransaction(client, runId, persisted, 'stock_history_missing');
+        return;
+      }
       await clearOCShippingDeletedSource(client, persisted.id);
       if (persisted.resource === 'invoice') await deleteOCShippingWarning(client, 5, persisted.id);
       if (persisted.resource === 'estimate') await deleteOCShippingWarning(client, 4, persisted.id);
       if (resolvedDocId) await this.options.deleteDocument(client, resolvedDocId);
-      await this.complete(client, runId, persisted, 'done', task.attempts);
+      await this.deleteDocumentStockSignature(client, persisted.id);
+      if (stockItemIds.length > 0) {
+        await this.queueStockReconciliationTasks(
+          client, runId, persisted, stockItemIds,
+          requireStockReconciliationNotBefore(stockReconciliationNotBefore)
+        );
+        await putJson(client, officialTaskKey(runId, persisted.taskId), {
+          ...persisted,
+          status: 'waiting_children',
+          attempts: Math.max(persisted.attempts, task.attempts),
+        });
+      } else {
+        await this.complete(client, runId, persisted, 'done', task.attempts);
+      }
     });
   }
 
@@ -419,11 +465,125 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     return true;
   }
 
+  private async saveTaskFailureInTransaction(
+    client: PoolClient,
+    runId: string,
+    task: OfficialV3SyncTask,
+    code: string
+  ): Promise<void> {
+    await putJson(client, officialTaskKey(runId, task.taskId), {
+      ...task,
+      status: 'failed',
+      errorCode: code,
+    });
+  }
+
   private async hasNewerReceipt(client: PoolClient, task: OfficialV3SyncTask): Promise<boolean> {
     const latest = await readJson(client, officialLatestReceiptKey(task.resource, task.id));
     if (!latest) return false;
-    const receipt = latest as { generation?: unknown };
-    return typeof receipt.generation === 'number' && receipt.generation > task.generation;
+    const receipt = latest as { generation?: unknown; operation?: unknown };
+    if (typeof receipt.generation !== 'number' || receipt.generation <= task.generation) return false;
+    if (task.kind === 'stock_reconciliation') return receipt.operation === 'delete';
+    return true;
+  }
+
+  private async readDocumentStockSignature(
+    client: PoolClient,
+    apiDocId: string
+  ): Promise<DocumentStockSignatureRead> {
+    const persisted = await readJson(client, officialDocumentStockSignatureKey(apiDocId));
+    if (persisted !== null) {
+      const signature = parseOfficialV3DocumentStockSignature(persisted);
+      if (!signature) throw new Error('Invalid persisted official V3 document stock signature.');
+      return { signature, source: 'sidecar' };
+    }
+    const resolvedDocId = await this.options.resolveDocumentIdByApiId(client, apiDocId);
+    if (!resolvedDocId) return { signature: null, source: 'missing' };
+    const doc = await client.query<{
+      context_id: number;
+      is_cancelled: number | null;
+      status_name: string | null;
+      status_id: number | null;
+      date_sent: string | null;
+    }>('SELECT context_id, is_cancelled, status_name, status_id, date_sent FROM documents WHERE doc_id = $1', [resolvedDocId]);
+    if (!doc.rows[0]) return { signature: null, source: 'missing' };
+    const lines = await client.query<{
+      item_id: string;
+      quantity: string | number | null;
+      quantity_received: string | number | null;
+      quantity_shipped: string | number | null;
+      item_location: string | null;
+    }>(
+      `SELECT item_id, quantity, quantity_received, quantity_shipped, item_location
+       FROM item_documents WHERE doc_id = $1`,
+      [resolvedDocId]
+    );
+    return { signature: createOfficialV3DocumentStockSignature(
+      {
+        context_id: doc.rows[0].context_id,
+        is_cancelled: doc.rows[0].is_cancelled,
+        status_name: doc.rows[0].status_name,
+        status_id: doc.rows[0].status_id,
+        date_sent: doc.rows[0].date_sent,
+      } as Pick<DocumentRow, 'context_id' | 'is_cancelled' | 'status_name' | 'status_id' | 'date_sent'>,
+      lines.rows.map((line) => ({
+        item_id: line.item_id,
+        quantity: numeric(line.quantity),
+        quantity_received: numeric(line.quantity_received),
+        quantity_shipped: numeric(line.quantity_shipped),
+        item_location: line.item_location,
+      }))
+    ), source: 'fallback' };
+  }
+
+  private async writeDocumentStockSignature(
+    client: PoolClient,
+    apiDocId: string,
+    signature: OfficialV3DocumentStockSignature
+  ): Promise<void> {
+    await putJson(client, officialDocumentStockSignatureKey(apiDocId), signature);
+  }
+
+  private async deleteDocumentStockSignature(client: PoolClient, apiDocId: string): Promise<void> {
+    await client.query('DELETE FROM cache_meta WHERE key = $1', [
+      officialDocumentStockSignatureKey(apiDocId),
+    ]);
+  }
+
+  private async queueStockReconciliationTasks(
+    client: PoolClient,
+    runId: string,
+    parent: OfficialV3SyncTask,
+    itemIds: readonly string[],
+    notBefore: number
+  ): Promise<void> {
+    const unique = [...new Set(itemIds)].sort();
+    for (let index = 0; index < unique.length; index++) {
+      const id = unique[index]!;
+      const child: OfficialV3SyncTask = {
+        taskId: `${parent.taskId}:stock:${id}`,
+        runId,
+        page: parent.page,
+        ordinal: parent.ordinal,
+        generation: parent.generation,
+        kind: 'stock_reconciliation',
+        parentTaskId: parent.taskId,
+        resource: 'item',
+        id,
+        operation: 'refresh',
+        status: 'pending',
+        attempts: 0,
+        notBefore,
+      };
+      assertOfficialTask(child);
+      const key = officialTaskKey(runId, child.taskId);
+      const existing = await readJson(client, key);
+      if (existing) {
+        assertOfficialTask(existing);
+        if (existing.status === 'done' || existing.status === 'superseded') continue;
+      }
+      await putJson(client, key, existing ? { ...child, attempts: (existing as OfficialV3SyncTask).attempts } : child);
+    }
   }
 
   private async completeWaitingParents(
@@ -502,6 +662,41 @@ function markerTask(
   };
 }
 
+function officialDocumentStockSignatureKey(apiDocId: string): string {
+  return `official_v3_sync.document_stock.v1:${apiDocId}`;
+}
+
+function numeric(value: string | number | null): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+interface DocumentStockSignatureRead {
+  signature: OfficialV3DocumentStockSignature | null;
+  source: 'sidecar' | 'fallback' | 'missing';
+}
+
+function bootstrapStockReconciliationItemIds(
+  before: OfficialV3DocumentStockSignature | null,
+  after: OfficialV3DocumentStockSignature
+): string[] {
+  const contextId = after.contextId ?? before?.contextId;
+  if (contextId !== 5 && contextId !== 11) return [];
+  if (before?.stockState !== 'active' && after.stockState !== 'active') return [];
+  return [...new Set([...(before?.lines ?? []), ...after.lines].map((line) => line.itemId))].sort();
+}
+
+function requireStockReconciliationNotBefore(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error('Official V3 stock reconciliation eligibility time is invalid.');
+  }
+  return value;
+}
+
 function canResumeInitialSinceRun(
   current: OfficialV3SyncRun | null,
   state: OfficialV3SyncState,
@@ -578,6 +773,7 @@ async function putLatestReceipt(
     generation: task.generation,
     runId,
     taskId: task.taskId,
+    operation: task.operation,
   });
 }
 

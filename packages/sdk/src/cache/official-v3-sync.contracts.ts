@@ -25,6 +25,7 @@ export interface OfficialV3SyncDependencies {
   documents: OfficialV3DocumentReadPort;
   hydrator: Pick<V3ExactItemHydratorService, 'hydrate'>;
   now?: () => number;
+  sleep?: (milliseconds: number) => Promise<void>;
   guard?: () => void | Promise<void>;
   onProgress?: (progress: OfficialV3SyncProgress) => void;
   pageLimit?: number;

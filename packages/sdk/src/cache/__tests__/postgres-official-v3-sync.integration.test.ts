@@ -200,7 +200,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     expect(resumed.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
   });
 
-  it('applies source document upserts without inventory refresh children before advancing coverage', async () => {
+  it('bootstraps active cached invoice targets once before advancing coverage', async () => {
     const ctx = await createContext('source-doc-upsert-coverage');
     const harness = serviceHarness(ctx, {
       'since:1788670542': envelope(
@@ -220,9 +220,9 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       accountIdentity: binding.accountIdentity,
       since: 1788670542,
     });
-    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA, itemB], { categoryNames: null });
     expect(result.run.status).toBe('success');
-    expect(result.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
+    expect(result.tasks).toMatchObject({ discovered: 3, applied: 3, failed: 0, pending: 0 });
     expect(result.state.cursorGap).toBe(false);
     const updatedDocument = await ctx.service.getDocument(docId);
     expect(updatedDocument).toMatchObject({
@@ -234,11 +234,71 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     await expect(ctx.service.getItemDocuments(docId)).resolves.toEqual([
       expect.objectContaining({ item_id: itemB, document_item_id: lineNew }),
     ]);
-    await expect(ctx.service.getItem(itemA)).resolves.toBeUndefined();
-    await expect(ctx.service.getItem(itemB)).resolves.toBeUndefined();
+    await expect(ctx.service.getItem(itemA)).resolves.toMatchObject({ item_id: itemA });
+    await expect(ctx.service.getItem(itemB)).resolves.toMatchObject({ item_id: itemB });
   });
 
-  it('applies source document upserts without queuing inventory refresh children', async () => {
+  it('queues selective stock reconciliation for changed invoice quantity before advancing coverage', async () => {
+    const ctx = await createContext('stock-impact-invoice');
+    let now = 100;
+    const pages: PageMap = {
+      'since:1788670542': envelope(
+        [{ resource: 'invoice', id: docId, operation: 'upsert' }],
+        false,
+        'cursor-stock-impact'
+      ),
+    };
+    const harness = serviceHarness(ctx, pages, {
+      now: () => now,
+      sleep: async (milliseconds) => { now += Math.ceil(milliseconds / 1000); },
+    });
+
+    await ctx.service.insertDocument(document(docId, { archived: 1, document_name: 'Prior' }));
+    await ctx.service.insertItemDocument(line(itemA, docId, 'old-line'));
+    harness.documents.get.mockResolvedValue(invoicePayload(docId, itemA, {
+      lines: [{
+        id: lineNew,
+        object: 'invoice_line',
+        invoice_id: docId,
+        item_id: itemA,
+        line_type: 'inventory',
+        name: 'Widget',
+        quantity: 3,
+        unit_price: '10.0000',
+        unit_cost: '10.0000',
+        total_cost: '30.0000',
+        subtotal: '30.0000',
+      }],
+    }));
+
+    const result = await harness.service.sync({
+      accountIdentity: binding.accountIdentity,
+      since: 1788670542,
+    });
+
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA], { categoryNames: null });
+    expect(result.run.status).toBe('success');
+    expect(result.tasks).toMatchObject({ discovered: 2, applied: 2, failed: 0, pending: 0 });
+    expect(result.state.cursorGap).toBe(false);
+    await expect(readOfficialTasks(ctx.pool, result.run.runId)).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ resource: 'invoice', status: 'done' }),
+      expect.objectContaining({ kind: 'stock_reconciliation', resource: 'item', id: itemA, status: 'done' }),
+    ]));
+    await expect(ctx.service.getItem(itemA)).resolves.toMatchObject({ item_id: itemA });
+
+    pages['cursor:cursor-stock-impact'] = envelope(
+      [{ resource: 'invoice', id: docId, operation: 'upsert' }],
+      false,
+      'cursor-stock-no-change'
+    );
+    const replay = await harness.service.sync({ accountIdentity: binding.accountIdentity });
+
+    expect(harness.hydrator.hydrate).toHaveBeenCalledTimes(1);
+    expect(replay.run.status).toBe('success');
+    expect(replay.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
+  });
+
+  it('reconciles the one-time active cached invoice target union', async () => {
     const ctx = await createContext('source-doc-upsert');
     const harness = serviceHarness(ctx, {
       'since:1788670542': envelope(
@@ -257,21 +317,22 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       since: 1788670542,
     });
 
-    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA, itemB], { categoryNames: null });
     expect(result.run.status).toBe('success');
-    expect(result.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
+    expect(result.tasks).toMatchObject({ discovered: 3, applied: 3, failed: 0, pending: 0 });
     expect(result.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
-    await expect(readOfficialTasks(ctx.pool, result.run.runId)).resolves.toEqual([
+    await expect(readOfficialTasks(ctx.pool, result.run.runId)).resolves.toEqual(expect.arrayContaining([
       expect.objectContaining({ resource: 'invoice', status: 'done' }),
-    ]);
-    await expect(ctx.service.getItem(itemA)).resolves.toBeUndefined();
-    await expect(ctx.service.getItem(itemB)).resolves.toBeUndefined();
+      expect.objectContaining({ kind: 'stock_reconciliation', status: 'done' }),
+    ]));
+    await expect(ctx.service.getItem(itemA)).resolves.toMatchObject({ item_id: itemA });
+    await expect(ctx.service.getItem(itemB)).resolves.toMatchObject({ item_id: itemB });
     await expect(ctx.service.getItemDocuments(docId)).resolves.toEqual([
       expect.objectContaining({ item_id: itemB, document_item_id: lineNew }),
     ]);
   });
 
-  it('applies source document deletes without queuing inventory refresh children', async () => {
+  it('reconciles active cached invoice targets before deleting the document', async () => {
     const ctx = await createContext('source-doc-delete');
     const harness = serviceHarness(ctx, {
       'since:1788670542': envelope(
@@ -290,14 +351,15 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     });
 
     expect(harness.documents.get).not.toHaveBeenCalled();
-    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA], { categoryNames: null });
     expect(result.run.status).toBe('success');
-    expect(result.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
+    expect(result.tasks).toMatchObject({ discovered: 2, applied: 2, failed: 0, pending: 0 });
     await expect(ctx.service.getDocument(docId)).resolves.toBeUndefined();
     await expect(ctx.service.getItemDocuments(docId)).resolves.toEqual([]);
-    await expect(readOfficialTasks(ctx.pool, result.run.runId)).resolves.toEqual([
+    await expect(readOfficialTasks(ctx.pool, result.run.runId)).resolves.toEqual(expect.arrayContaining([
       expect.objectContaining({ resource: 'invoice', status: 'done' }),
-    ]);
+      expect.objectContaining({ kind: 'stock_reconciliation', id: itemA, status: 'done' }),
+    ]));
   });
 
   it('keeps a persistently failed source marker blocking cursor advancement without inventory hydration', async () => {
@@ -327,7 +389,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     await expect(ctx.service.getDocument(docId)).resolves.toBeUndefined();
   });
 
-  it('retries a failed source marker with a valid source payload without inventory hydration', async () => {
+  it('retries a failed source marker and reconciles its first active invoice payload', async () => {
     const ctx = await createContext('source-doc-failed-retry');
     const harness = serviceHarness(ctx, {
       'since:1788670542': envelope(
@@ -348,10 +410,10 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       since: 1788670542,
     });
 
-    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemB], { categoryNames: null });
     expect(harness.documents.get).toHaveBeenCalledTimes(2);
     expect(result.run.status).toBe('success');
-    expect(result.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
+    expect(result.tasks).toMatchObject({ discovered: 2, applied: 2, failed: 0, pending: 0 });
     expect(result.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
     const [task] = await readOfficialTasks(ctx.pool, result.run.runId);
     expect(task).toMatchObject({ resource: 'invoice', status: 'done', attempts: 2 });
@@ -377,7 +439,11 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       [{ resource: 'invoice', id: docId, operation: 'upsert' }]
     );
     const task = (await store.listTasks(run.runId))[0]!;
-    await installTaskReceiptFailure(ctx.pool, task);
+    await installTaskReceiptFailure(
+      ctx.pool,
+      { ...task, taskId: `${task.taskId}:stock:${itemA}` },
+      'pending'
+    );
 
     await expect(
       harness.service.sync({ accountIdentity: binding.accountIdentity, resume: true })
@@ -394,7 +460,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       resume: true,
     });
 
-    expect(harness.hydrator.hydrate).not.toHaveBeenCalled();
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA], { categoryNames: null });
     expect(resumed.run.status).toBe('success');
     await expect(ctx.service.getDocument(docId)).resolves.toMatchObject({
       api_doc_id: docId,
@@ -736,6 +802,11 @@ function serviceHarness(
   pages: PageMap,
   overrides: Partial<OfficialV3SyncDependencies> = {}
 ) {
+  let simulatedNow = 100;
+  const now = overrides.now ?? (() => simulatedNow);
+  const sleep = overrides.sleep ?? (async (milliseconds: number) => {
+    simulatedNow += Math.ceil(milliseconds / 1000);
+  });
   const sync: OfficialV3SyncTransport & { read: jest.Mock } = {
     read: jest.fn(async (params: { since?: string | number; cursor?: string }) => {
       const key = params.since !== undefined ? `since:${params.since}` : `cursor:${params.cursor}`;
@@ -755,8 +826,9 @@ function serviceHarness(
     sync,
     hydrator,
     documents,
-    now: () => 100,
     ...overrides,
+    now,
+    sleep,
   } as OfficialV3SyncDependencies);
   return { service, sync, hydrator, documents, pages };
 }
@@ -981,7 +1053,8 @@ async function putMeta(pool: InstanceType<typeof Pool>, key: string, value: stri
 
 async function installTaskReceiptFailure(
   pool: InstanceType<typeof Pool>,
-  task: OfficialV3SyncTask
+  task: OfficialV3SyncTask,
+  status = 'done'
 ): Promise<void> {
   await pool.query(`
     CREATE OR REPLACE FUNCTION fail_official_receipt_fn()
@@ -991,7 +1064,7 @@ async function installTaskReceiptFailure(
     BEGIN
       IF NEW.key LIKE 'official_v3_sync.task.v1:%'
          AND NEW.value::jsonb ->> 'taskId' = ${quoteLiteral(task.taskId)}
-         AND NEW.value::jsonb ->> 'status' = 'done' THEN
+         AND NEW.value::jsonb ->> 'status' = ${quoteLiteral(status)} THEN
         RAISE EXCEPTION 'fail_official_receipt';
       END IF;
       RETURN NEW;

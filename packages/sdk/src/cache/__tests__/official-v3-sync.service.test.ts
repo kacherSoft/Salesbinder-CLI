@@ -114,7 +114,7 @@ function documentPayload(
   return payload;
 }
 
-function harness(options: { pageLimit?: number } = {}) {
+function harness(options: { pageLimit?: number; now?: () => number; sleep?: (milliseconds: number) => Promise<void> } = {}) {
   const store = new MemoryOfficialStore();
   const pages = new Map<string, { changes: OfficialV3SyncMarker[]; has_more: boolean; next_cursor: string }>();
   const sync = {
@@ -140,7 +140,8 @@ function harness(options: { pageLimit?: number } = {}) {
     sync,
     hydrator: { hydrate },
     documents,
-    now: () => 100,
+    now: options.now ?? (() => 100),
+    sleep: options.sleep,
     pageLimit: options.pageLimit,
   });
   return { service, store, pages, sync, hydrate, documents };
@@ -398,6 +399,125 @@ describe('OfficialV3SyncService', () => {
       `upsert:${fourth}`,
       `upsert:${fifth}`,
       `document:${docId}`,
+    ]);
+    expect(result.run.status).toBe('success');
+  });
+
+
+  it('waits for stock reconciliation settlement and coalesces duplicate item children', async () => {
+    let now = 100;
+    const sleeps: number[] = [];
+    const h = harness({
+      now: () => now,
+      sleep: async (milliseconds) => { sleeps.push(milliseconds); now += Math.ceil(milliseconds / 1000); },
+    });
+    h.store.seedState('cursor-2');
+    h.store.seedRun('run-stock', 'running');
+    h.store.pages.push({
+      runId: 'run-stock', page: 1, request: { kind: 'cursor', value: 'cursor-1' }, status: 'sealed',
+      markerCount: 2, hasMore: false, nextCursor: 'cursor-2', firstGeneration: 1, lastGeneration: 2,
+      responseHash: 'seeded-stock-page',
+    });
+    h.store.seedTask({
+      taskId: 'parent-a', runId: 'run-stock', page: 1, ordinal: 0, generation: 1,
+      kind: 'marker', resource: 'invoice', id: docId, operation: 'upsert', status: 'waiting_children', attempts: 1,
+    });
+    h.store.seedTask({
+      taskId: 'parent-b', runId: 'run-stock', page: 1, ordinal: 1, generation: 2,
+      kind: 'marker', resource: 'invoice', id: laterDocId, operation: 'upsert', status: 'waiting_children', attempts: 1,
+    });
+    h.store.seedTask({
+      taskId: 'parent-a:stock:item-a', runId: 'run-stock', page: 1, ordinal: 0, generation: 1,
+      parentTaskId: 'parent-a', kind: 'stock_reconciliation', resource: 'item', id: itemA,
+      operation: 'refresh', status: 'pending', attempts: 0, notBefore: 130,
+    });
+    h.store.seedTask({
+      taskId: 'parent-b:stock:item-a', runId: 'run-stock', page: 1, ordinal: 1, generation: 2,
+      parentTaskId: 'parent-b', kind: 'stock_reconciliation', resource: 'item', id: itemA,
+      operation: 'refresh', status: 'pending', attempts: 0, notBefore: 130,
+    });
+
+    const result = await h.service.sync({ accountIdentity, resume: true });
+
+    expect(sleeps).toEqual([30_000]);
+    expect(h.hydrate).toHaveBeenCalledTimes(1);
+    expect(h.hydrate).toHaveBeenCalledWith([itemA], { categoryNames: null });
+    expect(h.store.events).toEqual([`refresh:${itemA}`, `refresh:${itemA}`]);
+    expect(await h.store.listTasks('run-stock')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: 'parent-a', status: 'done' }),
+      expect.objectContaining({ taskId: 'parent-b', status: 'done' }),
+      expect.objectContaining({ taskId: 'parent-a:stock:item-a', status: 'done' }),
+      expect.objectContaining({ taskId: 'parent-b:stock:item-a', status: 'done' }),
+    ]));
+    expect(result.run.status).toBe('success');
+  });
+
+  it('runs a due stock child after an earlier same-item upsert receipt', async () => {
+    let now = 100;
+    const h = harness({
+      now: () => now,
+      sleep: async (milliseconds) => { now += Math.ceil(milliseconds / 1000); },
+    });
+    h.store.seedState('cursor-2');
+    h.store.seedRun('run-stock-upsert', 'running');
+    h.store.pages.push({
+      runId: 'run-stock-upsert', page: 1, request: { kind: 'cursor', value: 'cursor-1' }, status: 'sealed',
+      markerCount: 2, hasMore: false, nextCursor: 'cursor-2', firstGeneration: 1, lastGeneration: 2,
+      responseHash: 'seeded-stock-upsert-page',
+    });
+    h.store.seedTask({
+      taskId: 'parent', runId: 'run-stock-upsert', page: 1, ordinal: 0, generation: 1,
+      kind: 'marker', resource: 'invoice', id: docId, operation: 'upsert', status: 'waiting_children', attempts: 1,
+    });
+    h.store.seedTask({
+      taskId: 'parent:stock:item-a', runId: 'run-stock-upsert', page: 1, ordinal: 0, generation: 1,
+      parentTaskId: 'parent', kind: 'stock_reconciliation', resource: 'item', id: itemA,
+      operation: 'refresh', status: 'pending', attempts: 0, notBefore: 130,
+    });
+    h.store.seedTask({
+      taskId: 'item-upsert', runId: 'run-stock-upsert', page: 1, ordinal: 1, generation: 2,
+      kind: 'marker', resource: 'item', id: itemA, operation: 'upsert', status: 'pending', attempts: 0,
+    });
+
+    const result = await h.service.sync({ accountIdentity, resume: true });
+
+    expect(h.hydrate.mock.calls).toEqual([
+      [[itemA], { categoryNames: null }],
+      [[itemA], { categoryNames: null }],
+    ]);
+    expect(await h.store.listTasks('run-stock-upsert')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: 'parent:stock:item-a', status: 'done' }),
+      expect.objectContaining({ taskId: 'item-upsert', status: 'done' }),
+    ]));
+    expect(result.run.status).toBe('success');
+  });
+
+  it('coalesces late duplicate stock children after the ten-item hydration limit', async () => {
+    const h = harness();
+    const ids = batchIds.slice(0, 11);
+    h.store.seedState('cursor-2');
+    h.store.seedRun('run-stock-limit', 'running');
+    h.store.pages.push({
+      runId: 'run-stock-limit', page: 1, request: { kind: 'cursor', value: 'cursor-1' }, status: 'sealed',
+      markerCount: 12, hasMore: false, nextCursor: 'cursor-2', firstGeneration: 1, lastGeneration: 12,
+      responseHash: 'seeded-stock-limit-page',
+    });
+    ids.forEach((id, index) => h.store.seedTask({
+      taskId: `stock:${index}`, runId: 'run-stock-limit', page: 1, ordinal: index, generation: index + 1,
+      kind: 'stock_reconciliation', resource: 'item', id, operation: 'refresh', status: 'pending', attempts: 0,
+      notBefore: 100,
+    }));
+    h.store.seedTask({
+      taskId: 'stock:duplicate', runId: 'run-stock-limit', page: 1, ordinal: 11, generation: 12,
+      kind: 'stock_reconciliation', resource: 'item', id: ids[0]!, operation: 'refresh', status: 'pending', attempts: 0,
+      notBefore: 100,
+    });
+
+    const result = await h.service.sync({ accountIdentity, resume: true });
+
+    expect(h.hydrate.mock.calls).toEqual([
+      [ids.slice(0, 10), { categoryNames: null }],
+      [[ids[10]!], { categoryNames: null }],
     ]);
     expect(result.run.status).toBe('success');
   });
@@ -721,7 +841,13 @@ class MemoryOfficialStore implements OfficialV3SyncStore {
   }
   async listTasks(runId: string) { return [...this.tasks.values()].filter((task) => task.runId === runId).sort((a, b) => a.page - b.page || a.ordinal - b.ordinal || a.taskId.localeCompare(b.taskId)).map((task) => structuredClone(task)); }
   async markSupersededIfStale(_runId: string, task: OfficialV3SyncTask) {
-    const newer = [...this.tasks.values()].some((other) => other.resource === task.resource && other.id === task.id && other.generation > task.generation && ['done', 'superseded'].includes(other.status));
+    const newer = [...this.tasks.values()].some((other) =>
+      other.resource === task.resource &&
+      other.id === task.id &&
+      other.generation > task.generation &&
+      ['done', 'superseded'].includes(other.status) &&
+      (task.kind !== 'stock_reconciliation' || other.operation === 'delete')
+    );
     if (newer) this.tasks.set(this.key(task.runId, task.taskId), { ...task, status: 'superseded' });
     return newer;
   }
