@@ -265,6 +265,7 @@ test('Markdown separates interval activity from current official tasks and prese
   assert.match(markdown, /reference run in progress; resource outcomes are provisional \(categories=failed, accounts=success, users=warning, payments=failed\)/);
   assert.match(markdown, /Interval activity/);
   assert.match(markdown, /Current official run task state/);
+  assert.equal((markdown.match(/\| --- \| ---: \| ---: \| ---: \| ---: \|/g) ?? []).length, 2);
   assert.match(markdown, /done=32/);
   assert.match(markdown, /\| item \| 15 \| 15 \| 0 \| 69 \|/);
   assert.match(markdown, /\| item \| 10 \| 10 \| 0 \| 69 \|/);

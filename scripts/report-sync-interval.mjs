@@ -572,7 +572,7 @@ export function formatMarkdownReport(report) {
   if (!compact.latestHealth.taskCounts) {
     lines.push('No current official run metadata.');
   } else {
-    lines.push('| Resource | Done tasks | Unique IDs | Failed | Pending |', '| --- | ---: | ---: | ---: |');
+    lines.push('| Resource | Done tasks | Unique IDs | Failed | Pending |', '| --- | ---: | ---: | ---: | ---: |');
     for (const resource of RESOURCES) {
       const counts = compact.latestHealth.taskCounts[resource];
       lines.push(`| ${resource} | ${counts.doneTasks ?? 0} | ${counts.doneUniqueIds ?? 0} | ${counts.failedTasks ?? 0} | ${counts.pendingTasks ?? 0} |`);
