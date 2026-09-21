@@ -35,7 +35,10 @@ export interface SalesOrderShippingDocumentsPort extends OCShippingDocumentsRead
 }
 
 export interface SalesOrderShippingCachePort {
-  applyOCShippingPatch(patch: OCShippingPatch): Promise<'applied' | 'skipped_missing' | 'skipped_stale'>;
+  applyOCShippingPatch(
+    patch: OCShippingPatch,
+    estimatePayload?: unknown
+  ): Promise<'applied' | 'skipped_missing' | 'skipped_stale'>;
   clearOCShippingAuthority(authorityId: string): Promise<void>;
   getOCShippingPendingWarnings(): Promise<readonly OCShippingWarning[]>;
   setOCShippingWarning(warning: OCShippingWarning): Promise<void>;
@@ -135,15 +138,34 @@ export class SalesOrderShippingReconciliationService {
             detail
           );
           scanned++;
+          let deferred = false;
           if (hydration.patch) {
             await this.guard();
-            if ((await this.dependencies.cache.applyOCShippingPatch(hydration.patch)) === 'applied') applied++;
+            const application = await this.dependencies.cache.applyOCShippingPatch(
+              hydration.patch,
+              hydration.estimatePayload
+            );
+            if (application === 'applied') {
+              applied++;
+            } else {
+              deferred = true;
+              const issue = { code: 'cache_projection_deferred' as const, documentId: hydration.patch.estimateId };
+              await this.dependencies.cache.setOCShippingWarning({
+                contextId: 4,
+                documentId: hydration.patch.estimateId,
+                code: 'shipping_unknown',
+                updatedAt: this.now(),
+              });
+              failures.push(issue);
+              failureCount++;
+              salesOrderFailures++;
+            }
           }
           failures.push(...hydration.issues);
           failureCount += hydration.issues.length;
           salesOrderFailures += hydration.issues.length;
           options.onProgress?.({
-            event: hydration.issues.length ? 'record_warning' : 'record_applied',
+            event: hydration.issues.length || deferred ? 'record_warning' : 'record_applied',
             scanned,
             applied,
             failed: failureCount,
@@ -218,13 +240,19 @@ export class SalesOrderShippingReconciliationService {
         let application: Awaited<ReturnType<SalesOrderShippingCachePort['applyOCShippingPatch']>> | null = null;
         if (hydration.patch) {
           await this.guard();
-          application = await this.dependencies.cache.applyOCShippingPatch(hydration.patch);
+          application = await this.dependencies.cache.applyOCShippingPatch(
+            hydration.patch,
+            hydration.estimatePayload ?? (warning.contextId === 4 ? payload : undefined)
+          );
           if (application === 'applied') applied++;
         }
         if (hydration.issues.length > 0 || (hydration.patch && application !== 'applied')) {
           pendingWarnings++;
           failureCount++;
           failures.push(...hydration.issues);
+          if (hydration.patch && application !== 'applied') {
+            failures.push({ code: 'cache_projection_deferred', documentId: hydration.patch.estimateId });
+          }
           await this.touchWarning(warning);
           options.onProgress?.({ event: 'warning_retry_pending', scanned, applied, failed: failureCount });
           continue;

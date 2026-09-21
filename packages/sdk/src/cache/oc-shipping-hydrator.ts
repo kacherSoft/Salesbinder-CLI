@@ -100,7 +100,10 @@ async function hydrateFromInvoice(
   }
   const estimate = await readEstimate(documents, relation.value.id);
   if (estimate === null) return issueOnly('estimate_not_found', relation.value.id);
-  return patchFromSource(documents, estimate, invoice);
+  return withEstimatePayload(
+    await patchFromSource(documents, estimate.estimate, invoice),
+    estimate.payload
+  );
 }
 
 async function hydrateFromSalesOrderSource(
@@ -112,7 +115,10 @@ async function hydrateFromSalesOrderSource(
   if (relation.value === null) return { patch: null, issues: [] };
   const estimate = await readEstimate(documents, relation.value.id);
   if (estimate === null) return issueOnly('estimate_not_found', relation.value.id);
-  return patchFromSource(documents, estimate, source);
+  return withEstimatePayload(
+    await patchFromSource(documents, estimate.estimate, source),
+    estimate.payload
+  );
 }
 
 async function patchFromSource(
@@ -147,13 +153,21 @@ async function patchFromSource(
 async function readEstimate(
   documents: OCShippingDocumentsReadPort,
   id: string
-): Promise<OCShippingCanonicalEstimate | null> {
+): Promise<{ estimate: OCShippingCanonicalEstimate; payload: unknown } | null> {
   try {
-    return normalizeV3OCShippingEstimate(await documents.get(4, id));
+    const payload = await documents.get(4, id);
+    return { estimate: normalizeV3OCShippingEstimate(payload), payload };
   } catch (error) {
     if (notFound(error)) return null;
     throw error;
   }
+}
+
+function withEstimatePayload(
+  result: OCShippingHydrationResult,
+  estimatePayload: unknown
+): OCShippingHydrationResult {
+  return result.patch ? { ...result, estimatePayload } : result;
 }
 
 async function readSource(

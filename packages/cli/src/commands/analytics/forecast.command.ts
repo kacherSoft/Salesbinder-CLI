@@ -7,6 +7,7 @@ import { formatJson, formatError } from '../../output/json.formatter.js';
 import {
   ensureAnalyticsCacheBinding,
   getAnalyticsSyncDecision,
+  resolveAnalyticsStaleThreshold,
 } from './analytics-cache-binding.js';
 
 interface ForecastOptions {
@@ -77,11 +78,12 @@ Output includes:
         const analyticsService = new CacheAnalyticsService();
 
         const prefs = loadPreferences();
+        const staleThresholdSeconds = resolveAnalyticsStaleThreshold(prefs?.cacheStaleSeconds);
         const indexer = new DocumentIndexerService(
           client,
           cache,
           accountName,
-          prefs?.cacheStaleSeconds
+          staleThresholdSeconds
         );
 
         const analyticsOptions: ForecastOptions = {
@@ -91,11 +93,14 @@ Output includes:
 
         if (!analyticsOptions.useCachedOnly) {
           const state = await cache.getCacheState();
-          const syncDecision = getAnalyticsSyncDecision(
-            analyticsOptions.forceRefresh === true,
+          const syncDecision = await getAnalyticsSyncDecision({
+            cache,
+            forceRefresh: analyticsOptions.forceRefresh === true,
             state,
-            await indexer.isCacheStale()
-          );
+            readLegacyCacheStale: () => indexer.isCacheStale(),
+            staleThresholdSeconds,
+          });
+          if (syncDecision.error) throw new Error(syncDecision.error);
 
           if (syncDecision.shouldSync) {
             const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);

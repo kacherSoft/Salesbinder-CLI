@@ -94,6 +94,12 @@ export { createDocumentOffsetSyncService } from './document-offset-client.factor
 export * from './official-v3-sync.types.js';
 export * from './official-v3-sync.service.js';
 export { readOfficialV3SyncStatus } from './official-v3-sync-status.js';
+export {
+  projectPublicCacheSyncAuthority,
+  readPublicCacheSyncAuthority,
+  type OfficialV3PublicCacheSyncAuthority,
+  type PublicCacheSyncAuthority,
+} from './public-sync-authority.js';
 export { createOfficialV3SyncService } from './official-v3-sync-client.factory.js';
 export type { OfficialV3SyncRuntime } from './official-v3-sync-client.factory.js';
 export { PostgresOfficialV3SyncStore } from './postgres-official-v3-sync.store.js';

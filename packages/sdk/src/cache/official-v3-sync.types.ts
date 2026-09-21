@@ -76,6 +76,12 @@ export interface OfficialV3SyncTask {
   notBefore?: number;
 }
 
+export interface OfficialV3ShippingPrerequisite {
+  document: DocumentRow;
+  lines: Omit<ItemDocumentRow, 'id'>[];
+  stockSignature: OfficialV3DocumentStockSignature;
+}
+
 export interface OfficialV3SyncStore {
   getState(): Promise<OfficialV3SyncState | null>;
   getRun(): Promise<OfficialV3SyncRun | null>;
@@ -104,7 +110,8 @@ export interface OfficialV3SyncStore {
     shippingPatch?: OCShippingPatch | null,
     shippingWarning?: OCShippingWarning | null,
     stockSignature?: OfficialV3DocumentStockSignature | null,
-    stockReconciliationNotBefore?: number
+    stockReconciliationNotBefore?: number,
+    shippingPrerequisite?: OfficialV3ShippingPrerequisite | null
   ): Promise<void>;
   applyDocumentDelete(
     runId: string,

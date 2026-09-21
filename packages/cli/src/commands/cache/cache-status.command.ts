@@ -36,7 +36,6 @@ export function registerCacheStatusCommand(cache: Command, program: Command): vo
             throw new Error('PostgreSQL backend is configured but could not be opened.');
           cacheService = pgCache;
           await pgCache.verifyAccountBinding(accountBinding);
-          await pgCache.ensureSchema();
           location = { connection: maskPostgresUrl(dbUrl) };
         } else {
           backend = 'sqlite';
@@ -85,38 +84,59 @@ export function registerCacheStatusCommand(cache: Command, program: Command): vo
             activeCache.getCategoryCacheMeta(),
             activeCache.getInventoryCacheMeta(),
           ]);
-        // Diagnostics must remain available even when API sync configuration is invalid.
-        const stale = !state || state.lastSync < Math.floor(Date.now() / 1000) - staleThreshold;
-        const changeFeed = await readChangeFeedStatus({
-          backend,
-          cache: activeCache,
-          accountIdentity: accountBinding.accountIdentity,
-        });
+        const [authority, changeFeed, references, ocShipping] = await Promise.all([
+          sdk.readPublicCacheSyncAuthority(activeCache, { staleThresholdSeconds: staleThreshold }),
+          readChangeFeedStatus({
+            backend,
+            cache: activeCache,
+            accountIdentity: accountBinding.accountIdentity,
+          }),
+          readReferenceStatus(activeCache, accountBinding.accountIdentity),
+          readOCShippingStatus(activeCache),
+        ]);
+        const legacy = projectLegacyStatus(state, syncStatus, staleThreshold);
+        const selected = authority.authority === 'official_v3' ? authority : legacy;
         const output = {
           backend,
           ...location,
           account: accountName,
-          sync_health: deriveCacheSyncHealth(syncStatus),
-          sync_status: projectStatus(syncStatus),
+          cache_authority: authority.authority,
+          sync_health: selected.syncHealth,
+          sync_status: selected.syncStatus,
           change_feed: changeFeed,
-          ...(state
+          ...(authority.authority === 'official_v3'
             ? {
-                last_sync: new Date(state.lastSync * 1000).toISOString(),
-                last_document_sync:
-                  state.lastDocumentSync === undefined
-                    ? null
-                    : new Date(state.lastDocumentSync * 1000).toISOString(),
-                last_full_sync: new Date(state.lastFullSync * 1000).toISOString(),
+                last_sync: isoTimestamp(authority.lastAppliedAt),
+                latest_sync_attempt: isoTimestamp(authority.lastAttemptAt),
+                coverage: authority.coverage,
+                overall_health: deriveOverallHealth(selected.syncHealth, ocShipping, references),
                 ...counts,
-                schema_version: state.schemaVersion,
-                is_stale: stale,
-                freshness: stale ? 'STALE' : 'FRESH',
+                ...(state ? { schema_version: state.schemaVersion } : {}),
+                is_stale: authority.isStale,
+                freshness: authority.freshness,
                 stale_threshold_seconds: staleThreshold,
                 payment_sync_status: paymentStatus ?? 'not_initialized',
                 categories: categoryMeta ?? 'not_initialized',
                 inventory: inventoryMeta ?? 'not_initialized',
+                references,
+                oc_shipping: ocShipping,
+                legacy_status: {
+                  sync_health: legacy.syncHealth,
+                  sync_status: legacy.syncStatus,
+                  ...legacy.output,
+                },
               }
-            : { message: 'Cache exists but no metadata found. May need full sync.' }),
+            : {
+                ...legacy.output,
+                ...(state
+                  ? {
+                      ...counts,
+                      payment_sync_status: paymentStatus ?? 'not_initialized',
+                      categories: categoryMeta ?? 'not_initialized',
+                      inventory: inventoryMeta ?? 'not_initialized',
+                    }
+                  : {}),
+              }),
         };
         console.log(formatJson(output));
       } catch (error) {
@@ -126,6 +146,110 @@ export function registerCacheStatusCommand(cache: Command, program: Command): vo
         await cacheService?.close().catch(() => undefined);
       }
     });
+}
+
+function projectLegacyStatus(
+  state: Awaited<ReturnType<CacheService['getCacheState']>>,
+  syncStatus: CacheSyncStatus | null,
+  staleThreshold: number
+): {
+  syncHealth: string;
+  syncStatus: Record<string, unknown> | 'not_initialized';
+  output: Record<string, unknown>;
+} {
+  const stale = !state || state.lastSync < Math.floor(Date.now() / 1000) - staleThreshold;
+  return {
+    syncHealth: deriveCacheSyncHealth(syncStatus),
+    syncStatus: projectStatus(syncStatus),
+    output: state
+      ? {
+          last_sync: new Date(state.lastSync * 1000).toISOString(),
+          last_document_sync:
+            state.lastDocumentSync === undefined
+              ? null
+              : new Date(state.lastDocumentSync * 1000).toISOString(),
+          last_full_sync: new Date(state.lastFullSync * 1000).toISOString(),
+          schema_version: state.schemaVersion,
+          is_stale: stale,
+          freshness: stale ? 'STALE' : 'FRESH',
+          stale_threshold_seconds: staleThreshold,
+        }
+      : { message: 'Cache exists but no metadata found. May need full sync.' },
+  };
+}
+
+function isoTimestamp(value: number | null): string | null {
+  return value === null ? null : new Date(value * 1000).toISOString();
+}
+
+function deriveOverallHealth(
+  syncHealth: string,
+  ocShipping: unknown,
+  references: unknown
+): 'healthy' | 'warning' | 'failed' | 'unavailable' {
+  if (syncHealth === 'failed') return 'failed';
+  if (syncHealth === 'unavailable') return 'unavailable';
+  if (
+    syncHealth !== 'healthy' ||
+    hasOCShippingWarning(ocShipping) ||
+    hasReferenceRefreshWarning(references)
+  )
+    return 'warning';
+  return 'healthy';
+}
+
+function hasOCShippingWarning(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const result = value as {
+    pending_warning_count?: unknown;
+    reconciliation?: { status?: unknown; failed?: unknown };
+  };
+  return (
+    result.pending_warning_count !== 0 ||
+    result.reconciliation?.status === 'failed' ||
+    result.reconciliation?.status === 'success_with_warnings' ||
+    (typeof result.reconciliation?.failed === 'number' && result.reconciliation.failed > 0)
+  );
+}
+
+function hasReferenceRefreshWarning(value: unknown): boolean {
+  if (value === 'not_available') return true;
+  if (!value || typeof value !== 'object') return false;
+  const status = value as {
+    run?: { status?: unknown };
+    resources?: Record<string, { outcome?: unknown }>;
+  };
+  if (status.run?.status === 'failed' || status.run?.status === 'success_with_warnings') return true;
+  return Object.values(status.resources ?? {}).some((resource) => resource.outcome === 'failed');
+}
+
+async function readReferenceStatus(cache: CacheService, accountIdentity: string): Promise<unknown> {
+  const candidate = cache as CacheService & {
+    getReferenceRefreshStore?: () => { getStatus(identity: string): Promise<unknown> };
+  };
+  return typeof candidate.getReferenceRefreshStore === 'function'
+    ? (await candidate.getReferenceRefreshStore().getStatus(accountIdentity)) ?? 'not_initialized'
+    : 'not_available';
+}
+
+async function readOCShippingStatus(cache: CacheService): Promise<unknown> {
+  const candidate = cache as CacheService & {
+    getOCShippingReconciliationStatus?: () => Promise<unknown>;
+    getOCShippingPendingWarnings?: () => Promise<readonly unknown[]>;
+  };
+  if (
+    typeof candidate.getOCShippingReconciliationStatus !== 'function' ||
+    typeof candidate.getOCShippingPendingWarnings !== 'function'
+  )
+    return 'not_available';
+  const [reconciliation, warnings] = await Promise.all([
+    candidate.getOCShippingReconciliationStatus(),
+    candidate.getOCShippingPendingWarnings(),
+  ]);
+  return {
+    reconciliation: reconciliation ?? 'not_initialized',
+    pending_warning_count: warnings.length,
+  };
 }
 
 function projectStatus(

@@ -59,6 +59,7 @@ function harness(options?: {
   known?: readonly OCShippingProvenance[];
   prior?: OCShippingReconciliationStatus | null;
   warnings?: readonly OCShippingWarning[];
+  application?: 'applied' | 'skipped_missing' | 'skipped_stale';
 }) {
   const statuses: OCShippingReconciliationStatus[] = [];
   const applied: OCShippingPatch[] = [];
@@ -68,7 +69,7 @@ function harness(options?: {
   const cache = {
     applyOCShippingPatch: jest.fn(async (value: OCShippingPatch) => {
       applied.push(value);
-      return 'applied' as const;
+      return options?.application ?? 'applied' as const;
     }),
     clearOCShippingAuthority: jest.fn(async (id: string) => void cleared.push(id)),
     getOCShippingPendingWarnings: jest.fn(async () => options?.warnings ?? []),
@@ -286,6 +287,7 @@ describe('SalesOrderShippingReconciliationService', () => {
 
   it('retries and clears a resolved invoice shipping warning', async () => {
     const ctx = harness({ warnings: [warning(5, invoiceId)] });
+    const estimatePayload = { object: 'estimate', id: estimateId };
     const get = jest.fn(async () => ({ id: invoiceId, object: 'invoice' }));
     const service = new SalesOrderShippingReconciliationService({
       documents: {
@@ -295,15 +297,59 @@ describe('SalesOrderShippingReconciliationService', () => {
       },
       cache: ctx.cache,
       hydrate: jest.fn(),
-      hydrateWarning: jest.fn(async () => ({ patch: patch(orderA), issues: [] })),
+      hydrateWarning: jest.fn(async () => ({ patch: patch(orderA), issues: [], estimatePayload })),
       now: () => 10,
     });
 
     const result = await service.sync({ accountIdentity: 'salesbinder:example' });
 
     expect(get).toHaveBeenCalledWith(5, invoiceId);
+    expect(ctx.cache.applyOCShippingPatch).toHaveBeenCalledWith(patch(orderA), estimatePayload);
     expect(ctx.clearedWarnings).toEqual([[5, invoiceId]]);
     expect(result).toMatchObject({ pendingWarnings: 0, status: { status: 'success', applied: 1, failed: 0 } });
+  });
+
+  it('retries an estimate warning with its validated current payload as the prerequisite', async () => {
+    const ctx = harness({ warnings: [warning(4, estimateId)] });
+    const estimatePayload = { id: estimateId, object: 'estimate' };
+    const service = new SalesOrderShippingReconciliationService({
+      documents: {
+        listSalesOrders: jest.fn(async () => page(1, 1, 0, [])),
+        getSalesOrder: jest.fn(),
+        get: jest.fn(async () => estimatePayload),
+      },
+      cache: ctx.cache,
+      hydrate: jest.fn(),
+      hydrateWarning: jest.fn(async () => ({ patch: patch(orderA), issues: [] })),
+      now: () => 10,
+    });
+
+    await service.sync({ accountIdentity: 'salesbinder:example' });
+
+    expect(ctx.cache.applyOCShippingPatch).toHaveBeenCalledWith(patch(orderA), estimatePayload);
+    expect(ctx.clearedWarnings).toEqual([[4, estimateId]]);
+  });
+
+  it('keeps a skipped sales-order projection visible and queues its durable retry', async () => {
+    const ctx = harness({ application: 'skipped_stale' });
+    const service = new SalesOrderShippingReconciliationService({
+      documents: {
+        listSalesOrders: jest.fn(async () => page(1, 1, 1, [summary(orderA)])),
+        getSalesOrder: jest.fn(async () => summary(orderA)),
+        get: jest.fn(),
+      },
+      cache: ctx.cache,
+      hydrate: jest.fn(async () => ({ patch: patch(orderA), issues: [] })),
+      now: () => 10,
+    });
+
+    const result = await service.sync({ accountIdentity: 'salesbinder:example' });
+
+    expect(result).toMatchObject({ status: { status: 'success_with_warnings', failed: 1 } });
+    expect(result.failures).toContainEqual({ code: 'cache_projection_deferred', documentId: estimateId });
+    expect(ctx.touchedWarnings).toEqual([
+      { contextId: 4, documentId: estimateId, code: 'shipping_unknown', updatedAt: 10 },
+    ]);
   });
 
   it('keeps a persistent customer conflict pending without aborting the sales-order pass', async () => {
