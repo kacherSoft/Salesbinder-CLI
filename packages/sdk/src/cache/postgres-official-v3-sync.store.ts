@@ -16,6 +16,7 @@ import {
 import type {
   OfficialV3SyncMarker,
   OfficialV3SyncPage,
+  OfficialV3ShippingPrerequisite,
   OfficialV3SyncRun,
   OfficialV3SyncState,
   OfficialV3SyncStore,
@@ -214,7 +215,8 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     shippingPatch?: OCShippingPatch | null,
     shippingWarning?: OCShippingWarning | null,
     stockSignature?: OfficialV3DocumentStockSignature | null,
-    stockReconciliationNotBefore?: number
+    stockReconciliationNotBefore?: number,
+    shippingPrerequisite?: OfficialV3ShippingPrerequisite | null
   ): Promise<void> {
     assertDocumentTask(task, document, lines);
     await this.options.withVerifiedWrite(async (client) => {
@@ -222,6 +224,9 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
       if (await this.completeIfStale(client, runId, persisted)) return;
       const before = await this.readDocumentStockSignature(client, persisted.id);
       const resolved = await this.options.resolveDocument(client, document);
+      const shippingPrerequisiteApplied = shippingPatch && shippingPrerequisite
+        ? await this.alignShippingPrerequisite(client, shippingPrerequisite, shippingPatch)
+        : true;
       const after = stockSignature ?? createOfficialV3DocumentStockSignature(resolved, lines);
       const stockItemIds = before.source === 'fallback'
         ? bootstrapStockReconciliationItemIds(before.signature, after)
@@ -236,14 +241,23 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
         resolved.api_doc_id ?? resolved.doc_id,
         resolved.associated_document_id ?? null
       );
-      if (shippingWarning) {
-        if (shippingWarning.contextId !== resolved.context_id || shippingWarning.documentId !== (resolved.api_doc_id ?? resolved.doc_id)) {
+      const deferredShippingWarning = shippingPatch && !shippingPrerequisiteApplied;
+      const effectiveShippingWarning = shippingWarning ?? (deferredShippingWarning
+        ? {
+            contextId: resolved.context_id as 4 | 5,
+            documentId: resolved.api_doc_id ?? resolved.doc_id,
+            code: 'shipping_unknown' as const,
+            updatedAt: nowSeconds(),
+          }
+        : null);
+      if (effectiveShippingWarning) {
+        if (effectiveShippingWarning.contextId !== resolved.context_id || effectiveShippingWarning.documentId !== (resolved.api_doc_id ?? resolved.doc_id)) {
           throw new Error('OC shipping warning does not match the document task.');
         }
         if (resolved.context_id === 5) await clearOCShippingAuthority(client, resolved.api_doc_id ?? resolved.doc_id);
         else await clearOCShippingEstimateUnknown(client, resolved.api_doc_id ?? resolved.doc_id);
-        if (shippingPatch) await applyOCShippingPatch(client, shippingPatch);
-        await writeOCShippingWarning(client, shippingWarning);
+        if (shippingPatch && !deferredShippingWarning) await applyOCShippingPatch(client, shippingPatch);
+        await writeOCShippingWarning(client, effectiveShippingWarning);
       } else {
         if (shippingPatch) await applyOCShippingPatch(client, shippingPatch);
         if (resolved.context_id === 4 || resolved.context_id === 5) {
@@ -380,6 +394,23 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
       if (await this.completeIfStale(client, runId, persisted)) return;
       await this.options.writeInventory(client, item, rows);
       await this.complete(client, runId, persisted, 'done', task.attempts);
+    });
+  }
+
+  /**
+   * A linked invoice may be current while its estimate marker is absent from
+   * the same partial catch-up. Align only an older exact cached estimate using
+   * the detail response that already proved the shipping relation.
+   */
+  private async alignShippingPrerequisite(
+    client: PoolClient,
+    prerequisite: OfficialV3ShippingPrerequisite,
+    patch: OCShippingPatch
+  ): Promise<boolean> {
+    return alignOCShippingPrerequisite(client, prerequisite, patch, {
+      resolveDocument: this.options.resolveDocument,
+      writeDocument: this.options.writeDocument,
+      onAligned: () => this.writeDocumentStockSignature(client, patch.estimateId, prerequisite.stockSignature),
     });
   }
 
@@ -628,6 +659,48 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
   }
 }
 
+export async function alignOCShippingPrerequisite(
+  client: PoolClient,
+  prerequisite: OfficialV3ShippingPrerequisite,
+  patch: OCShippingPatch,
+  options: Pick<PostgresOfficialV3SyncStoreOptions, 'resolveDocument' | 'writeDocument'> & {
+    onAligned?: () => Promise<void>;
+  }
+): Promise<boolean> {
+  assertShippingPrerequisite(prerequisite, patch);
+  const cached = await client.query<{
+    api_doc_id: string | null;
+    context_id: number;
+    doc_number: number;
+    customer_id: string | null;
+    modified: string | number;
+  }>(
+    `SELECT api_doc_id, context_id, doc_number, customer_id, modified
+     FROM documents WHERE api_doc_id = $1 FOR UPDATE`,
+    [patch.estimateId]
+  );
+  const existing = cached.rows[0];
+  if (existing) {
+    if (
+      existing.api_doc_id !== patch.estimateId ||
+      existing.context_id !== 4 ||
+      existing.doc_number !== patch.estimateNumber ||
+      Number(existing.modified) > patch.estimateModified ||
+      (Number(existing.modified) === patch.estimateModified && existing.customer_id !== patch.customerId)
+    ) return false;
+    if (Number(existing.modified) === patch.estimateModified) return true;
+  }
+  const resolved = await options.resolveDocument(client, prerequisite.document);
+  assertShippingPrerequisite({ ...prerequisite, document: resolved }, patch);
+  await options.writeDocument(
+    client,
+    resolved,
+    prerequisite.lines.map((line) => ({ ...line, doc_id: resolved.doc_id }))
+  );
+  await options.onAligned?.();
+  return true;
+}
+
 function initialState(run: OfficialV3SyncRun): OfficialV3SyncState {
   return {
     version: 1,
@@ -731,6 +804,26 @@ function assertDocumentTask(
   }
   if (lines.some((line) => line.doc_id !== document.doc_id)) {
     throw new Error('Official V3 document line identity mismatch.');
+  }
+}
+
+function assertShippingPrerequisite(
+  prerequisite: OfficialV3ShippingPrerequisite,
+  patch: OCShippingPatch
+): void {
+  const { document, lines, stockSignature } = prerequisite;
+  if (
+    document.api_doc_id !== patch.estimateId ||
+    document.doc_id !== patch.estimateId ||
+    document.cache_source !== 'api' ||
+    document.context_id !== 4 ||
+    document.doc_number !== patch.estimateNumber ||
+    document.customer_id !== patch.customerId ||
+    document.modified !== patch.estimateModified ||
+    stockSignature.contextId !== 4 ||
+    lines.some((line) => line.doc_id !== document.doc_id)
+  ) {
+    throw new Error('Official V3 shipping prerequisite identity mismatch.');
   }
 }
 

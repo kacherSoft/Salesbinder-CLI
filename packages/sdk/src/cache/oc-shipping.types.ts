@@ -77,7 +77,8 @@ export type OCShippingHydrationIssueCode =
   | 'fulfillment_authority_unobserved'
   | 'source_document_not_found'
   | 'authority_not_found'
-  | 'estimate_not_found';
+  | 'estimate_not_found'
+  | 'cache_projection_deferred';
 
 export interface OCShippingHydrationIssue {
   code: OCShippingHydrationIssueCode;
@@ -87,6 +88,12 @@ export interface OCShippingHydrationIssue {
 export interface OCShippingHydrationResult {
   patch: OCShippingPatch | null;
   issues: readonly OCShippingHydrationIssue[];
+  /**
+   * The exact estimate detail read while proving a related invoice or sales
+   * order. The official sync may use it to bring an older cached OC forward
+   * before applying the guarded derived-shipping patch.
+   */
+  estimatePayload?: unknown;
 }
 
 /** Read-only subset required to hydrate the authoritative fulfillment document. */

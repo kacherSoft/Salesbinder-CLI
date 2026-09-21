@@ -62,7 +62,10 @@ import { hasUnpairedUtf16Surrogate } from './salesbinder-source-text-validation.
 import { assertCanonicalV3SourceId } from './v3-inventory-source-validation.js';
 import { PostgresInventoryChangeFeedStore } from './postgres-inventory-change-feed.store.js';
 import { PostgresDocumentOffsetStore } from './postgres-document-offset.store.js';
-import { PostgresOfficialV3SyncStore } from './postgres-official-v3-sync.store.js';
+import {
+  alignOCShippingPrerequisite,
+  PostgresOfficialV3SyncStore,
+} from './postgres-official-v3-sync.store.js';
 import {
   applyOCShippingPatch,
   clearOCShippingAuthority,
@@ -102,12 +105,15 @@ import type {
   OffsetTaskKind,
 } from './document-offset-sync.types.js';
 import type {
+  OfficialV3ShippingPrerequisite,
   OfficialV3SyncRun,
   OfficialV3SyncState,
   OfficialV3SyncStatusSummary,
   OfficialV3SyncStore,
 } from './official-v3-sync.types.js';
 import { readOfficialV3SyncStatus } from './official-v3-sync-status.js';
+import { normalizeOfficialV3DocumentCacheRows } from './v3-document-cache-normalizer.js';
+import { createOfficialV3DocumentStockSignatureFromPayload } from './official-v3-stock-reconciliation.js';
 import type { ReferenceRefreshStore } from './reference-refresh.types.js';
 
 const { Pool } = pg;
@@ -1387,8 +1393,22 @@ export class PostgresCacheService
     );
   }
 
-  async applyOCShippingPatch(shippingPatch: OCShippingPatch): Promise<import('./postgres-oc-shipping.store.js').OCShippingPatchApplication> {
-    return this.withVerifiedWrite((client) => applyOCShippingPatch(client, shippingPatch));
+  async applyOCShippingPatch(
+    shippingPatch: OCShippingPatch,
+    estimatePayload?: unknown
+  ): Promise<import('./postgres-oc-shipping.store.js').OCShippingPatchApplication> {
+    const prerequisite = estimatePayload === undefined
+      ? null
+      : shippingPrerequisiteFromPayload(estimatePayload, shippingPatch);
+    return this.withVerifiedWrite(async (client) => {
+      if (prerequisite && !(await alignOCShippingPrerequisite(client, prerequisite, shippingPatch, {
+        resolveDocument: async (transactionClient, document) =>
+          (await this.normalizeDocumentForWrite(document, transactionClient)) as unknown as DocumentRow,
+        writeDocument: (transactionClient, document, lines) =>
+          this.writeResolvedDocumentBundle(transactionClient, document as unknown as Record<string, unknown>, lines),
+      }))) return 'skipped_stale';
+      return applyOCShippingPatch(client, shippingPatch);
+    });
   }
 
   async applyOCShippingPatches(
@@ -3818,3 +3838,22 @@ const isNullableNonNegativePostgresInteger = (value: unknown): value is number |
 
 const isNullableBinaryFlag = (value: unknown): value is 0 | 1 | null | undefined =>
   value == null || value === 0 || value === 1;
+
+function shippingPrerequisiteFromPayload(
+  payload: unknown,
+  patch: OCShippingPatch
+): OfficialV3ShippingPrerequisite {
+  const normalized = normalizeOfficialV3DocumentCacheRows(payload, {
+    id: patch.estimateId,
+    resource: 'estimate',
+  });
+  const signature = createOfficialV3DocumentStockSignatureFromPayload(payload, 4);
+  if (
+    !signature ||
+    normalized.docRow.context_id !== 4 ||
+    normalized.docRow.doc_number !== patch.estimateNumber ||
+    normalized.docRow.customer_id !== patch.customerId ||
+    normalized.docRow.modified !== patch.estimateModified
+  ) throw new Error('Validated OC shipping prerequisite does not match the shipping patch.');
+  return { document: normalized.docRow, lines: normalized.itemRows, stockSignature: signature };
+}

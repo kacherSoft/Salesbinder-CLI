@@ -7,6 +7,7 @@ import { formatJson, formatError } from '../../output/json.formatter.js';
 import {
   ensureAnalyticsCacheBinding,
   getAnalyticsSyncDecision,
+  resolveAnalyticsStaleThreshold,
 } from './analytics-cache-binding.js';
 
 interface AnalyticsOptions {
@@ -47,6 +48,7 @@ Output includes:
           createSalesBinderAccountBinding,
           DocumentIndexerService,
           DocumentContextId,
+          readPublicCacheSyncAuthority,
           loadConfig,
           loadPreferences,
         } = await import('@salesbinder/sdk');
@@ -58,11 +60,12 @@ Output includes:
 
         // Load stale threshold from config
         const prefs = loadPreferences();
+        const staleThresholdSeconds = resolveAnalyticsStaleThreshold(prefs?.cacheStaleSeconds);
         const indexer = new DocumentIndexerService(
           client,
           cache,
           accountName,
-          prefs?.cacheStaleSeconds
+          staleThresholdSeconds
         );
 
         // Parse months option
@@ -79,11 +82,14 @@ Output includes:
         // Check cache and sync if needed
         if (!analyticsOptions.useCachedOnly) {
           const state = await cache.getCacheState();
-          const syncDecision = getAnalyticsSyncDecision(
-            analyticsOptions.forceRefresh === true,
+          const syncDecision = await getAnalyticsSyncDecision({
+            cache,
+            forceRefresh: analyticsOptions.forceRefresh === true,
             state,
-            await indexer.isCacheStale()
-          );
+            readLegacyCacheStale: () => indexer.isCacheStale(),
+            staleThresholdSeconds,
+          });
+          if (syncDecision.error) throw new Error(syncDecision.error);
 
           if (syncDecision.shouldSync) {
             const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
@@ -139,8 +145,23 @@ Output includes:
 
         // Get cache freshness info
         const state = await cache.getCacheState();
-        const lastSync = state ? new Date(state.lastSync * 1000).toISOString() : 'unknown';
-        const stale = state ? await indexer.isCacheStale() : true;
+        const cacheAuthority = await readPublicCacheSyncAuthority(cache, {
+          staleThresholdSeconds,
+        });
+        const lastSync =
+          cacheAuthority.authority === 'official_v3'
+            ? cacheAuthority.lastAppliedAt === null
+              ? 'unknown'
+              : new Date(cacheAuthority.lastAppliedAt * 1000).toISOString()
+            : state
+              ? new Date(state.lastSync * 1000).toISOString()
+              : 'unknown';
+        const stale =
+          cacheAuthority.authority === 'official_v3'
+            ? cacheAuthority.isStale
+            : state
+              ? await indexer.isCacheStale()
+              : true;
 
         await cache.close();
         cache = null;
@@ -155,6 +176,7 @@ Output includes:
           cache_freshness: {
             last_sync: lastSync,
             stale,
+            authority: cacheAuthority.authority,
           },
         };
 

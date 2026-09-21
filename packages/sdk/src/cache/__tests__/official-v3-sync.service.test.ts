@@ -3,6 +3,7 @@ import type {
   OfficialV3SyncMarker,
   OfficialV3SyncPage,
   OfficialV3SyncRun,
+  OfficialV3ShippingPrerequisite,
   OfficialV3SyncState,
   OfficialV3SyncStore,
   OfficialV3SyncTask,
@@ -79,7 +80,8 @@ function invoice(id = docId): Record<string, unknown> {
 
 function documentPayload(
   resource: 'invoice' | 'estimate' | 'purchase_order',
-  id = docId
+  id = docId,
+  extra: Record<string, unknown> = {}
 ): Record<string, unknown> {
   if (resource === 'invoice') return invoice(id);
   const numberKey = resource === 'estimate' ? 'estimate_number' : 'purchase_order_number';
@@ -111,7 +113,7 @@ function documentPayload(
     delete payload.salesperson_id;
     payload.assigned_user_id = 'b16f844f-4b40-4f05-a468-407106563e03';
   }
-  return payload;
+  return { ...payload, ...extra };
 }
 
 function harness(options: { pageLimit?: number; now?: () => number; sleep?: (milliseconds: number) => Promise<void> } = {}) {
@@ -246,6 +248,34 @@ describe('OfficialV3SyncService', () => {
       run: { status: 'success' }, tasks: { applied: 1, failed: 0 },
     });
     expect(getSalesOrder).not.toHaveBeenCalled();
+  });
+
+  it('passes the validated related estimate as the shipping prerequisite for an invoice task', async () => {
+    const h = harness();
+    Object.assign(h.documents, { getSalesOrder: jest.fn() });
+    h.pages.set('since:1788670542', {
+      changes: [{ resource: 'invoice', id: docId, operation: 'upsert' }],
+      has_more: false,
+      next_cursor: 'cursor-shipping-prerequisite',
+    });
+    h.documents.get
+      .mockResolvedValueOnce({ ...invoice(),
+        source_estimate: { id: laterDocId, estimate_number: 123 },
+        fulfillment_authority: 'invoice',
+        fulfillment_sales_order_id: null,
+      })
+      .mockResolvedValueOnce(documentPayload('estimate', laterDocId, {
+        converted_document: { id: docId, kind: 'invoice', number: 123 },
+      }));
+
+    await expect(h.service.sync({ accountIdentity, since: 1788670542 })).resolves.toMatchObject({
+      run: { status: 'success' },
+    });
+    expect(h.store.documentShippingPrerequisites).toEqual([
+      expect.objectContaining({
+        document: expect.objectContaining({ api_doc_id: laterDocId, context_id: 4, doc_number: 123 }),
+      }),
+    ]);
   });
 
   it('applies document deletes without item hydration or child tasks', async () => {
@@ -824,6 +854,7 @@ class MemoryOfficialStore implements OfficialV3SyncStore {
   tasks = new Map<string, OfficialV3SyncTask>();
   deletedItems: string[] = [];
   events: string[] = [];
+  documentShippingPrerequisites: OfficialV3ShippingPrerequisite[] = [];
 
   async getState() { return this.state ? structuredClone(this.state) : null; }
   async getRun() { return this.currentRun ? structuredClone(this.currentRun) : null; }
@@ -858,7 +889,18 @@ class MemoryOfficialStore implements OfficialV3SyncStore {
   async applyItemUpsert(runId: string, task: OfficialV3SyncTask) { this.events.push(`upsert:${task.id}`); await this.done(runId, task); }
   async applyItemRefresh(runId: string, task: OfficialV3SyncTask) { this.events.push(`refresh:${task.id}`); await this.done(runId, task); await this.completeParents(runId); }
   async applyItemDelete(runId: string, task: OfficialV3SyncTask) { this.deletedItems.push(task.id); this.events.push(`delete:${task.id}`); await this.done(runId, task); }
-  async applyDocumentUpsert(runId: string, task: OfficialV3SyncTask) {
+  async applyDocumentUpsert(
+    runId: string,
+    task: OfficialV3SyncTask,
+    _document?: unknown,
+    _lines?: unknown,
+    _shippingPatch?: unknown,
+    _shippingWarning?: unknown,
+    _stockSignature?: unknown,
+    _stockReconciliationNotBefore?: unknown,
+    shippingPrerequisite?: OfficialV3ShippingPrerequisite | null
+  ) {
+    if (shippingPrerequisite) this.documentShippingPrerequisites.push(shippingPrerequisite);
     this.events.push(`document:${task.id}`);
     await this.done(runId, task);
   }

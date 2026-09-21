@@ -4,6 +4,7 @@ import { PostgresCacheService } from '../postgres-cache.service.js';
 import { createSalesBinderAccountBinding, type DocumentRow, type ItemDocumentRow } from '../types.js';
 import type { OCShippingPatch } from '../oc-shipping.types.js';
 import type { OfficialV3SyncRun } from '../official-v3-sync.types.js';
+import { createOfficialV3DocumentStockSignature } from '../official-v3-stock-reconciliation.js';
 
 const { Pool } = pg;
 const testUrl = process.env.SALESBINDER_OC_SHIPPING_TEST_DB_URL;
@@ -120,6 +121,118 @@ describeIfPostgres('PostgreSQL OC shipping persistence', () => {
     await store.applyDocumentUpsert(recovered.runId, (await store.listTasks(recovered.runId))[0]!, document(invoiceId, 5, 2001, 31), [], patch(estimateId, 20, invoiceId, 31, 1));
     await expect(ctx.service.getOCShippingPendingWarnings()).resolves.toEqual([]);
     await expect(ctx.service.getDocument(estimateId)).resolves.toMatchObject({ shipped_percent: 50 });
+  });
+
+  it('atomically aligns an older cached estimate from validated invoice hydration before applying shipping', async () => {
+    const ctx = await createContext('stale-estimate-prerequisite');
+    const staleCustomerId = '82b266c8-628f-48ce-a83c-21013cb740f6';
+    await seedEstimate(ctx, estimateId, 10, 1001, 0, { customer_id: staleCustomerId });
+    await seedPayment(ctx, estimateId);
+    const store = ctx.service.getOfficialV3SyncStore();
+    const run = officialRun();
+    await store.beginRun(run);
+    await store.sealPage(run.runId, { kind: 'since', value: '1' }, page(run.runId), [
+      { resource: 'invoice', id: invoiceId, operation: 'upsert' },
+    ]);
+    const estimate = document(estimateId, 4, 1001, 20);
+    const estimateLines = [line(estimateId, 0)];
+    await store.applyDocumentUpsert(
+      run.runId,
+      (await store.listTasks(run.runId))[0]!,
+      document(invoiceId, 5, 2001, 30),
+      [],
+      patch(estimateId, 20, invoiceId, 30, 1),
+      undefined,
+      undefined,
+      undefined,
+      {
+        document: estimate,
+        lines: estimateLines,
+        stockSignature: createOfficialV3DocumentStockSignature(estimate, estimateLines),
+      }
+    );
+
+    await expect(ctx.service.getDocument(estimateId)).resolves.toMatchObject({
+      customer_id: customerId,
+      modified: 20,
+      associated_document_id: invoiceId,
+      shipped_percent: 50,
+    });
+    await expect(countPayments(ctx.pool, estimateId)).resolves.toBe(1);
+    await expect(ctx.service.getOCShippingPendingWarnings()).resolves.toEqual([]);
+    await expect(store.listTasks(run.runId)).resolves.toEqual([
+      expect.objectContaining({ status: 'done' }),
+    ]);
+  });
+
+  it('defers a stale shipping projection against a newer cached estimate and repairs it on a later replay', async () => {
+    const ctx = await createContext('newer-estimate-prerequisite');
+    await seedEstimate(ctx, estimateId, 21, 1001, 0);
+    const store = ctx.service.getOfficialV3SyncStore();
+    const initial = officialRun();
+    await store.beginRun(initial);
+    await store.sealPage(initial.runId, { kind: 'since', value: '1' }, page(initial.runId), [
+      { resource: 'invoice', id: invoiceId, operation: 'upsert' },
+    ]);
+    const stale = document(estimateId, 4, 1001, 20);
+    const staleLines = [line(estimateId, 0)];
+    await expect(store.applyDocumentUpsert(
+      initial.runId,
+      (await store.listTasks(initial.runId))[0]!,
+      document(invoiceId, 5, 2001, 30),
+      [],
+      patch(estimateId, 20, invoiceId, 30, 1),
+      undefined,
+      undefined,
+      undefined,
+      {
+        document: stale,
+        lines: staleLines,
+        stockSignature: createOfficialV3DocumentStockSignature(stale, staleLines),
+      }
+    )).resolves.toBeUndefined();
+    await expect(ctx.service.getDocument(estimateId)).resolves.toMatchObject({ modified: 21, shipped_percent: null });
+    await expect(ctx.service.getOCShippingPendingWarnings()).resolves.toEqual([
+      expect.objectContaining({ contextId: 5, documentId: invoiceId }),
+    ]);
+    await store.finishRun({
+      ...initial,
+      status: 'success_with_warnings',
+      ingestionComplete: true,
+      pageCount: 1,
+      finishedAt: 31,
+      updatedAt: 31,
+    });
+
+    const replay: OfficialV3SyncRun = {
+      ...initial,
+      runId: `run-${randomUUID()}`,
+      entry: { kind: 'cursor', value: '2' },
+      updatedAt: 32,
+    };
+    await store.beginRun(replay);
+    await store.sealPage(replay.runId, { kind: 'cursor', value: '2' }, page(replay.runId), [
+      { resource: 'invoice', id: invoiceId, operation: 'upsert' },
+    ]);
+    const current = document(estimateId, 4, 1001, 22);
+    const currentLines = [line(estimateId, 0)];
+    await store.applyDocumentUpsert(
+      replay.runId,
+      (await store.listTasks(replay.runId))[0]!,
+      document(invoiceId, 5, 2001, 32),
+      [],
+      patch(estimateId, 22, invoiceId, 32, 1),
+      undefined,
+      undefined,
+      undefined,
+      {
+        document: current,
+        lines: currentLines,
+        stockSignature: createOfficialV3DocumentStockSignature(current, currentLines),
+      }
+    );
+    await expect(ctx.service.getDocument(estimateId)).resolves.toMatchObject({ modified: 22, shipped_percent: 50 });
+    await expect(ctx.service.getOCShippingPendingWarnings()).resolves.toEqual([]);
   });
 
   it('clears stale OC shipment values for a patchless estimate warning but retains its observed link', async () => {

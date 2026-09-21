@@ -117,6 +117,9 @@ const outerPgService = {
     paymentSyncStatus = status;
   }),
   getCacheState: jest.fn(async () => null),
+  getOfficialV3SyncState: jest.fn<Promise<unknown>, []>(async () => null),
+  getOfficialV3SyncRun: jest.fn<Promise<unknown>, []>(async () => null),
+  getOfficialV3SyncStatus: jest.fn<Promise<unknown>, []>(async () => null),
   setCacheState: jest.fn<Promise<void>, [Record<string, unknown>]>(async () => undefined),
   getAccountCount: jest.fn(async () => 0),
   getDocumentCount: jest.fn(async () => 0),
@@ -482,6 +485,10 @@ jest.mock(
     resolveSyncLookbackSeconds: (value: unknown) =>
       jest.requireActual('../../../../sdk/src/cache/sync-lookback.js')
         .resolveSyncLookbackSeconds(value),
+    readPublicCacheSyncAuthority: (cache: unknown, options: unknown) =>
+      jest
+        .requireActual('../../../../sdk/src/cache/public-sync-authority.js')
+        .readPublicCacheSyncAuthority(cache, options),
     loadConfig: (accountName: string) => mockLoadConfig(accountName),
     createSalesBinderAccountBinding: jest.fn(() => ({
       accountIdentity: 'salesbinder:example',
@@ -752,6 +759,9 @@ describe('cache sync --pull lock ordering', () => {
     outerPgService.setCacheState.mockImplementation(async () => undefined);
     outerPgService.setSyncStatus.mockImplementation(async () => undefined);
     outerPgService.getSyncStatus.mockResolvedValue(null);
+    outerPgService.getOfficialV3SyncState.mockResolvedValue(null);
+    outerPgService.getOfficialV3SyncRun.mockResolvedValue(null);
+    outerPgService.getOfficialV3SyncStatus.mockResolvedValue(null);
     outerPgService.getPaymentSyncStatus.mockImplementation(async () => paymentSyncStatus as never);
     outerPgService.setPaymentSyncStatus.mockImplementation(async (status) => {
       mockPaymentStatusWritten = true;
@@ -2222,6 +2232,117 @@ describe('cache sync --pull lock ordering', () => {
     }
   });
 
+  it('uses clean official V3 state over failed legacy metadata without schema writes', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(1_030_000);
+    outerPgService.getCacheState.mockResolvedValue({
+      accountName: 'default', schemaVersion: 7, lastSync: 1, lastFullSync: 1,
+      documentCount: 0, itemDocumentCount: 0,
+    } as never);
+    outerPgService.getSyncStatus.mockResolvedValue({ status: 'failed', updatedAt: 1 } as never);
+    const run = {
+      version: 1 as const,
+      runId: 'official-run',
+      accountIdentity: 'salesbinder:example',
+      entry: { kind: 'cursor' as const, value: 'cursor' },
+      status: 'success' as const,
+      ingestionComplete: true,
+      pageCount: 1,
+      startedAt: 1_000,
+      updatedAt: 1_020,
+      finishedAt: 1_020,
+    };
+    const state = {
+      version: 1 as const,
+      accountIdentity: 'salesbinder:example',
+      resources: ['item'] as const,
+      ingestionCursor: 'cursor',
+      appliedCursor: 'cursor',
+      appliedGeneration: 1,
+      nextGeneration: 1,
+      coverage: 'partial_catch_up' as const,
+      updatedAt: 1_010,
+    };
+    outerPgService.getOfficialV3SyncState.mockResolvedValue(state);
+    outerPgService.getOfficialV3SyncRun.mockResolvedValue(run);
+    outerPgService.getOfficialV3SyncStatus.mockResolvedValue({
+      run,
+      state: { ...state, hasIngestionCursor: true, hasAppliedCursor: true, cursorGap: false },
+      tasks: { discovered: 1, applied: 1, failed: 0, pending: 0, superseded: 0 },
+      failures: [],
+      coverage: 'partial_catch_up',
+    });
+
+    await runCacheStatus();
+
+    const output = JSON.parse((console.log as jest.Mock).mock.calls[0][0]);
+    expect(output).toMatchObject({
+      cache_authority: 'official_v3',
+      sync_health: 'healthy',
+      freshness: 'FRESH',
+      last_sync: '1970-01-01T00:17:00.000Z',
+      legacy_status: { sync_health: 'failed' },
+    });
+    expect(outerPgService.ensureSchema).not.toHaveBeenCalled();
+    expect(outerPgService.setCacheState).not.toHaveBeenCalled();
+    expect(outerPgService.setSyncStatus).not.toHaveBeenCalled();
+  });
+
+  it('keeps failed official V3 state authoritative over fresh legacy metadata', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(1_030_000);
+    outerPgService.getCacheState.mockResolvedValue({
+      accountName: 'default', schemaVersion: 7, lastSync: 1_020, lastFullSync: 1_020,
+      documentCount: 0, itemDocumentCount: 0,
+    } as never);
+    outerPgService.getSyncStatus.mockResolvedValue({ status: 'success', updatedAt: 1_020 } as never);
+    const run = {
+      version: 1 as const,
+      runId: 'official-failed-run',
+      accountIdentity: 'salesbinder:example',
+      entry: { kind: 'cursor' as const, value: 'cursor' },
+      status: 'failed' as const,
+      ingestionComplete: false,
+      pageCount: 1,
+      startedAt: 1_000,
+      updatedAt: 1_025,
+      finishedAt: 1_025,
+      errorCode: 'source_failed',
+    };
+    const state = {
+      version: 1 as const,
+      accountIdentity: 'salesbinder:example',
+      resources: ['item'] as const,
+      ingestionCursor: 'next',
+      appliedCursor: 'previous',
+      appliedGeneration: 1,
+      nextGeneration: 2,
+      coverage: 'partial_catch_up' as const,
+      updatedAt: 1_024,
+    };
+    outerPgService.getOfficialV3SyncState.mockResolvedValue(state);
+    outerPgService.getOfficialV3SyncRun.mockResolvedValue(run);
+    outerPgService.getOfficialV3SyncStatus.mockResolvedValue({
+      run,
+      state: { ...state, hasIngestionCursor: true, hasAppliedCursor: true, cursorGap: true },
+      tasks: { discovered: 281, applied: 1, failed: 1, pending: 280, superseded: 0 },
+      failures: [{ taskId: 'task-1', resource: 'item', id: 'item-1', code: 'source_failed' }],
+      coverage: 'partial_catch_up',
+    });
+
+    await runCacheStatus();
+
+    const output = JSON.parse((console.log as jest.Mock).mock.calls[0][0]);
+    expect(output).toMatchObject({
+      cache_authority: 'official_v3',
+      sync_health: 'failed',
+      overall_health: 'failed',
+      freshness: 'STALE',
+      last_sync: null,
+      latest_sync_attempt: '1970-01-01T00:17:05.000Z',
+      legacy_status: { sync_health: 'success', freshness: 'FRESH' },
+    });
+    expect(output.sync_status).toMatchObject({ cursor_gap: true, tasks: { pending: 280 } });
+  });
+
   it('projects first-sync status progress and derives stale-running health without mutation', async () => {
     outerPgService.getCacheState.mockResolvedValue(null);
     const persistedStatus = {
@@ -2282,6 +2403,7 @@ describe('cache sync --pull lock ordering', () => {
       /persisted-secret|private\.example|authorization|warning-status-secret|warning\.example/
     );
     expect(persistedStatus.progress).toHaveProperty('currentRecordId', 'must-not-leak');
+    expect(outerPgService.ensureSchema).not.toHaveBeenCalled();
     expect(outerPgService.setSyncStatus).not.toHaveBeenCalled();
     expect(outerPgService.releaseSyncLock).not.toHaveBeenCalled();
   });

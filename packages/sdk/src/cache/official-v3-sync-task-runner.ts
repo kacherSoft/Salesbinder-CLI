@@ -1,6 +1,9 @@
 import type { OfficialV3TaskExecution } from './official-v3-sync.contracts.js';
 import { officialV3LocalFailure } from './official-v3-sync-failure.js';
-import type { OfficialV3SyncTask } from './official-v3-sync.types.js';
+import type {
+  OfficialV3ShippingPrerequisite,
+  OfficialV3SyncTask,
+} from './official-v3-sync.types.js';
 import type { V3ExactItemHydrationResult } from './v3-exact-item-hydrator.service.js';
 import { normalizeOfficialV3DocumentCacheRows } from './v3-document-cache-normalizer.js';
 import { createOfficialV3DocumentStockSignatureFromPayload } from './official-v3-stock-reconciliation.js';
@@ -299,6 +302,9 @@ async function applyDocumentHydration(
       : undefined;
   const stockSignature = createOfficialV3DocumentStockSignatureFromPayload(payload, contextId);
   const stockReconciliationNotBefore = execution.now() + STOCK_RECONCILIATION_SETTLEMENT_SECONDS;
+  const shippingPrerequisite = shipping?.patch && shipping.estimatePayload !== undefined
+    ? normalizeShippingPrerequisite(shipping.estimatePayload, shipping.patch)
+    : undefined;
   if (shipping) {
     await execution.deps.store.applyDocumentUpsert(
       execution.runId,
@@ -315,7 +321,8 @@ async function applyDocumentHydration(
           }
         : null,
       stockSignature,
-      stockReconciliationNotBefore
+      stockReconciliationNotBefore,
+      shippingPrerequisite
     );
   } else {
     await execution.deps.store.applyDocumentUpsert(
@@ -324,6 +331,31 @@ async function applyDocumentHydration(
       stockReconciliationNotBefore
     );
   }
+}
+
+function normalizeShippingPrerequisite(
+  payload: unknown,
+  patch: NonNullable<Awaited<ReturnType<typeof hydrateOcShippingPatchSafely>>['patch']>
+): OfficialV3ShippingPrerequisite {
+  const normalized = normalizeOfficialV3DocumentCacheRows(payload, {
+    id: patch.estimateId,
+    resource: 'estimate',
+  });
+  if (
+    normalized.docRow.context_id !== 4 ||
+    normalized.docRow.doc_number !== patch.estimateNumber ||
+    normalized.docRow.customer_id !== patch.customerId ||
+    normalized.docRow.modified !== patch.estimateModified
+  ) {
+    throw new Error('Validated OC shipping prerequisite does not match the shipping patch.');
+  }
+  const stockSignature = createOfficialV3DocumentStockSignatureFromPayload(payload, 4);
+  if (!stockSignature) throw new Error('Validated OC shipping prerequisite has no stock signature.');
+  return {
+    document: normalized.docRow,
+    lines: normalized.itemRows,
+    stockSignature,
+  };
 }
 
 async function hydrateShippingIfConfigured(

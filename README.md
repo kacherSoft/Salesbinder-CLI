@@ -167,13 +167,15 @@ When `SALESBINDER_DB_URL` is set, PostgreSQL is the shared source of truth.
 - **Optional sync-and-pull:** `cache sync --pull` writes PostgreSQL, then refreshes local SQLite
 - **Sync status:** `cache_meta.sync_status` records `running`, `success`, `success_with_warnings`, or `failed` so readers can detect an active writer and partial record recovery
 
+When official V3 state exists in PostgreSQL, public cache health uses that official authority. `cache status` is a read-only report and adds `overall_health` across official, reference, and OC-shipping lanes. Legacy cache metadata remains nested diagnostic context only. If official state is present but unreadable or inconsistent, status and analytics fail closed as `official_v3` unavailable instead of falling back to older legacy timestamps.
+
 If the PostgreSQL writer loses its session ownership or a transaction outcome is uncertain, `cache sync` fails closed with a sanitized error and no success output. Atomic category and inventory publication keeps the last authoritative snapshot in place, and a later run can reacquire the lock and retry safely.
 
 PostgreSQL → SQLite mirror refresh is explicit only; normal reads and normal `cache sync` do not start a background pull.
 
 Inventory change-feed sync uses a separate PostgreSQL ledger database configured with `SALESBINDER_CHANGE_FEED_DB_URL`. The cache database and the ledger database are both one-account-per-database resources; they must be distinct database targets, and the CLI validates that they represent the same SalesBinder account before it reads or writes feed-backed inventory state. `cache status` reports only sanitized ledger reachability and progress, not raw connection details.
 
-The approved cache-sync runner lives as a private monorepo package (`packages/cache-sync-runner`) and is deployed as a separate URL-less Coolify app. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. The deployed normal runner schedules the official V3 partial catch-up from its durable status: initialize uninitialized state once, resume incomplete/warning state, and poll clean state from the retained applied cursor. It defaults to 300 seconds, never depends on the webhook ledger, and never launches legacy `cache sync` or automatic weekly `--full`. Feature branches stay in PRs until reviewed; only reviewed `main` commits promote to the Coolify app. See [Deployment](docs/deployment.md) for configuration, activation gates, and rollback.
+The approved cache-sync runner lives as a private monorepo package (`packages/cache-sync-runner`) and targets a separate URL-less Coolify app. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. The normal runner schedules the official V3 partial catch-up from its durable status: initialize uninitialized state once, resume incomplete/warning state, and poll clean state from the retained applied cursor. It defaults to 300 seconds, never depends on the webhook ledger, and never launches legacy `cache sync` or automatic weekly `--full`. Feature branches stay in PRs until reviewed; only reviewed `main` commits promote to the Coolify app after the deployment gates pass. See [Deployment](docs/deployment.md) for configuration, activation gates, and rollback.
 
 The PostgreSQL schema is created automatically on first use.
 
@@ -631,10 +633,12 @@ node packages/cli/dist/cli.js analytics patterns <item-id>
 All analytics commands support:
 
 ```bash
---refresh         # Force cache refresh before query
+--refresh         # Request fresh data before query
 --cached          # Use cache without checking freshness
 --resolve-names   # (customers only) Fetch customer names from API
 ```
+
+For managed PostgreSQL caches with official V3 state, normal analytics use the same `SALESBINDER_CACHE_STALE_SECONDS` precedence as `cache status` and fail with actionable guidance when official health is stale, failed, incomplete, unavailable, or has a cursor gap. `--cached` preserves the explicit cached-read path without the freshness gate. `--refresh` does not invoke the legacy document sync against official authority; it directs operators to resume or run `cache sync-v3` first.
 
 **Note:** customer names are cached by CSV import and forward sync. `--resolve-names` is now a fallback for old rows where `customer_name` is still null.
 
@@ -688,7 +692,7 @@ node packages/cli/dist/cli.js cache sync --full
 # Backfill invoice payment transactions (resumable)
 node packages/cli/dist/cli.js cache sync-payments
 
-# Check cache status (includes authoritative category and inventory snapshot metadata, latest progress, and sync health)
+# Check cache status (includes official/legacy authority, latest progress, and sync health)
 node packages/cli/dist/cli.js cache status
 
 # Clear cache data
@@ -718,6 +722,15 @@ The target database must already be bound to the selected SalesBinder account.
 Set `SALESBINDER_DB_URL` and provide a V3 key through `SALESBINDER_V3_API_KEY`
 or the account's `v3ApiKey`. The command does not use a V2 fallback and never
 refreshes the SQLite mirror.
+
+For PostgreSQL readers, `cache status` and analytics select official V3 state as
+the public freshness authority when it exists. `last_sync` is the latest verified
+clean successful application completion; ingestion, failed attempts, warnings,
+pending tasks, and cursor gaps appear in status but do not advance public
+freshness. Status also reports `overall_health`, reference health, and
+`oc_shipping.pending_warning_count`; that warning count is separate from the
+latest OC shipping reconciliation result. `coverage: partial_catch_up` is not
+full-baseline proof.
 
 ```bash
 # First partial catch-up: choose a non-future ISO timestamp with a timezone,
@@ -824,8 +837,12 @@ synchronization or payment-table scope.
 Malformed shipping values on the initiating document are record-local official
 V3 failures, not run-fatal failures. Related-source contract failures are
 recorded as durable shipping warnings without failing the initiating feed task.
-Each run retries up to 500 oldest pending warnings in fair rotation; sales-order
-freshness remains independent of the feed cursor.
+Invoice shipping patches require the current source invoice or sales order to
+validate the same estimate identity before a patch is written; stale or
+conflicting relations are withheld as warnings. This preserves current/newer
+guards and does not fan out estimate line-item refreshes. Each run retries up to
+500 oldest pending warnings in fair rotation; sales-order freshness remains
+independent of the feed cursor.
 
 The explicit repair operator stages the source and then plans against a fresh
 cache snapshot. V2 is discovery-only: it selects reciprocal, same-customer,
@@ -1046,9 +1063,9 @@ For daily operations involving item sales analytics with PostgreSQL as the sourc
 - Feed-bound PostgreSQL sync drains the ledger, hydrates exact item IDs, and keeps resumable receipts.
 - Cached queries are instant (<100ms).
 - Writer sync is explicit, so reader agents do not unexpectedly wait for PostgreSQL → SQLite pulls.
-- `cache status` shows `sync_status` and `sync_health` when a strict report should wait for the writer to finish.
+- `cache status` shows the selected cache authority, `sync_status`, and `sync_health` when a strict report should wait for official work to finish.
 - `--cached` flag skips sync check for fastest queries.
-- `--refresh` flag forces fresh data when needed
+- `--refresh` requests fresh data; with official V3 authority, use `cache sync-v3` rather than legacy sync.
 
 ## Output Format
 
