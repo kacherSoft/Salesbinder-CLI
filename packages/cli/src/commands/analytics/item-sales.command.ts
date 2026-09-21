@@ -5,15 +5,11 @@
 import type { Command } from 'commander';
 import { formatJson, formatError } from '../../output/json.formatter.js';
 import {
-  ensureAnalyticsCacheBinding,
-  getAnalyticsSyncDecision,
+  assertAnalyticsCacheReadable,
+  assertAnalyticsReadOptions,
+  isLegacyAnalyticsCacheStale,
   resolveAnalyticsStaleThreshold,
 } from './analytics-cache-binding.js';
-
-interface AnalyticsOptions {
-  forceRefresh?: boolean;
-  useCachedOnly?: boolean;
-}
 
 /**
  * Register item-sales analytics command
@@ -26,7 +22,6 @@ export function registerItemSalesCommand(analytics: Command): void {
 Examples:
   salesbinder analytics item-sales <item-id>
   salesbinder analytics item-sales <item-id> --months 12
-  salesbinder analytics item-sales <item-id> --refresh
   salesbinder analytics item-sales <item-id> --cached
 
 Output includes:
@@ -37,36 +32,28 @@ Output includes:
   - Revenue by period
   - Cache freshness information`)
     .option('--months <periods>', 'Periods in months (comma-separated)', '3,6,12')
-    .option('--refresh', 'Force cache refresh before query')
+    .option('--refresh', 'Unsupported: run an explicit cache sync command before analytics')
     .option('--cached', 'Use cache without checking freshness')
     .action(async (itemId: string, options: { months: string; refresh?: boolean; cached?: boolean }) => {
       let cache: import('@salesbinder/sdk').CacheService | null = null;
       try {
+        assertAnalyticsReadOptions(options);
         const {
           SalesBinderClient,
-          createCacheService,
-          createSalesBinderAccountBinding,
-          DocumentIndexerService,
+          createReadCacheService,
           DocumentContextId,
           readPublicCacheSyncAuthority,
-          loadConfig,
           loadPreferences,
         } = await import('@salesbinder/sdk');
 
         const rootProgram = analytics.parent;
         const accountName = rootProgram?.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
-        cache = await createCacheService(accountName);
+        cache = await createReadCacheService(accountName);
 
         // Load stale threshold from config
         const prefs = loadPreferences();
         const staleThresholdSeconds = resolveAnalyticsStaleThreshold(prefs?.cacheStaleSeconds);
-        const indexer = new DocumentIndexerService(
-          client,
-          cache,
-          accountName,
-          staleThresholdSeconds
-        );
 
         // Parse months option
         const periods = options.months
@@ -74,31 +61,7 @@ Output includes:
           .map((m: string) => parseInt(m, 10))
           .filter((m: number) => [3, 6, 12].includes(m));
 
-        const analyticsOptions: AnalyticsOptions = {
-          forceRefresh: options.refresh,
-          useCachedOnly: options.cached,
-        };
-
-        // Check cache and sync if needed
-        if (!analyticsOptions.useCachedOnly) {
-          const state = await cache.getCacheState();
-          const syncDecision = await getAnalyticsSyncDecision({
-            cache,
-            forceRefresh: analyticsOptions.forceRefresh === true,
-            state,
-            readLegacyCacheStale: () => indexer.isCacheStale(),
-            staleThresholdSeconds,
-          });
-          if (syncDecision.error) throw new Error(syncDecision.error);
-
-          if (syncDecision.shouldSync) {
-            const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
-            await ensureAnalyticsCacheBinding(cache, accountBinding);
-            console.error('Syncing cache...');
-            await indexer.sync({ full: syncDecision.full });
-            console.error('Sync complete');
-          }
-        }
+        await assertAnalyticsCacheReadable(cache, options, staleThresholdSeconds);
 
         // Fetch item details for name and stock
         let itemName: string | undefined;
@@ -160,7 +123,7 @@ Output includes:
           cacheAuthority.authority === 'official_v3'
             ? cacheAuthority.isStale
             : state
-              ? await indexer.isCacheStale()
+              ? isLegacyAnalyticsCacheStale(state, staleThresholdSeconds)
               : true;
 
         await cache.close();

@@ -1,171 +1,128 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 jest.mock(
   '@salesbinder/sdk',
   () => ({
     readPublicCacheSyncAuthority: (cache: unknown, options: unknown) =>
-      jest
-        .requireActual('../../../../sdk/src/cache/public-sync-authority.js')
+      jest.requireActual('../../../../sdk/src/cache/public-sync-authority.js')
         .readPublicCacheSyncAuthority(cache, options),
   }),
   { virtual: true }
 );
-import type { CacheService } from '@salesbinder/sdk';
-import { SQLiteCacheService } from '../../../../sdk/src/cache/sqlite-cache.service.js';
-import { createSalesBinderAccountBinding } from '../../../../sdk/src/cache/types.js';
+import type { CacheService, CacheState } from '@salesbinder/sdk';
 import {
-  ensureAnalyticsCacheBinding,
-  getAnalyticsSyncDecision,
+  assertAnalyticsCacheReadable,
+  assertAnalyticsReadOptions,
+  isLegacyAnalyticsCacheStale,
   resolveAnalyticsStaleThreshold,
 } from './analytics-cache-binding.js';
 
-const binding = { accountIdentity: 'salesbinder:acme', accountSubdomain: 'acme' };
-
 function cache(overrides: Partial<CacheService> = {}): CacheService {
   return {
-    ensureAccountBinding: jest.fn(async () => undefined),
-    verifyAccountBinding: jest.fn(async () => undefined),
+    getCacheState: jest.fn(async () => null),
+    getSyncStatus: jest.fn(async () => null),
     ...overrides,
   } as CacheService;
 }
 
-describe('ensureAnalyticsCacheBinding', () => {
-  it('ensures the canonical binding before a refresh path', async () => {
-    const service = cache();
+function freshState(): CacheState {
+  return {
+    lastSync: Math.floor(Date.now() / 1000), lastFullSync: 100,
+    documentCount: 1, itemDocumentCount: 1,
+    accountName: 'old-alias', schemaVersion: 8,
+  };
+}
 
-    await ensureAnalyticsCacheBinding(service, binding);
-
-    expect(service.ensureAccountBinding).toHaveBeenCalledWith(binding);
-    expect(service.verifyAccountBinding).not.toHaveBeenCalled();
+describe('read-only analytics readiness', () => {
+  it('rejects an uninitialized legacy cache with explicit writer guidance', async () => {
+    await expect(assertAnalyticsCacheReadable(cache(), {}, 3600))
+      .rejects.toThrow(/uninitialized.*read-only.*cache sync/);
   });
 
-  it('rejects a mismatched bound cache before refresh writes', async () => {
-    const service = cache({
-      ensureAccountBinding: jest.fn(async () => {
-        throw new Error('SQLite cache database is not bound to salesbinder:acme.');
-      }),
-    });
-
-    await expect(ensureAnalyticsCacheBinding(service, binding)).rejects.toThrow(
-      /not bound to salesbinder:acme/
-    );
+  it('rejects stale legacy state rather than syncing', async () => {
+    const service = cache({ getCacheState: jest.fn(async () => ({ ...freshState(), lastSync: 1 })) });
+    await expect(assertAnalyticsCacheReadable(service, {}, 3600))
+      .rejects.toThrow(/stale.*read-only.*cache sync/);
   });
 
-  it('rejects a mismatched real SQLite binding without changing its payload', async () => {
-    const directory = mkdtempSync(join(tmpdir(), 'salesbinder-analytics-binding-'));
-    const path = join(directory, 'cache.db');
-    const owner = new SQLiteCacheService('owner', path);
-    await owner.ensureAccountBinding(createSalesBinderAccountBinding('owner'));
-    await owner.insertItem({ item_id: 'bound-item', name: 'Bound item' });
-    await owner.close();
-
-    const mismatched = new SQLiteCacheService('renamed-alias', path);
-    try {
-      await expect(
-        ensureAnalyticsCacheBinding(
-          mismatched,
-          createSalesBinderAccountBinding('different-account')
-        )
-      ).rejects.toThrow(/not bound to salesbinder:different-account/);
-      expect(await mismatched.getItem('bound-item')).toBeDefined();
-    } finally {
-      await mismatched.close();
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
-});
-
-describe('analytics command sync decision', () => {
-  const originalStaleThreshold = process.env.SALESBINDER_CACHE_STALE_SECONDS;
-
-  afterEach(() => {
-    if (originalStaleThreshold === undefined) delete process.env.SALESBINDER_CACHE_STALE_SECONDS;
-    else process.env.SALESBINDER_CACHE_STALE_SECONDS = originalStaleThreshold;
-  });
-
-  function decisionInput(overrides: Partial<Parameters<typeof getAnalyticsSyncDecision>[0]> = {}) {
-    return {
-      cache: cache(),
-      forceRefresh: false,
-      state: null,
-      readLegacyCacheStale: jest.fn(async () => true),
-      staleThresholdSeconds: 3600,
-      ...overrides,
-    };
-  }
-
-  it('selects a full sync for an initial uncached legacy cache', async () => {
-    await expect(getAnalyticsSyncDecision(decisionInput())).resolves.toEqual({
-      shouldSync: true,
-      full: true,
-    });
-  });
-
-  it('does not sync only because a local alias differs from cache state', async () => {
-    const state = {
-      lastSync: 100,
-      lastFullSync: 100,
-      documentCount: 1,
-      itemDocumentCount: 1,
-      accountName: 'old-alias',
-      schemaVersion: 8,
-    };
-
-    await expect(
-      getAnalyticsSyncDecision(
-        decisionInput({ state, readLegacyCacheStale: jest.fn(async () => false) })
-      )
-    ).resolves.toEqual({
-      shouldSync: false,
-      full: false,
-    });
-  });
-
-  it('uses healthy official state without reading legacy freshness or syncing', async () => {
-    const readLegacyCacheStale = jest.fn(async () => true);
-    const official = officialCache('success');
-
-    await expect(
-      getAnalyticsSyncDecision(decisionInput({ cache: official, readLegacyCacheStale }))
-    ).resolves.toEqual({ shouldSync: false, full: false });
-    expect(readLegacyCacheStale).not.toHaveBeenCalled();
-  });
-
-  it.each(['failed', 'success_with_warnings'] as const)(
-    'requires explicit cached mode for official %s state without reading legacy freshness',
-    async (status) => {
-      const readLegacyCacheStale = jest.fn(async () => false);
-      await expect(
-        getAnalyticsSyncDecision(
-          decisionInput({ cache: officialCache(status), readLegacyCacheStale })
-        )
-      ).resolves.toEqual(
-        expect.objectContaining({ shouldSync: false, error: expect.stringContaining('--cached') })
-      );
-      expect(readLegacyCacheStale).not.toHaveBeenCalled();
+  it.each(['running', 'failed', 'success_with_warnings'] as const)(
+    'rejects fresh timestamps when legacy sync is %s', async (status) => {
+      const service = cache({
+        getCacheState: jest.fn(async () => freshState()),
+        getSyncStatus: jest.fn(async () => ({
+          status, runId: 'run-1', accountName: 'acme', syncTarget: 'sqlite' as const,
+          startedAt: 1, updatedAt: 2,
+        })),
+      });
+      await expect(assertAnalyticsCacheReadable(service, {}, 3600)).rejects.toThrow(status);
     }
   );
 
-  it('refuses explicit refresh on an official cache without calling legacy freshness', async () => {
-    const readLegacyCacheStale = jest.fn(async () => false);
-    await expect(
-      getAnalyticsSyncDecision(
-        decisionInput({ cache: officialCache('success'), forceRefresh: true, readLegacyCacheStale })
-      )
-    ).resolves.toEqual(
-      expect.objectContaining({ shouldSync: false, error: expect.stringContaining('cache sync-v3') })
-    );
-    expect(readLegacyCacheStale).not.toHaveBeenCalled();
+  it('accepts a fresh legacy cache regardless of local alias', async () => {
+    const service = cache({ getCacheState: jest.fn(async () => freshState()) });
+    await expect(assertAnalyticsCacheReadable(service, {}, 3600)).resolves.toBeUndefined();
+  });
+
+  it('accepts healthy official state without consulting legacy metadata', async () => {
+    const service = officialCache('success');
+    await expect(assertAnalyticsCacheReadable(service, {}, 3600)).resolves.toBeUndefined();
+    expect(service.getCacheState).not.toHaveBeenCalled();
+    expect(service.getSyncStatus).not.toHaveBeenCalled();
+  });
+
+  it.each(['failed', 'success_with_warnings'] as const)(
+    'requires explicit cached mode for official %s state', async (status) => {
+      const service = officialCache(status);
+      await expect(assertAnalyticsCacheReadable(service, {}, 3600))
+        .rejects.toThrow(/Official V3.*cache sync-v3 --resume.*--cached/);
+      expect(service.getCacheState).not.toHaveBeenCalled();
+    }
+  );
+
+  it('keeps unavailable official state authoritative over legacy metadata', async () => {
+    const service = officialCache('success');
+    Object.assign(service, { getOfficialV3SyncState: async () => { throw new Error('unreadable'); } });
+    await expect(assertAnalyticsCacheReadable(service, {}, 3600))
+      .rejects.toThrow(/Official V3 cache is unavailable.*cache sync-v3 --status/);
+    expect(service.getCacheState).not.toHaveBeenCalled();
+  });
+
+  it('uses cached mode without reading freshness metadata', async () => {
+    const service = cache();
+    await expect(assertAnalyticsCacheReadable(service, { cached: true }, 3600)).resolves.toBeUndefined();
+    expect(service.getCacheState).not.toHaveBeenCalled();
+    expect(service.getSyncStatus).not.toHaveBeenCalled();
+  });
+
+  it.each([{}, { cached: true }])('rejects refresh before inspecting the cache: %j', async (options) => {
+    const service = cache();
+    expect(() => assertAnalyticsReadOptions({ ...options, refresh: true }))
+      .toThrow(/read-only.*--refresh.*cache sync-v3.*cache sync/);
+    await expect(assertAnalyticsCacheReadable(service, { ...options, refresh: true }, 3600))
+      .rejects.toThrow(/read-only/);
+    expect(service.getCacheState).not.toHaveBeenCalled();
+  });
+
+  it('rejects a missing metadata table instead of initializing it', async () => {
+    const service = cache({ getCacheState: jest.fn(async () => { throw new Error('no such table: cache_meta'); }) });
+    await expect(assertAnalyticsCacheReadable(service, {}, 3600)).rejects.toThrow(/no such table/);
+  });
+
+  it.each([0, Number.NaN, Number.POSITIVE_INFINITY, 1.5])('treats invalid last-sync %s as stale', (lastSync) => {
+    expect(isLegacyAnalyticsCacheStale({ ...freshState(), lastSync }, 3600)).toBe(true);
   });
 
   it('uses the cache-status environment threshold precedence', () => {
-    process.env.SALESBINDER_CACHE_STALE_SECONDS = '0';
-    expect(resolveAnalyticsStaleThreshold(7_200)).toBe(0);
-    process.env.SALESBINDER_CACHE_STALE_SECONDS = 'invalid';
-    expect(resolveAnalyticsStaleThreshold(7_200)).toBe(3600);
-    delete process.env.SALESBINDER_CACHE_STALE_SECONDS;
-    expect(resolveAnalyticsStaleThreshold(7_200)).toBe(7_200);
+    const previous = process.env.SALESBINDER_CACHE_STALE_SECONDS;
+    try {
+      process.env.SALESBINDER_CACHE_STALE_SECONDS = '0';
+      expect(resolveAnalyticsStaleThreshold(7_200)).toBe(0);
+      process.env.SALESBINDER_CACHE_STALE_SECONDS = 'invalid';
+      expect(resolveAnalyticsStaleThreshold(7_200)).toBe(3600);
+      delete process.env.SALESBINDER_CACHE_STALE_SECONDS;
+      expect(resolveAnalyticsStaleThreshold(7_200)).toBe(7_200);
+    } finally {
+      if (previous === undefined) delete process.env.SALESBINDER_CACHE_STALE_SECONDS;
+      else process.env.SALESBINDER_CACHE_STALE_SECONDS = previous;
+    }
   });
 });
 

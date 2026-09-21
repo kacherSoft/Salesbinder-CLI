@@ -23,8 +23,11 @@ export type {
 } from './inventory-change-feed-sync.service.js';
 export {
   createCacheService,
+  createReadCacheService,
+  createPostgresCacheReaderService,
   createPostgresCacheService,
   getPostgresReadUrl,
+  isPostgresReadBackend,
 } from './cache.factory.js';
 export { pullFromPostgres } from './pg-to-sqlite-sync.service.js';
 export type {

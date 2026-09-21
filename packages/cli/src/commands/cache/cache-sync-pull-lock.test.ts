@@ -182,6 +182,8 @@ const pullFromPostgres = jest.fn<
   [string, string, string | undefined, object | undefined, MockPullOptions | undefined]
 >();
 const createPostgresCacheService = jest.fn(async () => outerPgService);
+const createPostgresCacheReaderService = jest.fn(async () => outerPgService);
+const createReadCacheService = jest.fn(async () => sqliteCacheService);
 const categoryIndexerConstructor = jest.fn();
 const v3InventoryIndexerConstructor = jest.fn();
 
@@ -480,6 +482,8 @@ jest.mock(
       }
     },
     createPostgresCacheService,
+    createPostgresCacheReaderService,
+    createReadCacheService,
     pullFromPostgres,
     loadPreferences: jest.fn(() => ({})),
     resolveSyncLookbackSeconds: (value: unknown) =>
@@ -2062,6 +2066,7 @@ describe('cache sync --pull lock ordering', () => {
     expect(process.exitCode).toBe(1);
     expect(console.error).toHaveBeenCalledWith(expect.stringContaining('API v3 key is required'));
     expect(createPostgresCacheService).not.toHaveBeenCalled();
+    expect(createReadCacheService).not.toHaveBeenCalled();
     expect(outerPgService.ensureAccountBinding).not.toHaveBeenCalled();
     expect(outerPgService.tryAcquireSyncLock).not.toHaveBeenCalled();
     expect(outerPgService.setSyncStatus).not.toHaveBeenCalled();
@@ -2282,6 +2287,8 @@ describe('cache sync --pull lock ordering', () => {
       last_sync: '1970-01-01T00:17:00.000Z',
       legacy_status: { sync_health: 'failed' },
     });
+    expect(createPostgresCacheReaderService).toHaveBeenCalledWith('default');
+    expect(createPostgresCacheService).not.toHaveBeenCalled();
     expect(outerPgService.ensureSchema).not.toHaveBeenCalled();
     expect(outerPgService.setCacheState).not.toHaveBeenCalled();
     expect(outerPgService.setSyncStatus).not.toHaveBeenCalled();
@@ -2440,7 +2447,7 @@ describe('cache sync --pull lock ordering', () => {
 
     await runCacheStatus();
 
-    expect(process.exitCode).toBeUndefined();
+    expect(process.exitCode).toBe(1);
     expect(console.error).not.toHaveBeenCalled();
     expect(process.stderr.write).not.toHaveBeenCalled();
     expect(console.log).toHaveBeenCalledTimes(1);
@@ -2454,6 +2461,26 @@ describe('cache sync --pull lock ordering', () => {
       message: 'Cache does not exist. Run "cache sync" to create it.',
     });
     expect(createPostgresCacheService).not.toHaveBeenCalled();
+    expect(createReadCacheService).not.toHaveBeenCalled();
+  });
+
+  it('rejects an explicitly selected PostgreSQL read backend without a database URL', async () => {
+    delete process.env.SALESBINDER_DB_URL;
+    process.env.SALESBINDER_READ_BACKEND = 'postgresql';
+
+    try {
+      await runCacheStatus();
+
+      expect(process.exitCode).toBe(1);
+      expect(console.log).not.toHaveBeenCalled();
+      expect(console.error).toHaveBeenCalledWith(
+        expect.stringContaining('PostgreSQL read backend is selected but SALESBINDER_DB_URL is not configured.')
+      );
+      expect(createPostgresCacheReaderService).not.toHaveBeenCalled();
+      expect(createReadCacheService).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.SALESBINDER_READ_BACKEND;
+    }
   });
 });
 

@@ -5,15 +5,10 @@
 import type { Command } from 'commander';
 import { formatJson, formatError } from '../../output/json.formatter.js';
 import {
-  ensureAnalyticsCacheBinding,
-  getAnalyticsSyncDecision,
+  assertAnalyticsCacheReadable,
+  assertAnalyticsReadOptions,
   resolveAnalyticsStaleThreshold,
 } from './analytics-cache-binding.js';
-
-interface PricingOptions {
-  forceRefresh?: boolean;
-  useCachedOnly?: boolean;
-}
 
 interface PriceDistributionItem {
   price: number;
@@ -52,68 +47,36 @@ export function registerPricingCommand(analytics: Command): void {
 
 Examples:
   salesbinder analytics pricing <item-id>
-  salesbinder analytics pricing <item-id> --refresh
   salesbinder analytics pricing <item-id> --cached
 
 Output includes:
   - Price statistics (min/max/avg/median/std dev)
   - Price distribution by price point
   - Discount detection and frequency`)
-    .option('--refresh', 'Force cache refresh before query')
+    .option('--refresh', 'Unsupported: run an explicit cache sync command before analytics')
     .option('--cached', 'Use cache without checking freshness')
     .action(async (itemId: string, options: { refresh?: boolean; cached?: boolean }) => {
       let cache: import('@salesbinder/sdk').CacheService | null = null;
       try {
+        assertAnalyticsReadOptions(options);
         const {
           SalesBinderClient,
-          createCacheService,
-          createSalesBinderAccountBinding,
-          DocumentIndexerService,
+          createReadCacheService,
           DocumentContextId,
           CacheAnalyticsService,
-          loadConfig,
           loadPreferences,
         } = await import('@salesbinder/sdk');
 
         const rootProgram = analytics.parent;
         const accountName = rootProgram?.opts().account || 'default';
         const client = new SalesBinderClient(accountName);
-        cache = await createCacheService(accountName);
+        cache = await createReadCacheService(accountName);
         const analyticsService = new CacheAnalyticsService();
 
         const prefs = loadPreferences();
         const staleThresholdSeconds = resolveAnalyticsStaleThreshold(prefs?.cacheStaleSeconds);
-        const indexer = new DocumentIndexerService(
-          client,
-          cache,
-          accountName,
-          staleThresholdSeconds
-        );
 
-        const analyticsOptions: PricingOptions = {
-          forceRefresh: options.refresh,
-          useCachedOnly: options.cached,
-        };
-
-        if (!analyticsOptions.useCachedOnly) {
-          const state = await cache.getCacheState();
-          const syncDecision = await getAnalyticsSyncDecision({
-            cache,
-            forceRefresh: analyticsOptions.forceRefresh === true,
-            state,
-            readLegacyCacheStale: () => indexer.isCacheStale(),
-            staleThresholdSeconds,
-          });
-          if (syncDecision.error) throw new Error(syncDecision.error);
-
-          if (syncDecision.shouldSync) {
-            const accountBinding = createSalesBinderAccountBinding(loadConfig(accountName).subdomain);
-            await ensureAnalyticsCacheBinding(cache, accountBinding);
-            console.error('Syncing cache...');
-            await indexer.sync({ full: syncDecision.full });
-            console.error('Sync complete');
-          }
-        }
+        await assertAnalyticsCacheReadable(cache, options, staleThresholdSeconds);
 
         let itemName: string | undefined;
         try {

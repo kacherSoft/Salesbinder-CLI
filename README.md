@@ -167,7 +167,7 @@ When `SALESBINDER_DB_URL` is set, PostgreSQL is the shared source of truth.
 - **Optional sync-and-pull:** `cache sync --pull` writes PostgreSQL, then refreshes local SQLite
 - **Sync status:** `cache_meta.sync_status` records `running`, `success`, `success_with_warnings`, or `failed` so readers can detect an active writer and partial record recovery
 
-When official V3 state exists in PostgreSQL, public cache health uses that official authority. `cache status` is a read-only report and adds `overall_health` across official, reference, and OC-shipping lanes. Legacy cache metadata remains nested diagnostic context only. If official state is present but unreadable or inconsistent, status and analytics fail closed as `official_v3` unavailable instead of falling back to older legacy timestamps.
+When official V3 state exists in PostgreSQL, public cache health uses that official authority. `cache status` is a read-only report and adds `overall_health` across official, reference, and OC-shipping lanes. Legacy cache metadata remains nested diagnostic context only. If official state is present but unreadable or inconsistent, status and analytics fail closed as `official_v3` unavailable instead of falling back to older legacy timestamps. Reader commands open only existing cache storage; a missing PostgreSQL database/schema or missing SQLite cache is an operational error, not a trigger for schema creation or sync.
 
 If the PostgreSQL writer loses its session ownership or a transaction outcome is uncertain, `cache sync` fails closed with a sanitized error and no success output. Atomic category and inventory publication keeps the last authoritative snapshot in place, and a later run can reacquire the lock and retry safely.
 
@@ -177,7 +177,7 @@ Inventory change-feed sync uses a separate PostgreSQL ledger database configured
 
 The approved cache-sync runner lives as a private monorepo package (`packages/cache-sync-runner`) and targets a separate URL-less Coolify app. Its startup probe loads the compiled CLI/SDK and exercises the native SQLite binding before credentials are bootstrapped. The normal runner schedules the official V3 partial catch-up from its durable status: initialize uninitialized state once, resume incomplete/warning state, and poll clean state from the retained applied cursor. It defaults to 300 seconds, never depends on the webhook ledger, and never launches legacy `cache sync` or automatic weekly `--full`. Feature branches stay in PRs until reviewed; only reviewed `main` commits promote to the Coolify app after the deployment gates pass. See [Deployment](docs/deployment.md) for configuration, activation gates, and rollback.
 
-The PostgreSQL schema is created automatically on first use.
+Explicit PostgreSQL writer commands create or migrate the schema on first use. Reader commands such as `cache status` and analytics do not run schema DDL.
 
 Cache schema v4 keeps archive and payment safety intact. Accounts preserve their existing active/archived boolean behavior. Items and documents use `0` for active, `1` for archived, and `NULL` when the source cannot report lifecycle state; a later row with unknown state does not erase a known value. Payment tables and payment-sync metadata remain additive. Cache schema v5 adds shipping fields on documents and line items: `documents.date_sent`, `documents.shipped_percent`, and `item_documents.quantity_shipped`.
 
@@ -338,7 +338,7 @@ node packages/cli/dist/cli.js categories delete <category-id>
 
 ### Analytics
 
-Generate sales analytics for items using the configured cache backend. By default analytics read the local SQLite mirror. Set `SALESBINDER_READ_BACKEND=postgresql` with `SALESBINDER_DB_URL` when reader agents should query the shared PostgreSQL source of truth directly.
+Generate sales analytics for items using the configured cache backend. Analytics commands are read-only: by default they read the local SQLite mirror, and with `SALESBINDER_READ_BACKEND=postgresql` plus `SALESBINDER_DB_URL` they read the existing shared PostgreSQL cache. They do not create cache schema, run implicit legacy sync, or refresh stale data; run an explicit cache writer command first when freshness fails.
 
 #### Basic Sales
 
@@ -633,12 +633,12 @@ node packages/cli/dist/cli.js analytics patterns <item-id>
 All analytics commands support:
 
 ```bash
---refresh         # Request fresh data before query
---cached          # Use cache without checking freshness
+--refresh         # Unsupported for analytics; run an explicit cache writer first
+--cached          # Read the existing cache without the freshness gate
 --resolve-names   # (customers only) Fetch customer names from API
 ```
 
-For managed PostgreSQL caches with official V3 state, normal analytics use the same `SALESBINDER_CACHE_STALE_SECONDS` precedence as `cache status` and fail with actionable guidance when official health is stale, failed, incomplete, unavailable, or has a cursor gap. `--cached` preserves the explicit cached-read path without the freshness gate. `--refresh` does not invoke the legacy document sync against official authority; it directs operators to resume or run `cache sync-v3` first.
+Analytics never write cache data. Without `--cached`, analytics use the same `SALESBINDER_CACHE_STALE_SECONDS` precedence as `cache status` and fail with actionable guidance when official or legacy cache health is stale, failed, incomplete, unavailable, missing, or has a cursor gap. `--cached` bypasses only the freshness gate and still reads existing cache rows only. `--refresh`, including `--cached --refresh`, is rejected; use explicit writer commands such as `cache sync-v3 --resume`, `cache sync-v3`, or `cache sync` before retrying analytics.
 
 **Note:** customer names are cached by CSV import and forward sync. `--resolve-names` is now a fallback for old rows where `customer_name` is still null.
 
@@ -1032,7 +1032,7 @@ For daily operations involving item sales analytics with PostgreSQL as the sourc
 3. **Reader Agents**:
 
    ```bash
-   # Read directly from PostgreSQL source of truth
+   # Read directly from the existing PostgreSQL source of truth
    export SALESBINDER_READ_BACKEND=postgresql
    node packages/cli/dist/cli.js analytics item-sales <item-id>
    ```
@@ -1063,9 +1063,9 @@ For daily operations involving item sales analytics with PostgreSQL as the sourc
 - Feed-bound PostgreSQL sync drains the ledger, hydrates exact item IDs, and keeps resumable receipts.
 - Cached queries are instant (<100ms).
 - Writer sync is explicit, so reader agents do not unexpectedly wait for PostgreSQL → SQLite pulls.
-- `cache status` shows the selected cache authority, `sync_status`, and `sync_health` when a strict report should wait for official work to finish.
-- `--cached` flag skips sync check for fastest queries.
-- `--refresh` requests fresh data; with official V3 authority, use `cache sync-v3` rather than legacy sync.
+- `cache status` shows the selected cache authority, `sync_status`, and `sync_health` without creating schema or running sync.
+- `--cached` skips only the freshness check for fastest queries.
+- Analytics `--refresh` is unsupported; run an explicit writer command when data must be refreshed.
 
 ## Output Format
 
@@ -1147,8 +1147,9 @@ salesbinder documents list --context 5 --customer <customer-id>
 # Quick analytics from cache
 salesbinder analytics item-sales <item-id> --cached
 
-# Force fresh data
-salesbinder analytics item-sales <item-id> --refresh
+# Refresh data with an explicit writer, then read analytics
+salesbinder cache sync-v3 --resume
+salesbinder analytics item-sales <item-id>
 ```
 
 ### Context ID Reference

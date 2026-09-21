@@ -222,34 +222,44 @@ export class SQLiteCacheService implements CacheService {
   private db: Database.Database;
   private readonly accountName: string;
   private readonly dbPath: string;
+  private readonly readOnly: boolean;
   private readonly syncLocks = new Map<string, { fd: number; path: string }>();
 
-  constructor(accountName: string, customPath?: string) {
+  constructor(
+    accountName: string,
+    customPath?: string,
+    options: { readOnly?: boolean } = {}
+  ) {
     this.accountName = this.sanitizeAccountName(accountName);
-    this.dbPath = customPath || this.resolveCachePath(this.accountName);
+    this.readOnly = options.readOnly === true;
+    this.dbPath = customPath || this.resolveCachePath(this.accountName, this.readOnly);
     this.db = this.connect();
-    this.initializeSchema();
+    if (!this.readOnly) this.initializeSchema();
   }
 
   private sanitizeAccountName(name: string): string {
     return name.replace(/[^a-zA-Z0-9_-]/g, '_');
   }
 
-  private resolveCachePath(accountName: string): string {
+  private resolveCachePath(accountName: string, readOnly: boolean): string {
     const cacheDir = join(homedir(), '.salesbinder', 'cache');
-    mkdirSync(cacheDir, { mode: 0o700, recursive: true });
+    if (!readOnly) mkdirSync(cacheDir, { mode: 0o700, recursive: true });
     return join(cacheDir, `salesbinder-${accountName}.db`);
   }
 
   private connect(): Database.Database {
     const debugSql = process.env['DEBUG'] === 'true';
+    if (this.readOnly && !existsSync(this.dbPath)) {
+      throw new Error(`SQLite cache does not exist at ${this.dbPath}. Run cache sync first.`);
+    }
     const db = new Database(this.dbPath, {
-      fileMustExist: false,
+      readonly: this.readOnly,
+      fileMustExist: this.readOnly,
       verbose: debugSql ? console.log : undefined,
     });
-    db.pragma('journal_mode = WAL');
+    if (!this.readOnly) db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
-    if (existsSync(this.dbPath)) {
+    if (!this.readOnly && existsSync(this.dbPath)) {
       try {
         chmodSync(this.dbPath, 0o600);
       } catch {
@@ -1592,6 +1602,10 @@ export class SQLiteCacheService implements CacheService {
   }
 
   async verifyAccountBinding(binding: CacheAccountBinding): Promise<void> {
+    if (this.readOnly) {
+      this.verifyExistingAccountBinding(binding);
+      return;
+    }
     // The mirror path historically verifies before its first replacement. An
     // empty file is safe to bind here; populated legacy files fail closed.
     this.bindOrVerifyAccount(binding);
@@ -1943,6 +1957,45 @@ export class SQLiteCacheService implements CacheService {
       }
     });
     tx.immediate();
+  }
+
+  private verifyExistingAccountBinding(binding: CacheAccountBinding): void {
+    const canonical = createSalesBinderAccountBinding(binding.accountSubdomain);
+    if (canonical.accountIdentity !== binding.accountIdentity) {
+      throw new Error(
+        'SQLite cache account identity does not match its normalized SalesBinder subdomain.'
+      );
+    }
+    let identity: CacheMetaRow | undefined;
+    let subdomain: CacheMetaRow | undefined;
+    try {
+      identity = this.db
+        .prepare('SELECT value FROM cache_meta WHERE key = ?')
+        .get(SQLITE_ACCOUNT_IDENTITY_META_KEY) as CacheMetaRow | undefined;
+      subdomain = this.db
+        .prepare('SELECT value FROM cache_meta WHERE key = ?')
+        .get(SQLITE_ACCOUNT_SUBDOMAIN_META_KEY) as CacheMetaRow | undefined;
+    } catch (error) {
+      if (sqliteErrorMessage(error).includes('no such table: cache_meta')) {
+        throw new Error('SQLite cache schema is not initialized. Run cache sync first.');
+      }
+      throw error;
+    }
+    if (!identity || !subdomain) {
+      throw new Error(
+        `SQLite cache database has no account binding for ${canonical.accountIdentity}. ` +
+          'Run cache sync for this SalesBinder account first, or use the correctly bound cache.'
+      );
+    }
+    if (
+      identity.value !== canonical.accountIdentity ||
+      subdomain.value !== canonical.accountSubdomain
+    ) {
+      throw new Error(
+        `SQLite cache database is not bound to ${canonical.accountIdentity}. ` +
+          'Use the matching cache file or rebuild a fresh cache for this SalesBinder account.'
+      );
+    }
   }
 
   private assertSnapshotAccountMatchesBinding(accountIdentity: string): void {
@@ -2632,6 +2685,11 @@ const isNullableNonNegativePostgresInteger = (value: unknown): value is number |
 
 const isNullableBinaryFlag = (value: unknown): value is 0 | 1 | null | undefined =>
   value == null || value === 0 || value === 1;
+
+const sqliteErrorMessage = (error: unknown): string =>
+  typeof error === 'object' && error !== null && 'message' in error
+    ? String((error as { message?: unknown }).message)
+    : '';
 
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);

@@ -1,22 +1,17 @@
-import { readPublicCacheSyncAuthority, type CacheAccountBinding, type CacheService } from '@salesbinder/sdk';
-import type { CacheState } from '@salesbinder/sdk';
+import { readPublicCacheSyncAuthority, type CacheService, type CacheState } from '@salesbinder/sdk';
 
-/**
- * Ensure the canonical cache owner immediately before analytics refreshes
- * documents. Cached-only queries deliberately do not call this helper, so
- * offline reads retain their existing behavior.
- */
-export async function ensureAnalyticsCacheBinding(
-  cache: CacheService,
-  accountBinding: CacheAccountBinding
-): Promise<void> {
-  await cache.ensureAccountBinding(accountBinding);
+interface AnalyticsReadOptions {
+  refresh?: boolean;
+  cached?: boolean;
 }
 
-export interface AnalyticsSyncDecision {
-  shouldSync: boolean;
-  full: boolean;
-  error?: string;
+/** Reject the former implicit writer option, including when combined with --cached. */
+export function assertAnalyticsReadOptions(options: AnalyticsReadOptions): void {
+  if (options.refresh) {
+    throw new Error(
+      'Analytics is read-only; --refresh is unsupported. Run cache sync-v3 for official V3 caches or cache sync for legacy caches, then retry analytics.'
+    );
+  }
 }
 
 /** Match cache-status threshold precedence for every analytics freshness gate. */
@@ -32,42 +27,54 @@ export function resolveAnalyticsStaleThreshold(preference: unknown): number {
   return Number.isSafeInteger(value) && value >= 0 ? value : 3600;
 }
 
-/**
- * Official V3 cache state owns managed PostgreSQL freshness. It never triggers
- * the legacy document indexer, which would publish a second authority.
- */
-export async function getAnalyticsSyncDecision(input: {
-  cache: CacheService;
-  forceRefresh: boolean;
-  state: CacheState | null;
-  readLegacyCacheStale: () => Promise<boolean>;
-  staleThresholdSeconds: number;
-}): Promise<AnalyticsSyncDecision> {
-  const authority = await readPublicCacheSyncAuthority(input.cache, {
-    staleThresholdSeconds: input.staleThresholdSeconds,
-  });
+export function isLegacyAnalyticsCacheStale(
+  state: CacheState | null,
+  staleThresholdSeconds: number
+): boolean {
+  const now = Math.floor(Date.now() / 1000);
+  return !state ||
+    !Number.isSafeInteger(state.lastSync) ||
+    state.lastSync <= 0 ||
+    state.lastSync > now ||
+    now - state.lastSync > staleThresholdSeconds;
+}
+
+/** Check readiness without initializing a cache, updating ownership, or starting a writer. */
+export async function assertAnalyticsCacheReadable(
+  cache: CacheService,
+  options: AnalyticsReadOptions,
+  staleThresholdSeconds: number
+): Promise<void> {
+  assertAnalyticsReadOptions(options);
+  if (options.cached) return;
+
+  const authority = await readPublicCacheSyncAuthority(cache, { staleThresholdSeconds });
   if (authority.authority === 'official_v3') {
-    if (input.forceRefresh) {
-      return {
-        shouldSync: false,
-        full: false,
-        error:
-          'Official V3 cache refresh is managed by cache sync-v3. Run cache sync-v3 --resume, then retry analytics.',
-      };
-    }
     if (authority.syncHealth !== 'healthy') {
-      return {
-        shouldSync: false,
-        full: false,
-        error: `Official V3 cache is ${authority.syncHealth}. Run cache sync-v3 --resume, or use --cached to query the current snapshot explicitly.`,
-      };
+      const nextCommand = authority.syncHealth === 'stale'
+        ? 'cache sync-v3'
+        : authority.syncHealth === 'active' || authority.syncHealth === 'unavailable'
+          ? 'cache sync-v3 --status'
+          : 'cache sync-v3 --resume';
+      throw new Error(
+        `Official V3 cache is ${authority.syncHealth}. Analytics is read-only. Run ${nextCommand}, then retry, or use --cached to query the current snapshot explicitly.`
+      );
     }
-    return { shouldSync: false, full: false };
+    return;
   }
 
-  const cacheStale = await input.readLegacyCacheStale();
-  return {
-    shouldSync: input.forceRefresh || !input.state || cacheStale,
-    full: input.forceRefresh || !input.state,
-  };
+  const state = await cache.getCacheState();
+  const syncStatus = await cache.getSyncStatus();
+  const problem = !state || state.lastSync <= 0
+    ? 'uninitialized'
+    : syncStatus && syncStatus.status !== 'success'
+      ? syncStatus.status
+      : isLegacyAnalyticsCacheStale(state, staleThresholdSeconds)
+        ? 'stale'
+        : null;
+  if (problem) {
+    throw new Error(
+      `Legacy cache is ${problem}. Analytics is read-only. Run cache sync explicitly, then retry, or use --cached to query the current snapshot explicitly.`
+    );
+  }
 }

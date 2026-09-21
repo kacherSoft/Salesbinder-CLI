@@ -27,11 +27,17 @@ export function registerCacheStatusCommand(cache: Command, program: Command): vo
           sdk.loadConfig(accountName).subdomain
         );
         const dbUrl = process.env.SALESBINDER_DB_URL;
+        const postgresReadSelected = process.env.SALESBINDER_READ_BACKEND === 'postgresql';
         let backend: 'postgresql' | 'sqlite';
         let location: Record<string, unknown>;
+        if (postgresReadSelected && !dbUrl) {
+          throw new Error(
+            'PostgreSQL read backend is selected but SALESBINDER_DB_URL is not configured.'
+          );
+        }
         if (dbUrl) {
           backend = 'postgresql';
-          const pgCache = await sdk.createPostgresCacheService();
+          const pgCache = await sdk.createPostgresCacheReaderService(accountName);
           if (!pgCache)
             throw new Error('PostgreSQL backend is configured but could not be opened.');
           cacheService = pgCache;
@@ -52,9 +58,10 @@ export function registerCacheStatusCommand(cache: Command, program: Command): vo
                 message: 'Cache does not exist. Run "cache sync" to create it.',
               })
             );
+            process.exitCode = 1;
             return;
           }
-          cacheService = await sdk.createCacheService(accountName);
+          cacheService = await sdk.createReadCacheService(accountName);
           await cacheService.verifyAccountBinding(accountBinding);
           location = {
             exists: true,

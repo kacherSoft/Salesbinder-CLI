@@ -362,9 +362,11 @@ export class PostgresCacheService
   private officialV3SyncStore?: PostgresOfficialV3SyncStore;
   private referenceRefreshStore?: PostgresReferenceRefreshStore;
 
-  constructor(connectionString: string) {
-    this.connectionString = connectionString;
-    this.pool = new Pool({ connectionString });
+  constructor(connectionString: string, options: { readOnly?: boolean } = {}) {
+    this.connectionString = options.readOnly
+      ? appendReadOnlyConnectionOption(connectionString)
+      : connectionString;
+    this.pool = new Pool({ connectionString: this.connectionString });
     this.changeFeedStore();
     // node-postgres emits pool-level errors when an idle connection drops.
     // Handle them here so a transient idle-client failure does not become an
@@ -3549,6 +3551,14 @@ export class PostgresCacheService
       imported_at: Number(row.imported_at),
     };
   }
+}
+
+function appendReadOnlyConnectionOption(connectionString: string): string {
+  const url = new URL(connectionString);
+  const readOnlyOption = '-c default_transaction_read_only=on';
+  const current = url.searchParams.get('options');
+  url.searchParams.set('options', current ? `${current} ${readOnlyOption}` : readOnlyOption);
+  return url.toString();
 }
 
 interface DocumentIdentityRow {
