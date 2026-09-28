@@ -102,6 +102,43 @@ describe('V3ExactItemHydratorService', () => {
     expect(listVariations.mock.calls.map(([id]) => id)).toEqual([ids[0], ids[2]]);
   });
 
+  it('reports verified absence only when the caller explicitly trusts a successful exact lookup', async () => {
+    const ids = [canonicalId(1), canonicalId(2), canonicalId(3)];
+    const getMany = jest.fn(async () => ({
+      items: [v3Item({ id: ids[1], item_number: 2 })],
+      omittedIds: [ids[0], ids[2]],
+    }));
+    const service = createService({
+      getMany,
+      listVariations: jest.fn(async () => page([])),
+    });
+
+    await expect(service.hydrate(ids)).resolves.toEqual([
+      { id: ids[0], status: 'missing_unproven' },
+      expect.objectContaining({ id: ids[1], status: 'found_current' }),
+      { id: ids[2], status: 'missing_unproven' },
+    ]);
+    await expect(
+      service.hydrate(ids, { absenceAuthority: 'successful_exact_lookup' })
+    ).resolves.toEqual([
+      { id: ids[0], status: 'verified_absent' },
+      expect.objectContaining({ id: ids[1], status: 'found_current' }),
+      { id: ids[2], status: 'verified_absent' },
+    ]);
+  });
+
+  it('does not report verified absence from an incomplete exact response partition', async () => {
+    const id = canonicalId(1);
+    const service = createService({
+      getMany: jest.fn(async () => ({ items: [], omittedIds: [] })),
+      listVariations: jest.fn(async () => page([])),
+    });
+
+    await expect(
+      service.hydrate([id], { absenceAuthority: 'successful_exact_lookup' })
+    ).rejects.toBeInstanceOf(ApiResponseValidationError);
+  });
+
   it('isolates local item and variation validation failures from valid peers', async () => {
     const invalidRecord = v3Item({ id: canonicalId(1), item_number: 1, sku: 'BAD\0SKU' });
     const invalidVariations = v3Item({ id: canonicalId(2), item_number: 2, variation_count: 1 });

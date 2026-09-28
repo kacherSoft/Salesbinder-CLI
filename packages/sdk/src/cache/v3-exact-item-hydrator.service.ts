@@ -42,6 +42,12 @@ export type V3ExactItemHydrationProgressCallback = (
 export interface V3ExactItemHydrationOptions {
   categoryNames?: Map<string, string> | null;
   onProgress?: V3ExactItemHydrationProgressCallback;
+  /**
+   * A successful, fully validated exact-ID response may authoritatively prove
+   * current absence for official sync. Other workflows keep the conservative
+   * default because their source marker may not authorize local removal.
+   */
+  absenceAuthority?: 'successful_exact_lookup';
 }
 
 export interface V3FoundExactItemHydration {
@@ -56,6 +62,11 @@ export interface V3MissingExactItemHydration {
   status: 'missing_unproven';
 }
 
+export interface V3VerifiedAbsentExactItemHydration {
+  id: string;
+  status: 'verified_absent';
+}
+
 export interface V3FailedExactItemHydration {
   id: string;
   status: 'local_failure';
@@ -65,6 +76,7 @@ export interface V3FailedExactItemHydration {
 export type V3ExactItemHydrationResult =
   | V3FoundExactItemHydration
   | V3MissingExactItemHydration
+  | V3VerifiedAbsentExactItemHydration
   | V3FailedExactItemHydration;
 
 interface V3VariationHydrationClient {
@@ -97,7 +109,13 @@ export class V3ExactItemHydratorService {
         const item = items.get(id);
         let result: V3ExactItemHydrationResult;
         if (!item) {
-          result = { id, status: 'missing_unproven' };
+          result = {
+            id,
+            status:
+              options.absenceAuthority === 'successful_exact_lookup'
+                ? 'verified_absent'
+                : 'missing_unproven',
+          };
           counts.missingCount++;
         } else {
           const observation = await hydrateV3InventoryItem(

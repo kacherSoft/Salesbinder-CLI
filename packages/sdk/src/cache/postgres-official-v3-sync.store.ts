@@ -207,6 +207,17 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     });
   }
 
+  async applyItemAbsence(runId: string, task: OfficialV3SyncTask): Promise<void> {
+    await this.options.withVerifiedWrite(async (client) => {
+      const persisted = await this.requireTask(client, runId, task);
+      assertVerifiedItemAbsenceTask(persisted);
+      if (persisted.status === 'done' || persisted.status === 'superseded') return;
+      if (await this.completeIfStale(client, runId, persisted)) return;
+      await this.options.deleteApiInventory(client, persisted.id);
+      await this.complete(client, runId, persisted, 'done', task.attempts, 'absent');
+    });
+  }
+
   async applyDocumentUpsert(
     runId: string,
     task: OfficialV3SyncTask,
@@ -512,9 +523,11 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
   private async hasNewerReceipt(client: PoolClient, task: OfficialV3SyncTask): Promise<boolean> {
     const latest = await readJson(client, officialLatestReceiptKey(task.resource, task.id));
     if (!latest) return false;
-    const receipt = latest as { generation?: unknown; operation?: unknown };
-    if (typeof receipt.generation !== 'number' || receipt.generation <= task.generation) return false;
-    if (task.kind === 'stock_reconciliation') return receipt.operation === 'delete';
+    const receipt = parseLatestReceipt(latest);
+    if (receipt.generation <= task.generation) return false;
+    if (task.kind === 'stock_reconciliation') {
+      return receipt.operation === 'delete' || receipt.operation === 'absent';
+    }
     return true;
   }
 
@@ -642,13 +655,14 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     runId: string,
     task: OfficialV3SyncTask,
     status: 'done' | 'superseded',
-    attempts = task.attempts
+    attempts = task.attempts,
+    receiptOperation?: 'absent'
   ): Promise<void> {
     const done = { ...task, status, attempts: Math.max(task.attempts, attempts) };
     delete done.errorCode;
     await putJson(client, officialTaskKey(runId, task.taskId), done);
     if (status === 'done') {
-      await putLatestReceipt(client, runId, task);
+      await putLatestReceipt(client, runId, task, receiptOperation);
     }
   }
 
@@ -855,19 +869,50 @@ async function putJson(client: PoolClient, key: string, value: unknown): Promise
 async function putLatestReceipt(
   client: PoolClient,
   runId: string,
-  task: OfficialV3SyncTask
+  task: OfficialV3SyncTask,
+  receiptOperation?: 'absent'
 ): Promise<void> {
   const key = officialLatestReceiptKey(task.resource, task.id);
   const existing = await readJson(client, key);
-  if (existing && typeof (existing as { generation?: unknown }).generation === 'number') {
-    if ((existing as { generation: number }).generation >= task.generation) return;
-  }
+  if (existing && parseLatestReceipt(existing).generation >= task.generation) return;
   await putJson(client, key, {
     generation: task.generation,
     runId,
     taskId: task.taskId,
-    operation: task.operation,
+    operation: receiptOperation ?? task.operation,
+    ...(receiptOperation ? { sourceOperation: task.operation } : {}),
   });
+}
+
+interface OfficialLatestReceipt {
+  generation: number;
+  runId: string;
+  taskId: string;
+  operation?: unknown;
+}
+
+function parseLatestReceipt(value: unknown): OfficialLatestReceipt {
+  const receipt = value as Partial<OfficialLatestReceipt>;
+  if (
+    !Number.isSafeInteger(receipt.generation) ||
+    Number(receipt.generation) < 1 ||
+    typeof receipt.runId !== 'string' ||
+    receipt.runId.length === 0 ||
+    typeof receipt.taskId !== 'string' ||
+    receipt.taskId.length === 0
+  ) {
+    throw new Error('Invalid persisted official V3 latest receipt.');
+  }
+  return receipt as OfficialLatestReceipt;
+}
+
+function assertVerifiedItemAbsenceTask(task: OfficialV3SyncTask): void {
+  const markerUpsert = task.kind === 'marker' && task.operation === 'upsert';
+  const stockRefresh =
+    task.kind === 'stock_reconciliation' && task.operation === 'refresh';
+  if (task.resource !== 'item' || (!markerUpsert && !stockRefresh)) {
+    throw new Error('Official V3 verified item absence task is invalid.');
+  }
 }
 
 async function selectPrefix(client: PoolClient, prefix: string): Promise<{ key: string; value: string }[]> {

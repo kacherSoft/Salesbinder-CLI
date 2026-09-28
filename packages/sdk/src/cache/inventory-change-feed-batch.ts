@@ -210,7 +210,11 @@ export async function processInventoryGroups(
       ) {
         result = await confirmDeletedItem(group.objectId, renewal, dependencies);
       }
-      if (result.status === 'local_failure' || result.status === 'missing_unproven') {
+      if (
+        result.status === 'local_failure' ||
+        result.status === 'missing_unproven' ||
+        result.status === 'verified_absent'
+      ) {
         if (
           result.status === 'missing_unproven' &&
           group.newestEvent.eventType === 'inventory.item_deleted'
@@ -349,7 +353,10 @@ async function verifyAndComplete(
 
 async function failGroup(
   group: InventoryChangeFeedItemGroup,
-  result: Extract<V3ExactItemHydrationResult, { status: 'local_failure' | 'missing_unproven' }>,
+  result: Extract<
+    V3ExactItemHydrationResult,
+    { status: 'local_failure' | 'missing_unproven' | 'verified_absent' }
+  >,
   summary: InventoryGroupProcessingResult,
   dependencies: InventoryGroupProcessorDependencies
 ): Promise<void> {

@@ -120,7 +120,10 @@ async function refreshItem(execution: OffsetExecution, task: DocumentOffsetTask)
     if (results.length !== 1 || results[0]?.id !== task.id)
       throw new DocumentOffsetSyncError('invalid_hydration_identity');
     const result = results[0];
-    if (result.status === 'missing_unproven') failure = 'missing_unproven';
+    if (result.status === 'missing_unproven' || result.status === 'verified_absent') {
+      // This workflow never opts into exact-response absence authority.
+      failure = 'missing_unproven';
+    }
     else if (result.status === 'local_failure') failure = 'invalid_record';
     else bundle = result.bundle;
   } catch (error) {
