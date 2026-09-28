@@ -41,6 +41,10 @@ const itemD = '7fb6a3a8-d591-4761-98e5-b5275d20f5e4';
 const docId = 'c40e5d25-c573-48ec-aa46-9737eddf2513';
 const customerId = '90b266c8-628f-48ce-a83c-21013cb740f6';
 const lineNew = 'f60d6f78-7550-4ef0-bcbe-3e0ac367aa58';
+const officialHydrationOptions = {
+  absenceAuthority: 'successful_exact_lookup',
+  categoryNames: null,
+} as const;
 
 describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
   jest.setTimeout(45_000);
@@ -118,6 +122,113 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     await expect(store.listTasks(run.runId)).resolves.toEqual([
       expect.objectContaining({ taskId: task.taskId, status: 'pending' }),
     ]);
+  });
+
+  it('rolls back verified absence removal when task receipt commit fails', async () => {
+    const ctx = await createContext('absence-receipt-rollback');
+    const store = ctx.service.getOfficialV3SyncStore();
+    const run = officialRun();
+    await ctx.service.insertItem(item(itemA, 7, { name: 'Prior API item' }));
+    await ctx.service.insertItemStockLocation(stock(itemA, 7, `api-prior:${itemA}`));
+    await store.beginRun(run);
+    await store.sealPage(
+      run.runId,
+      { kind: 'since', value: '1788670542' },
+      page(run.runId, 1, 'cursor-absence-rollback', false),
+      [{ resource: 'item', id: itemA, operation: 'upsert' }]
+    );
+    const task = (await store.listTasks(run.runId))[0]!;
+    await installTaskReceiptFailure(ctx.pool, task);
+
+    await expect(store.applyItemAbsence(run.runId, { ...task, attempts: 1 })).rejects.toThrow(
+      'fail_official_receipt'
+    );
+
+    await expect(ctx.service.getItem(itemA)).resolves.toMatchObject({
+      name: 'Prior API item',
+      quantity: 7,
+      cache_source: 'api',
+    });
+    await expect(ctx.service.getItemStockLocations(itemA)).resolves.toEqual([
+      expect.objectContaining({ stock_row_id: `api-prior:${itemA}`, quantity_on_hand: 7 }),
+    ]);
+    await expect(store.listTasks(run.runId)).resolves.toEqual([
+      expect.objectContaining({ taskId: task.taskId, operation: 'upsert', status: 'pending' }),
+    ]);
+    await expect(readMeta(ctx.pool, officialLatestReceiptKey('item', itemA))).resolves.toBeNull();
+  });
+
+  it('removes only API inventory for verified absence and preserves CSV authority', async () => {
+    const ctx = await createContext('absence-preserves-csv');
+    const store = ctx.service.getOfficialV3SyncStore();
+    const run = officialRun();
+    await ctx.service.insertItem(item(itemA, 4, { name: 'Prior API item' }));
+    await ctx.service.insertItemStockLocation(stock(itemA, 4, `api-prior:${itemA}`));
+    await ctx.service.insertItemStockLocation({
+      ...stock(itemA, 19, `csv:${itemA}`),
+      cache_source: 'csv',
+      source_api_version: null,
+    });
+    await store.beginRun(run);
+    await store.sealPage(
+      run.runId,
+      { kind: 'since', value: '1788670542' },
+      page(run.runId, 1, 'cursor-absence-csv', false),
+      [{ resource: 'item', id: itemA, operation: 'upsert' }]
+    );
+    const task = (await store.listTasks(run.runId))[0]!;
+
+    await store.applyItemAbsence(run.runId, { ...task, attempts: 1 });
+
+    await expect(ctx.service.getItem(itemA)).resolves.toMatchObject({
+      item_id: itemA,
+      cache_source: 'csv',
+      source_api_version: null,
+    });
+    await expect(ctx.service.getItemStockLocations(itemA)).resolves.toEqual([
+      expect.objectContaining({
+        stock_row_id: `csv:${itemA}`,
+        cache_source: 'csv',
+        quantity_on_hand: 19,
+      }),
+    ]);
+    await expect(store.listTasks(run.runId)).resolves.toEqual([
+      expect.objectContaining({ taskId: task.taskId, operation: 'upsert', status: 'done' }),
+    ]);
+    await expect(readMeta(ctx.pool, officialLatestReceiptKey('item', itemA))).resolves.toBe(
+      JSON.stringify({
+        generation: task.generation,
+        runId: run.runId,
+        taskId: task.taskId,
+        operation: 'absent',
+        sourceOperation: 'upsert',
+      })
+    );
+  });
+
+  it('completes verified absence when the API item is already absent locally', async () => {
+    const ctx = await createContext('absence-already-local');
+    const store = ctx.service.getOfficialV3SyncStore();
+    const run = officialRun();
+    await store.beginRun(run);
+    await store.sealPage(
+      run.runId,
+      { kind: 'since', value: '1788670542' },
+      page(run.runId, 1, 'cursor-already-absent', false),
+      [{ resource: 'item', id: itemA, operation: 'upsert' }]
+    );
+    const task = (await store.listTasks(run.runId))[0]!;
+
+    await store.applyItemAbsence(run.runId, { ...task, attempts: 1 });
+    await store.advanceAppliedPrefix(run.runId);
+
+    await expect(ctx.service.getItem(itemA)).resolves.toBeUndefined();
+    await expect(store.listTasks(run.runId)).resolves.toEqual([
+      expect.objectContaining({ taskId: task.taskId, operation: 'upsert', status: 'done' }),
+    ]);
+    await expect(ctx.service.getOfficialV3SyncState()).resolves.toMatchObject({
+      appliedCursor: 'cursor-already-absent',
+    });
   });
 
   it('persists a sanitized failed run when the first source read fails before any page is sealed', async () => {
@@ -220,7 +331,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       accountIdentity: binding.accountIdentity,
       since: 1788670542,
     });
-    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA, itemB], { categoryNames: null });
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA, itemB], officialHydrationOptions);
     expect(result.run.status).toBe('success');
     expect(result.tasks).toMatchObject({ discovered: 3, applied: 3, failed: 0, pending: 0 });
     expect(result.state.cursorGap).toBe(false);
@@ -276,7 +387,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       since: 1788670542,
     });
 
-    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA], { categoryNames: null });
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA], officialHydrationOptions);
     expect(result.run.status).toBe('success');
     expect(result.tasks).toMatchObject({ discovered: 2, applied: 2, failed: 0, pending: 0 });
     expect(result.state.cursorGap).toBe(false);
@@ -317,7 +428,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       since: 1788670542,
     });
 
-    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA, itemB], { categoryNames: null });
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA, itemB], officialHydrationOptions);
     expect(result.run.status).toBe('success');
     expect(result.tasks).toMatchObject({ discovered: 3, applied: 3, failed: 0, pending: 0 });
     expect(result.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
@@ -351,7 +462,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     });
 
     expect(harness.documents.get).not.toHaveBeenCalled();
-    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA], { categoryNames: null });
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA], officialHydrationOptions);
     expect(result.run.status).toBe('success');
     expect(result.tasks).toMatchObject({ discovered: 2, applied: 2, failed: 0, pending: 0 });
     await expect(ctx.service.getDocument(docId)).resolves.toBeUndefined();
@@ -410,7 +521,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       since: 1788670542,
     });
 
-    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemB], { categoryNames: null });
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemB], officialHydrationOptions);
     expect(harness.documents.get).toHaveBeenCalledTimes(2);
     expect(result.run.status).toBe('success');
     expect(result.tasks).toMatchObject({ discovered: 2, applied: 2, failed: 0, pending: 0 });
@@ -460,7 +571,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       resume: true,
     });
 
-    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA], { categoryNames: null });
+    expect(harness.hydrator.hydrate).toHaveBeenCalledWith([itemA], officialHydrationOptions);
     expect(resumed.run.status).toBe('success');
     await expect(ctx.service.getDocument(docId)).resolves.toMatchObject({
       api_doc_id: docId,
@@ -527,7 +638,7 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     );
   });
 
-  it('retries prior failed work on resume, ingests a new cycle, and advances prefix across runs', async () => {
+  it('resolves prior failed work as verified absence and advances the prefix across runs', async () => {
     const ctx = await createContext('resume-prefix');
     const pages: PageMap = {
       'since:1788670542': envelope(
@@ -542,9 +653,17 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
       ),
     };
     const harness = serviceHarness(ctx, pages);
-    let itemAAvailable = false;
+    await ctx.service.insertItem(item(itemA, 5, { name: 'Stale API item' }));
+    await ctx.service.insertItemStockLocation(stock(itemA, 5, `stale-api:${itemA}`));
+    let itemAAbsenceVerified = false;
     harness.hydrator.hydrate.mockImplementation(async (ids) =>
-      ids.map((id) => (id === itemA && !itemAAvailable ? missing(id) : found(id)))
+      ids.map((id) =>
+        id === itemA
+          ? itemAAbsenceVerified
+            ? verifiedAbsent(id)
+            : missing(id)
+          : found(id)
+      )
     );
 
     const warning = await harness.service.sync({
@@ -555,8 +674,9 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     expect(warning.run.status).toBe('success_with_warnings');
     expect(warning.tasks).toMatchObject({ discovered: 2, applied: 1, failed: 1 });
     expect(warning.state).toMatchObject({ hasAppliedCursor: false, cursorGap: true });
+    await expect(ctx.service.getItem(itemA)).resolves.toMatchObject({ name: 'Stale API item' });
 
-    itemAAvailable = true;
+    itemAAbsenceVerified = true;
     pages['cursor:cursor-clean'] = envelope(
       [{ resource: 'item', id: itemC, operation: 'upsert' }],
       false,
@@ -572,6 +692,18 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     expect(resumed.run.status).toBe('success');
     expect(resumed.tasks).toMatchObject({ discovered: 3, applied: 3, failed: 0, pending: 0 });
     expect(resumed.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
+    await expect(ctx.service.getItem(itemA)).resolves.toBeUndefined();
+    const absenceReceipt = JSON.parse(
+      (await readMeta(ctx.pool, officialLatestReceiptKey('item', itemA)))!
+    );
+    expect(absenceReceipt).toMatchObject({
+      operation: 'absent',
+      sourceOperation: 'upsert',
+    });
+    const absenceTask = (await readOfficialTasks(ctx.pool, warning.run.runId)).find(
+      (task) => task.id === itemA
+    );
+    expect(absenceTask).toMatchObject({ operation: 'upsert', status: 'done' });
 
     pages['cursor:cursor-resumed'] = envelope(
       [{ resource: 'item', id: itemD, operation: 'upsert' }],
@@ -917,6 +1049,10 @@ function found(id: string, quantity = 1): V3ExactItemHydrationResult {
 
 function missing(id: string): V3ExactItemHydrationResult {
   return { id, status: 'missing_unproven' };
+}
+
+function verifiedAbsent(id: string): V3ExactItemHydrationResult {
+  return { id, status: 'verified_absent' };
 }
 
 function legacyRefreshTask(

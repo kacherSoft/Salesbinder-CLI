@@ -135,6 +135,28 @@ describe('V3ItemsResource', () => {
     });
   });
 
+  it('passes through sold unique items returned by exact-ID mode', async () => {
+    const id = canonicalId(1);
+    const sold = v3Item(id, {
+      inventory_type: 'unique',
+      status_id: 14,
+      quantity: 0,
+      archived: false,
+    });
+    const get = jest.fn().mockResolvedValue({
+      data: listEnvelope([sold], '/api/v3/items', { per_page: 1 }),
+    });
+    const resource = createResource(get);
+
+    await expect(resource.getMany([id])).resolves.toMatchObject({
+      items: [{ id, inventory_type: 'unique', status_id: 14 }],
+      omittedIds: [],
+    });
+    expect(get).toHaveBeenCalledWith('/items', {
+      params: { page: 1, limit: 1, ids: id, archived: 'all' },
+    });
+  });
+
   it.each([
     { label: 'empty', ids: [] },
     { label: '51 IDs', ids: Array.from({ length: 51 }, (_, index) => canonicalId(index + 1)) },

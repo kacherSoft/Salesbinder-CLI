@@ -102,6 +102,7 @@ export interface OfficialV3SyncStore {
     stockRows: ItemStockLocationRow[]
   ): Promise<void>;
   applyItemDelete(runId: string, task: OfficialV3SyncTask): Promise<void>;
+  applyItemAbsence(runId: string, task: OfficialV3SyncTask): Promise<void>;
   applyDocumentUpsert(
     runId: string,
     task: OfficialV3SyncTask,

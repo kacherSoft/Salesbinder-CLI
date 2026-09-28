@@ -767,6 +767,22 @@ root-items request, while preserving same-ID upsert/delete order.
 Variation/location pagination and each item's atomic checkpoint remain
 separate, so this is not a complete ten-item sync in one HTTP request.
 
+The shared exact-item hydrator remains conservative by default: an omitted ID
+is `missing_unproven`. The official V3 item-upsert and stock-reconciliation
+paths opt into `successful_exact_lookup` authority. Only a successful, complete,
+structurally valid exact-ID response may classify its requested omitted ID as
+`verified_absent`; a failed, malformed, truncated, or identity-invalid response,
+or a direct `404` alone, preserves the cache and does not authorize removal.
+
+Verified official absence runs through the normal fenced PostgreSQL writer. It
+removes only API-owned item and stock rows, preserves CSV-owned rows, completes
+the original task without rewriting its source operation, and records the
+latest receipt as `operation: absent` with the original `sourceOperation`.
+This proves current source absence, not when, why, or by whom a historical
+deletion occurred. Resume uses the existing task and cursor chain; it never
+resets the cursor. This source-tree contract still requires the deployment
+gates in [Deployment](docs/deployment.md) before it can be treated as live.
+
 Document markers hydrate their own document bundles first. The first
 observation bootstraps a stock-signature sidecar from the source payload,
 including item, location, and variation-location identity, then later runs
@@ -790,7 +806,7 @@ history is retained as a `stock_history_missing` failed task for operator review
 instead of fabricating item IDs or deleting unknown inventory; the run remains
 partial catch-up coverage until that task is resolved. Stock-reconciliation
 children are not satisfied by earlier item upsert receipts; only a later
-positive item delete receipt can supersede them.
+item delete or verified-absence receipt can supersede them.
 
 When old durable state contains document-derived `item_refresh` children,
 resume supersedes unfinished children without an inventory write or new

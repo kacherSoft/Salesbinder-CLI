@@ -10,6 +10,164 @@ const apiDocId = 'c40e5d25-c573-48ec-aa46-9737eddf2513';
 const localDocId = '67a862bf-8ba2-43d7-8706-4d0a048e9007';
 
 describe('PostgresOfficialV3SyncStore', () => {
+  it('atomically records verified absence without rewriting the source task operation', async () => {
+    const h = harness();
+    const run = officialRun();
+    const upsert = task(run.runId, 'absent-item', 1, 'upsert');
+    h.seedRun(run);
+    h.seedTask(upsert, 'failed');
+
+    await h.store.applyItemAbsence(run.runId, { ...upsert, attempts: 2 });
+
+    expect(h.deletedItems).toEqual([itemId]);
+    expect(h.task(upsert)).toMatchObject({
+      kind: 'marker',
+      operation: 'upsert',
+      status: 'done',
+      attempts: 2,
+    });
+    expect(JSON.parse(h.meta.get(officialLatestReceiptKey('item', itemId))!)).toEqual({
+      generation: 1,
+      runId: run.runId,
+      taskId: upsert.taskId,
+      operation: 'absent',
+      sourceOperation: 'upsert',
+    });
+  });
+
+  it.each([
+    {
+      label: 'source delete marker',
+      change: { operation: 'delete' as const },
+    },
+    {
+      label: 'legacy item refresh',
+      change: { kind: 'item_refresh' as const, operation: 'refresh' as const },
+    },
+    {
+      label: 'document marker',
+      change: { resource: 'invoice' as const },
+    },
+  ])('rejects verified absence for a $label', async ({ change }) => {
+    const h = harness();
+    const run = officialRun();
+    const invalid = { ...task(run.runId, `invalid-${change.operation ?? change.resource}`, 1, 'upsert'), ...change };
+    h.seedRun(run);
+    h.seedTask(invalid);
+
+    await expect(h.store.applyItemAbsence(run.runId, invalid)).rejects.toThrow(
+      'Official V3 verified item absence task is invalid.'
+    );
+
+    expect(h.deletedItems).toEqual([]);
+    expect(h.task(invalid)).toMatchObject({ status: 'pending' });
+    expect(h.meta.has(officialLatestReceiptKey(invalid.resource, invalid.id))).toBe(false);
+  });
+
+  it('does not remove inventory when a newer same-item receipt already exists', async () => {
+    const h = harness();
+    const run = officialRun();
+    const stale = task(run.runId, 'stale-absence', 1, 'upsert');
+    h.seedRun(run);
+    h.seedTask(stale, 'failed');
+    h.meta.set(officialLatestReceiptKey('item', itemId), JSON.stringify({
+      generation: 2,
+      runId: run.runId,
+      taskId: 'newer-item',
+      operation: 'upsert',
+    }));
+
+    await h.store.applyItemAbsence(run.runId, { ...stale, attempts: 2 });
+
+    expect(h.deletedItems).toEqual([]);
+    expect(h.task(stale)).toMatchObject({ operation: 'upsert', status: 'superseded' });
+  });
+
+  it.each(['done', 'superseded'] as const)(
+    'does not repeat removal for an already %s absence task',
+    async (status) => {
+      const h = harness();
+      const run = officialRun();
+      const completed = task(run.runId, `already-${status}`, 1, 'upsert');
+      h.seedRun(run);
+      h.seedTask(completed, status);
+
+      await h.store.applyItemAbsence(run.runId, completed);
+
+      expect(h.deletedItems).toEqual([]);
+      expect(h.task(completed)).toMatchObject({ operation: 'upsert', status });
+    }
+  );
+
+  it('allows a newer absence receipt to supersede stale stock reconciliation', async () => {
+    const h = harness();
+    const run = officialRun();
+    const stockTask: OfficialV3SyncTask = {
+      ...task(run.runId, 'stock-refresh', 1, 'refresh'),
+      kind: 'stock_reconciliation',
+      operation: 'refresh',
+      parentTaskId: 'document-parent',
+      notBefore: 100,
+    };
+    h.seedRun(run);
+    h.seedTask(stockTask, 'failed');
+    h.meta.set(officialLatestReceiptKey('item', itemId), JSON.stringify({
+      generation: 2,
+      runId: run.runId,
+      taskId: 'newer-absence',
+      operation: 'absent',
+      sourceOperation: 'upsert',
+    }));
+
+    await expect(h.store.markSupersededIfStale(run.runId, stockTask)).resolves.toBe(true);
+
+    expect(h.task(stockTask)).toMatchObject({ status: 'superseded' });
+    expect(h.deletedItems).toEqual([]);
+  });
+
+  it('records stock-reconciliation absence without rewriting its refresh operation', async () => {
+    const h = harness();
+    const run = officialRun();
+    const stockTask: OfficialV3SyncTask = {
+      ...task(run.runId, 'stock-absence', 1, 'refresh'),
+      kind: 'stock_reconciliation',
+      operation: 'refresh',
+      parentTaskId: 'document-parent',
+      notBefore: 100,
+    };
+    h.seedRun(run);
+    h.seedTask(stockTask);
+
+    await h.store.applyItemAbsence(run.runId, stockTask);
+
+    expect(h.deletedItems).toEqual([itemId]);
+    expect(h.task(stockTask)).toMatchObject({ operation: 'refresh', status: 'done' });
+    expect(JSON.parse(h.meta.get(officialLatestReceiptKey('item', itemId))!)).toMatchObject({
+      operation: 'absent',
+      sourceOperation: 'refresh',
+    });
+  });
+
+  it('fails closed before removal when the latest receipt is malformed', async () => {
+    const h = harness();
+    const run = officialRun();
+    const upsert = task(run.runId, 'malformed-receipt', 1, 'upsert');
+    h.seedRun(run);
+    h.seedTask(upsert);
+    h.meta.set(officialLatestReceiptKey('item', itemId), JSON.stringify({
+      generation: null,
+      runId: run.runId,
+      taskId: 'bad-receipt',
+    }));
+
+    await expect(h.store.applyItemAbsence(run.runId, upsert)).rejects.toThrow(
+      'Invalid persisted official V3 latest receipt.'
+    );
+
+    expect(h.deletedItems).toEqual([]);
+    expect(h.task(upsert)).toMatchObject({ operation: 'upsert', status: 'pending' });
+  });
+
   it('marks stale retry work superseded from the latest receipt key without mutating cache', async () => {
     const h = harness();
     const run = officialRun();

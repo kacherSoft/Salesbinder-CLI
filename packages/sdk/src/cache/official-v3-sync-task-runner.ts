@@ -14,6 +14,9 @@ import type { NormalizedV3InventoryItem } from './v3-inventory-normalizer.js';
 const DOCUMENT_CONTEXTS = { invoice: 5, estimate: 4, purchase_order: 11 } as const;
 const ITEM_HYDRATION_BATCH_LIMIT = 10;
 const STOCK_RECONCILIATION_SETTLEMENT_SECONDS = 30;
+const OFFICIAL_ITEM_HYDRATION_OPTIONS = {
+  absenceAuthority: 'successful_exact_lookup' as const,
+};
 
 export async function drainOfficialV3Tasks(execution: OfficialV3TaskExecution): Promise<void> {
   await execution.deps.store.retireLegacyItemRefreshTasks(execution.runId);
@@ -124,7 +127,10 @@ async function processItemHydrationBatch(
   try {
     results = await execution.deps.hydrator.hydrate(
       uniqueTaskIds(runnable),
-      { categoryNames: execution.deps.categoryNames ?? null }
+      {
+        ...OFFICIAL_ITEM_HYDRATION_OPTIONS,
+        categoryNames: execution.deps.categoryNames ?? null,
+      }
     );
   } catch (error) {
     const code = officialV3LocalFailure(error);
@@ -240,6 +246,7 @@ async function applyItemHydration(
   task: OfficialV3SyncTask
 ): Promise<void> {
   const results = await execution.deps.hydrator.hydrate([task.id], {
+    ...OFFICIAL_ITEM_HYDRATION_OPTIONS,
     categoryNames: execution.deps.categoryNames ?? null,
   });
   if (results.length !== 1 || results[0]?.id !== task.id) {
@@ -256,6 +263,10 @@ async function applyItemHydrationResult(
   if (result.id !== task.id) throw new Error('Official V3 item hydration identity mismatch');
   if (result.status === 'missing_unproven') {
     await execution.deps.store.saveTaskFailure(execution.runId, task, 'missing_unproven');
+    return;
+  }
+  if (result.status === 'verified_absent') {
+    await execution.deps.store.applyItemAbsence(execution.runId, task);
     return;
   }
   if (result.status === 'local_failure') {

@@ -1,4 +1,6 @@
+import { AxiosError } from 'axios';
 import { OfficialV3SyncService } from '../official-v3-sync.service.js';
+import { ApiResponseValidationError } from '../../resources/api-response-validation.error.js';
 import type {
   OfficialV3SyncMarker,
   OfficialV3SyncPage,
@@ -20,6 +22,10 @@ const batchIds = Array.from(
   { length: 12 },
   (_, index) => `10000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
 );
+const officialHydrationOptions = {
+  absenceAuthority: 'successful_exact_lookup',
+  categoryNames: null,
+} as const;
 
 function itemResult(id: string): V3ExactItemHydrationResult {
   return {
@@ -149,7 +155,71 @@ function harness(options: { pageLimit?: number; now?: () => number; sleep?: (mil
   return { service, store, pages, sync, hydrate, documents };
 }
 
+function axiosError(status: number): AxiosError {
+  return new AxiosError(`HTTP ${status}`, undefined, undefined, undefined, {
+    status,
+    statusText: String(status),
+    headers: {},
+    config: {} as never,
+    data: {},
+  });
+}
+
 describe('OfficialV3SyncService', () => {
+  it('removes a verified absent item and advances the official cursor', async () => {
+    const h = harness();
+    h.pages.set('since:1788670542', {
+      changes: [{ resource: 'item', id: itemB, operation: 'upsert' }],
+      has_more: false,
+      next_cursor: 'cursor-1',
+    });
+    h.hydrate.mockResolvedValueOnce([{ id: itemB, status: 'verified_absent' }]);
+
+    const result = await h.service.sync({ accountIdentity, since: 1788670542 });
+
+    expect(h.hydrate).toHaveBeenCalledWith([itemB], {
+      absenceAuthority: 'successful_exact_lookup',
+      categoryNames: null,
+    });
+    expect(h.store.events).toEqual([`absent:${itemB}`]);
+    expect(result.run.status).toBe('success');
+    expect(result.tasks).toMatchObject({ discovered: 1, applied: 1, failed: 0, pending: 0 });
+    expect(result.state).toMatchObject({ hasAppliedCursor: true, cursorGap: false });
+  });
+
+  it('applies verified absence to a stock reconciliation child and completes its parent', async () => {
+    const h = harness();
+    h.store.seedState('cursor-2');
+    h.store.seedRun('run-stock-absence', 'running');
+    h.store.pages.push({
+      runId: 'run-stock-absence', page: 1, request: { kind: 'cursor', value: 'cursor-1' },
+      status: 'sealed', markerCount: 1, hasMore: false, nextCursor: 'cursor-2',
+      firstGeneration: 1, lastGeneration: 1, responseHash: 'stock-absence-page',
+    });
+    h.store.seedTask({
+      taskId: 'parent', runId: 'run-stock-absence', page: 1, ordinal: 0, generation: 1,
+      kind: 'marker', resource: 'invoice', id: docId, operation: 'upsert',
+      status: 'waiting_children', attempts: 1,
+    });
+    h.store.seedTask({
+      taskId: 'parent:stock:item-a', runId: 'run-stock-absence', page: 1, ordinal: 0,
+      generation: 1, parentTaskId: 'parent', kind: 'stock_reconciliation', resource: 'item',
+      id: itemA, operation: 'refresh', status: 'pending', attempts: 0, notBefore: 100,
+    });
+    h.hydrate.mockResolvedValueOnce([{ id: itemA, status: 'verified_absent' }]);
+
+    const result = await h.service.sync({ accountIdentity, resume: true });
+
+    expect(h.store.events).toEqual([`absent:${itemA}`]);
+    expect(await h.store.listTasks('run-stock-absence')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: 'parent', operation: 'upsert', status: 'done' }),
+      expect.objectContaining({
+        taskId: 'parent:stock:item-a', operation: 'refresh', status: 'done',
+      }),
+    ]));
+    expect(result.run.status).toBe('success');
+  });
+
   it('seals later pages and keeps applied coverage behind an earlier record gap', async () => {
     const h = harness();
     h.pages.set('since:1788670542', {
@@ -471,7 +541,7 @@ describe('OfficialV3SyncService', () => {
 
     expect(sleeps).toEqual([30_000]);
     expect(h.hydrate).toHaveBeenCalledTimes(1);
-    expect(h.hydrate).toHaveBeenCalledWith([itemA], { categoryNames: null });
+    expect(h.hydrate).toHaveBeenCalledWith([itemA], officialHydrationOptions);
     expect(h.store.events).toEqual([`refresh:${itemA}`, `refresh:${itemA}`]);
     expect(await h.store.listTasks('run-stock')).toEqual(expect.arrayContaining([
       expect.objectContaining({ taskId: 'parent-a', status: 'done' }),
@@ -512,8 +582,8 @@ describe('OfficialV3SyncService', () => {
     const result = await h.service.sync({ accountIdentity, resume: true });
 
     expect(h.hydrate.mock.calls).toEqual([
-      [[itemA], { categoryNames: null }],
-      [[itemA], { categoryNames: null }],
+      [[itemA], officialHydrationOptions],
+      [[itemA], officialHydrationOptions],
     ]);
     expect(await h.store.listTasks('run-stock-upsert')).toEqual(expect.arrayContaining([
       expect.objectContaining({ taskId: 'parent:stock:item-a', status: 'done' }),
@@ -546,8 +616,8 @@ describe('OfficialV3SyncService', () => {
     const result = await h.service.sync({ accountIdentity, resume: true });
 
     expect(h.hydrate.mock.calls).toEqual([
-      [ids.slice(0, 10), { categoryNames: null }],
-      [[ids[10]!], { categoryNames: null }],
+      [ids.slice(0, 10), officialHydrationOptions],
+      [[ids[10]!], officialHydrationOptions],
     ]);
     expect(result.run.status).toBe('success');
   });
@@ -596,7 +666,83 @@ describe('OfficialV3SyncService', () => {
     });
 
     expect([...h.store.tasks.values()].map((task) => task.status)).toEqual(['pending', 'pending']);
+    expect(h.store.deletedItems).toEqual([]);
   });
+
+  it('retains inventory and fails the task when exact response validation fails', async () => {
+    const h = harness();
+    h.pages.set('since:1788670542', {
+      changes: [{ resource: 'item', id: itemA, operation: 'upsert' }],
+      has_more: false,
+      next_cursor: 'cursor-1',
+    });
+    h.hydrate.mockRejectedValue(
+      new ApiResponseValidationError(
+        'Invalid API v3 response for exact item lookup: expected one complete result page'
+      )
+    );
+
+    const result = await h.service.sync({ accountIdentity, since: 1788670542 });
+
+    expect(h.store.deletedItems).toEqual([]);
+    expect(h.store.events).toEqual([
+      `failure:${itemA}:invalid_record`,
+      `failure:${itemA}:invalid_record`,
+    ]);
+    expect(result.run.status).toBe('success_with_warnings');
+    expect(result.failures).toEqual([
+      { taskId: 'm:1:0', resource: 'item', id: itemA, code: 'invalid_record' },
+    ]);
+  });
+
+  it.each([
+    [404, 'missing_unproven'],
+    [500, 'source_unavailable'],
+  ] as const)(
+    'does not remove inventory after a failed exact lookup with HTTP %i',
+    async (status, expectedCode) => {
+      const h = harness();
+      h.pages.set('since:1788670542', {
+        changes: [{ resource: 'item', id: itemA, operation: 'upsert' }],
+        has_more: false,
+        next_cursor: 'cursor-1',
+      });
+      h.hydrate.mockRejectedValue(axiosError(status));
+
+      const result = await h.service.sync({ accountIdentity, since: 1788670542 });
+
+      expect(h.store.deletedItems).toEqual([]);
+      expect(result.run.status).toBe('success_with_warnings');
+      expect(result.failures).toEqual([
+        { taskId: 'm:1:0', resource: 'item', id: itemA, code: expectedCode },
+      ]);
+    }
+  );
+
+  it.each([
+    [403, 'authentication_failed'],
+    [429, 'rate_limit_failed'],
+  ] as const)(
+    'does not remove inventory after a fatal exact lookup with HTTP %i',
+    async (status, expectedCode) => {
+      const h = harness();
+      h.pages.set('since:1788670542', {
+        changes: [{ resource: 'item', id: itemA, operation: 'upsert' }],
+        has_more: false,
+        next_cursor: 'cursor-1',
+      });
+      h.hydrate.mockRejectedValue(axiosError(status));
+
+      await expect(
+        h.service.sync({ accountIdentity, since: 1788670542 })
+      ).rejects.toMatchObject({ code: expectedCode });
+
+      expect(h.store.deletedItems).toEqual([]);
+      expect([...h.store.tasks.values()]).toEqual([
+        expect.objectContaining({ operation: 'upsert', status: 'pending' }),
+      ]);
+    }
+  );
 
   it('does not replay a committed item after interruption before the batch checkpoint', async () => {
     const h = harness();
@@ -889,6 +1035,7 @@ class MemoryOfficialStore implements OfficialV3SyncStore {
   async applyItemUpsert(runId: string, task: OfficialV3SyncTask) { this.events.push(`upsert:${task.id}`); await this.done(runId, task); }
   async applyItemRefresh(runId: string, task: OfficialV3SyncTask) { this.events.push(`refresh:${task.id}`); await this.done(runId, task); await this.completeParents(runId); }
   async applyItemDelete(runId: string, task: OfficialV3SyncTask) { this.deletedItems.push(task.id); this.events.push(`delete:${task.id}`); await this.done(runId, task); }
+  async applyItemAbsence(runId: string, task: OfficialV3SyncTask) { this.deletedItems.push(task.id); this.events.push(`absent:${task.id}`); await this.done(runId, task); await this.completeParents(runId); }
   async applyDocumentUpsert(
     runId: string,
     task: OfficialV3SyncTask,
