@@ -298,7 +298,7 @@ function validDirectInvoiceAuthorityIds(estimates, invoices) {
   return [...new Set(estimates.flatMap((estimate) => {
     if (!estimate.associatedDocumentId) return [];
     const invoice = byId.get(estimate.associatedDocumentId);
-    if (!invoice || invoice.associatedDocumentId !== estimate.id || invoice.customerId !== estimate.customerId) return [];
+    if (!invoice || invoice.associatedDocumentId !== estimate.id) return [];
     return [invoice.id];
   }))].sort();
 }
@@ -465,7 +465,7 @@ export function buildPlan(stage, cache, salesOrderStage = null, invoiceAuthority
     const v2Invoice = invoices.get(estimate.associatedDocumentId);
     if (!v2Invoice) {
       const salesOrder = salesOrders.get(estimate.associatedDocumentId);
-      if (!salesOrder || salesOrder.customerId !== estimate.customerId || !salesOrder.sourceEstimate.observed || salesOrder.sourceEstimate.value == null || salesOrder.sourceEstimate.value.id !== estimate.id || salesOrder.sourceEstimate.value.estimateNumber !== estimate.documentNumber) { exclude('salesOrderRelationUnverified', estimate.id, true); continue; }
+      if (!salesOrder || !salesOrder.sourceEstimate.observed || salesOrder.sourceEstimate.value == null || salesOrder.sourceEstimate.value.id !== estimate.id || salesOrder.sourceEstimate.value.estimateNumber !== estimate.documentNumber) { exclude('salesOrderRelationUnverified', estimate.id, true); continue; }
       canonical.convertedDocument.value = { id: salesOrder.id, kind: 'sales_order', number: salesOrder.number };
       const patch = patchOrExclude(exclude, estimate.id, () => createOcShippingPatch(canonical, salesOrder));
       if (!patch) continue;
@@ -474,9 +474,8 @@ export function buildPlan(stage, cache, salesOrderStage = null, invoiceAuthority
       continue;
     }
     if (v2Invoice.associatedDocumentId !== estimate.id) { exclude('invoiceRelationUnverified', estimate.id, true); continue; }
-    if (v2Invoice.customerId !== estimate.customerId) { exclude('invoiceCustomerMismatch', estimate.id, true); continue; }
     const invoice = authorityInvoices.get(v2Invoice.id);
-    if (!invoice || invoice.kind !== 'invoice' || invoice.customerId !== estimate.customerId || !invoice.sourceEstimate.observed || invoice.sourceEstimate.value == null || invoice.sourceEstimate.value.id !== estimate.id || invoice.sourceEstimate.value.estimateNumber !== estimate.documentNumber) { exclude('invoiceRelationUnverified', estimate.id, true); continue; }
+    if (!invoice || invoice.kind !== 'invoice' || !invoice.sourceEstimate.observed || invoice.sourceEstimate.value == null || invoice.sourceEstimate.value.id !== estimate.id || invoice.sourceEstimate.value.estimateNumber !== estimate.documentNumber) { exclude('invoiceRelationUnverified', estimate.id, true); continue; }
     canonical.convertedDocument.value = { id: invoice.id, kind: 'invoice', number: invoice.number };
     let patch;
     if (invoice.fulfillmentAuthority === 'sales_order') {
