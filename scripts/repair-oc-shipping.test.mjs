@@ -110,13 +110,49 @@ test('uses V3 direct invoice authorities for shipping values and requires their 
   assert.equal(plan.patches[0].lines[0].quantityShipped, 0);
 });
 
-test('selects reciprocal same-customer V2 invoices even when V2 shipping header is invalid', () => {
+test('selects reciprocal V2 invoices even when V2 shipping header is invalid', () => {
   const source = sourceDocument(document({ associated_document_id: invoiceId }), 4);
   const invoice = v2Invoice({ shipped_percent: 150 });
   const plan = buildPlan(stage([source], [invoice]), cache([row()]), null, v3InvoiceAuthority());
   assert.equal(plan.patches.length, 1);
   assert.equal(plan.exclusions.invoiceRelationUnverified, 0);
   assert.equal(plan.accountedCachedCount, 1);
+});
+
+test('plans cross-customer invoice shipping without changing either customer or shipped quantities', () => {
+  const source = sourceDocument(document({ associated_document_id: invoiceId }), 4);
+  const invoice = v2Invoice({ customer_id: outsideId });
+  const authorities = v3InvoiceAuthority({ customerId: outsideId, shippedPercent: 30 });
+  const plan = buildPlan(stage([source], [invoice]), cache([row()]), null, authorities);
+  assert.equal(plan.patches.length, 1);
+  assert.equal(plan.patches[0].customerId, customer);
+  assert.equal(plan.patches[0].shippedPercent, 0);
+  assert.equal(plan.patches[0].lines[0].quantityShipped, 0);
+  assert.equal(source.customerId, customer);
+  assert.equal(invoice.customerId, outsideId);
+  assert.equal(authorities.authorities[0].source.customerId, outsideId);
+  assert.equal(plan.exclusions.invoiceCustomerMismatch, 0);
+});
+
+test('plans direct and invoice-linked sales orders with different customers', () => {
+  const salesOrder = { ...v3InvoiceAuthority().authorities[0].source,
+    id: sourceOnlyId, kind: 'sales_order', number: 55, customerId: sourceOnlyId,
+    shippedPercent: 40, fulfillmentAuthority: undefined, fulfillmentSalesOrderId: undefined };
+  const orders = { version: 1, source: 'salesbinder_v3_sales_orders',
+    accountIdentity: 'salesbinder:test', salesOrders: [salesOrder] };
+  const direct = sourceDocument(document({ associated_document_id: sourceOnlyId }), 4);
+  const directPlan = buildPlan(stage([direct]), cache([row()]), orders);
+  assert.equal(directPlan.patches.length, 1);
+  assert.equal(directPlan.patches[0].customerId, customer);
+  assert.equal(directPlan.patches[0].shippedPercent, 0);
+  const linked = sourceDocument(document({ associated_document_id: invoiceId }), 4);
+  const authorities = v3InvoiceAuthority({ customerId: outsideId,
+    fulfillmentAuthority: 'sales_order', fulfillmentSalesOrderId: sourceOnlyId });
+  const linkedPlan = buildPlan(stage([linked], [v2Invoice({ customer_id: outsideId })]), cache([row()]), orders, authorities);
+  assert.equal(linkedPlan.patches.length, 1);
+  assert.equal(linkedPlan.patches[0].customerId, customer);
+  assert.equal(linkedPlan.patches[0].shippedPercent, 0);
+  assert.equal(salesOrder.customerId, sourceOnlyId);
 });
 
 test('rejects authority-stage contradictions and excludes contract-invalid authorities', () => {

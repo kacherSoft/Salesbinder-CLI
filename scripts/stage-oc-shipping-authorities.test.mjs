@@ -45,12 +45,16 @@ function progress() {
   };
 }
 
-test('selects reciprocal same-customer invoices even when V2 header values are missing or invalid', () => {
+test('selects reciprocal invoices regardless of customer or V2 header values', () => {
   assert.deepEqual(selectInvoiceAuthorities(v2Stage(), ACCOUNT).requestedIds, [INVOICE]);
   assert.deepEqual(selectInvoiceAuthorities(v2Stage({ percent: 101 }), ACCOUNT).requestedIds, [INVOICE]);
   assert.deepEqual(selectInvoiceAuthorities(v2Stage({ percent: undefined }), ACCOUNT).requestedIds, [INVOICE]);
   assert.deepEqual(selectInvoiceAuthorities(v2Stage({ reciprocal: null }), ACCOUNT).requestedIds, []);
-  assert.deepEqual(selectInvoiceAuthorities(v2Stage({ invoiceCustomer: OTHER_CUSTOMER }), ACCOUNT).requestedIds, []);
+  const source = v2Stage({ invoiceCustomer: OTHER_CUSTOMER });
+  const result = selectInvoiceAuthorities(source, ACCOUNT);
+  assert.deepEqual(result.requestedIds, [INVOICE]);
+  assert.equal(source.contexts[4].documents[0].customerId, CUSTOMER);
+  assert.equal(source.contexts[5].documents[0].customerId, OTHER_CUSTOMER);
 });
 
 test('keeps retry exhaustion and transport errors resumable while naming safe record outcomes', () => {

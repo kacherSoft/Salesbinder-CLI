@@ -842,6 +842,11 @@ invoice or sales order. The configured four-resource V3 feed does not subscribe
 to sales-order markers, so linked sales orders are reconciled separately with
 their own freshness check; this does not change the feed cursor contract.
 
+Each document retains its own source customer identity. Different customer IDs
+across linked documents do not invalidate a source conversion relation or
+authorize changing either customer. Document identity and reciprocal
+conversion-link validation still apply.
+
 Line shipping is applied only for a validated, unambiguous source-line match at
 the item, variation/location, unit, and quantity scope. Source header shipping
 percentages are not authority; the compatibility `shipped_percent` field is
@@ -862,8 +867,8 @@ guards and does not fan out estimate line-item refreshes. Each run retries up to
 independent of the feed cursor.
 
 The explicit repair operator stages the source and then plans against a fresh
-cache snapshot. V2 is discovery-only: it selects reciprocal, same-customer,
-direct invoice relationships and never supplies shipment values. A completed
+cache snapshot. V2 is discovery-only: it selects reciprocal, direct invoice
+relationships and never supplies shipment values. A completed
 canonical V3 invoice-authority stage is mandatory before dry-run or apply.
 Staging and dry-run are read-only against the cache:
 

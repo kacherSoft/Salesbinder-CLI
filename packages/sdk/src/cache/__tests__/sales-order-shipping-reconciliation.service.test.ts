@@ -352,7 +352,49 @@ describe('SalesOrderShippingReconciliationService', () => {
     ]);
   });
 
-  it('keeps a persistent customer conflict pending without aborting the sales-order pass', async () => {
+  it('retries a cross-customer invoice warning through the real hydrator and clears it', async () => {
+    const ctx = harness({ warnings: [warning(5, invoiceId)] });
+    const customerId = '66666666-6666-4666-8666-666666666666';
+    const sourceCustomerId = '88888888-8888-4888-8888-888888888888';
+    const commonLine = { line_type: 'inventory', item_id: itemId, quantity: 2,
+      item_variation_location_id: null, unit_id: 1 };
+    const estimate = {
+      id: estimateId, object: 'estimate', estimate_number: 12,
+      updated_at: '2026-09-09T00:00:00Z', customer_id: customerId,
+      converted_document: { id: invoiceId, kind: 'invoice', number: 34 },
+      lines: [{ ...commonLine, id: lineId, object: 'estimate_line', quantity_shipped: null }],
+    };
+    const invoice = {
+      id: invoiceId, object: 'invoice', invoice_number: 34,
+      updated_at: '2026-09-09T00:00:01Z', customer_id: sourceCustomerId,
+      source_estimate: { id: estimateId, estimate_number: 12 },
+      fulfillment_authority: 'invoice', fulfillment_sales_order_id: null, shipped_percent: 160,
+      lines: [{ ...commonLine, id: orderB, object: 'invoice_line', quantity_shipped: 1 }],
+    };
+    const service = new SalesOrderShippingReconciliationService({
+      documents: {
+        listSalesOrders: jest.fn(async () => page(1, 1, 0, [])),
+        getSalesOrder: jest.fn(),
+        get: jest.fn(async (contextId) => contextId === 5 ? invoice : estimate),
+      },
+      cache: ctx.cache,
+      now: () => 10,
+    });
+
+    const result = await service.sync({ accountIdentity: 'salesbinder:example' });
+
+    expect(ctx.cache.applyOCShippingPatch).toHaveBeenCalledWith(expect.objectContaining({
+      customerId, estimateId, associatedDocumentId: invoiceId, shippedPercent: 50,
+      lines: [{ documentItemId: lineId, itemId, quantity: 2, quantityShipped: 1 }],
+    }), estimate);
+    expect(ctx.clearedWarnings).toEqual([[5, invoiceId]]);
+    expect(result).toMatchObject({ pendingWarnings: 0, failures: [],
+      status: { status: 'success', applied: 1, failed: 0 } });
+    expect(estimate.customer_id).toBe(customerId);
+    expect(invoice.customer_id).toBe(sourceCustomerId);
+  });
+
+  it('keeps a persistent relation conflict pending without aborting the sales-order pass', async () => {
     const ctx = harness({ warnings: [warning(4, estimateId)] });
     const service = new SalesOrderShippingReconciliationService({
       documents: {

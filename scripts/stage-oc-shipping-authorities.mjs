@@ -62,7 +62,6 @@ export function selectInvoiceAuthorities(v2Stage, accountIdentity) {
     const invoice = invoices.get(estimate.associatedDocumentId);
     if (!invoice) { rejected.missingInvoice += 1; continue; }
     if (invoice.associatedDocumentId !== estimate.id) { rejected.nonReciprocal += 1; continue; }
-    if (invoice.customerId !== estimate.customerId) { rejected.customerMismatch += 1; continue; }
     invoiceIds.add(invoice.id);
   }
   return { requestedIds: [...invoiceIds].sort(), rejected };

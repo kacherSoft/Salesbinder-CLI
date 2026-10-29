@@ -119,8 +119,7 @@ function validateSourceForEstimate(
     converted === null ||
     source.kind !== converted.kind ||
     source.id !== converted.id ||
-    source.number !== converted.number ||
-    source.customerId !== estimate.customerId
+    source.number !== converted.number
   ) {
     throw invalid('OC source document does not match its conversion relation');
   }
@@ -151,8 +150,7 @@ function validateAuthority(
   if (source.fulfillmentAuthority === 'sales_order') {
     if (
       authority.kind !== 'sales_order' ||
-      source.fulfillmentSalesOrderId !== authority.id ||
-      authority.customerId !== source.customerId
+      source.fulfillmentSalesOrderId !== authority.id
     ) {
       throw invalid('Invoice fulfillment authority does not match its sales order');
     }
@@ -171,7 +169,8 @@ function validateAuthority(
   } else if (authority !== source) {
     throw invalid('Standalone source must be its own fulfillment authority');
   }
-  if (!uuid(authority.id) || (authority.modified !== undefined && !epochSeconds(authority.modified))) {
+  if (!uuid(authority.id) || !uuid(authority.customerId) ||
+    (authority.modified !== undefined && !epochSeconds(authority.modified))) {
     throw invalid('Invalid authority identity');
   }
   validateLines(authority.lines);

@@ -38,6 +38,19 @@ describe('createOcShippingPatch', () => {
     });
   });
 
+  it.each(['invoice', 'sales_order'] as const)('accepts a related %s with a different customer', (kind) => {
+    const source = (kind === 'invoice' ? invoice : salesOrder)({ customerId: lineId(9), shippedPercent: 160 });
+    const oc = estimate({ convertedDocument: {
+      observed: true, value: { id: source.id, kind, number: source.number },
+    } });
+    expect(createOcShippingPatch(oc, source)).toMatchObject({
+      customerId, associatedDocumentId: source.id, shippedPercent: 50,
+      lines: [{ quantityShipped: 1 }],
+    });
+    expect(oc.customerId).toBe(customerId);
+    expect(source.customerId).toBe(lineId(9));
+  });
+
   it('keeps shipment unknown for omitted fields, duplicate scope, or a changed source quantity', () => {
     const source = invoice({
       lines: [
@@ -64,16 +77,21 @@ describe('createOcShippingPatch', () => {
 
   it('uses a linked sales order as invoice fulfillment authority, never a partial invoice', () => {
     const partialInvoice = invoice({
+      customerId: lineId(8),
       fulfillmentAuthority: 'sales_order',
       fulfillmentSalesOrderId: orderId,
       shippedPercent: 25,
       lines: [line(2, { quantityShipped: 0.5 })],
     });
-    const authority = salesOrder({ lines: [line(3, { quantityShipped: 1.5 })], shippedPercent: 75 });
+    const authority = salesOrder({ customerId: lineId(9), lines: [line(3, { quantityShipped: 1.5 })], shippedPercent: 160 });
 
     const result = createOcShippingPatch(estimate(), partialInvoice, authority);
-    expect(result).toMatchObject({ authorityId: orderId, shippedPercent: 75 });
+    expect(result).toMatchObject({ customerId, authorityId: orderId, shippedPercent: 75 });
     expect(result.lines[0]?.quantityShipped).toBe(1.5);
+    expect(partialInvoice.customerId).toBe(lineId(8));
+    expect(authority.customerId).toBe(lineId(9));
+    expect(() => createOcShippingPatch(estimate(), partialInvoice, { ...authority, customerId: 'invalid' }))
+      .toThrow('Invalid authority identity');
   });
 
   it('weights matched inventory lines and keeps zero or unknown totals unknown', () => {
@@ -94,6 +112,16 @@ describe('createOcShippingPatch', () => {
         .shippedPercent
     ).toBeNull();
     expect(createOcShippingPatch(estimate(), invoice({ lines: [line(2, { quantityShipped: null })] })).shippedPercent).toBeNull();
+    expect(createOcShippingPatch(estimate(), invoice({
+      shippedPercent: 60, lines: [line(2, { quantityShipped: null })],
+    }))).toMatchObject({ shippedPercent: null, lines: [{ quantityShipped: null }] });
+  });
+
+  it('still rejects incorrect document and reverse-relation identities', () => {
+    expect(() => createOcShippingPatch(estimate(), invoice({ number: 201 }))).toThrow('conversion relation');
+    expect(() => createOcShippingPatch(estimate(), invoice({
+      sourceEstimate: { observed: true, value: { id: orderId, estimateNumber: 100 } },
+    }))).toThrow('does not point to the OC');
   });
 
   it('can produce a reportable null-shipping clear only after the converted source is proven', () => {

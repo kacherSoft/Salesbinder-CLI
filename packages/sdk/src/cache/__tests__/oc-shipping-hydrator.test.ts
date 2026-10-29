@@ -103,9 +103,23 @@ describe('OC shipping hydration', () => {
     );
   });
 
-  it('converts a related customer conflict into a reportable shipping warning only', async () => {
+  it.each(['estimate', 'invoice'] as const)('accepts different source customers starting from an %s', async (kind) => {
+    const oc = estimate();
+    const source = invoice({ customer_id: otherCustomerId, shipped_percent: 160 });
+    await expect(hydrateOcShippingPatchSafely(
+      readPort({ estimate: oc, invoice: source }), kind === 'estimate' ? oc : source
+    )).resolves.toMatchObject({
+      issues: [], patch: { customerId, shippedPercent: 50, lines: [{ quantityShipped: 1 }] },
+    });
+    expect(oc.customer_id).toBe(customerId);
+    expect(source.customer_id).toBe(otherCustomerId);
+  });
+
+  it('converts an incorrect reverse relation into a reportable shipping warning', async () => {
     await expect(
-      hydrateOcShippingPatchSafely(readPort({ invoice: invoice({ customer_id: otherCustomerId }) }), estimate())
+      hydrateOcShippingPatchSafely(readPort({ invoice: invoice({
+        source_estimate: { id: otherOrderId, estimate_number: 100 },
+      }) }), estimate())
     ).resolves.toEqual({
       patch: null,
       issues: [{ code: 'shipping_contract_invalid', documentId: estimateId }],
