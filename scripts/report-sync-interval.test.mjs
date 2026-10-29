@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildIntervalReport,
+  deletedLogSince,
+  mergeDeletedLog,
+  summarizeDeletedLog,
   formatCliReport,
   formatMarkdownReport,
   makeCheckpoint,
@@ -362,4 +365,192 @@ test('successful audit save retains prior checkpoint evidence before advancing t
   await assert.rejects(saveCheckpointWithAudit(path, next, report, { previousCheckpoint: prior }), /exist/i);
   assert.deepEqual(await readCheckpoint(path, 300), next);
   await rm(directory, { recursive: true, force: true });
+});
+
+const deletionEvent = (runId, taskId, resource, id, operation, observedAt, stockHistory = 'not_applicable') => ({
+  version: 1, runId, taskId, resource, id, operation, observedAt, stockHistory,
+  uncertainty: stockHistory === 'unknown' ? 'stock_history_missing' : null,
+});
+
+test('deletion events survive resume without duplicate alerts while unknown stock remains visible', () => {
+  const prior = snapshot([], [], 200);
+  prior.deletionEvents = [];
+  const event = deletionEvent('r', 't:1', 'item', ids.itemA, 'absent', 250, 'unknown');
+  const current = { ...snapshot([], [], 300), deletionEvents: [event] };
+  const report = buildIntervalReport(current, makeCheckpoint(prior), { now: 300 });
+  assert.deepEqual(report.deletions.events, [{ resource: 'item', operation: 'absent', observedAt: 250, stockHistory: 'unknown' }]);
+  assert.equal(report.deletions.unknownStockWarnings.length, 1);
+  const markdown = formatMarkdownReport(report);
+  assert.match(markdown, /verified item absence/);
+  assert.match(markdown, /stock history=unknown/);
+  assert.match(markdown, /not the source deletion time/);
+  assert.equal(markdown.includes(ids.itemA), false);
+  assert.equal(JSON.stringify(formatCliReport(report)).includes(ids.itemA), false);
+  const resumed = buildIntervalReport({ ...current, observedAt: 400 }, makeCheckpoint(current), { now: 400 });
+  assert.equal(resumed.deletions.events.length, 0);
+  assert.equal(resumed.deletions.unknownStockWarnings.length, 1);
+});
+
+test('each repeated deletion event is reported independently and retains operation distinction', () => {
+  const first = deletionEvent('r1', 't', 'invoice', ids.invoiceA, 'delete', 250);
+  const second = deletionEvent('r2', 't', 'invoice', ids.invoiceA, 'delete', 350);
+  const prior = { ...snapshot([], [], 300), deletionEvents: [first] };
+  const current = { ...snapshot([], [], 400), deletionEvents: [first, second] };
+  const report = buildIntervalReport(current, makeCheckpoint(prior), { now: 400 });
+  assert.equal(report.deletions.events.length, 1);
+  assert.equal(report.deletions.events[0].observedAt, 350);
+  assert.match(formatMarkdownReport(report), /confirmed delete/);
+});
+
+test('legacy and first baselines disclose incomplete history and retain boundary events', () => {
+  const old = deletionEvent('r1', 't', 'item', ids.itemA, 'delete', 100, 'unknown');
+  const boundary = deletionEvent('r2', 't', 'item', ids.itemB, 'absent', 200, 'unknown');
+  const current = { ...snapshot([], [], 300), deletionEvents: [old, boundary] };
+  const legacy = { version: 1, observedAt: 200, accountBindingHash: 'a'.repeat(64), tasks: [], runs: [] };
+  const report = buildIntervalReport(current, legacy, { now: 300 });
+  assert.equal(report.deletions.history, 'legacy_checkpoint_history_incomplete');
+  assert.equal(report.deletions.events.length, 2);
+  assert.equal(report.deletions.events[1].observedAt, 200);
+  assert.equal(report.deletions.unknownStockWarnings.length, 2);
+  const baseline = buildIntervalReport(current, null, { now: 300 });
+  assert.equal(baseline.deletions.history, 'baseline_history_unavailable');
+  assert.equal(baseline.deletions.events.length, 2);
+  assert.equal(makeCheckpoint(current, legacy).deletionEvents.length, 2);
+});
+
+test('missing or changed immutable event blocks checkpoint advancement and preserves unknown warning', () => {
+  const event = deletionEvent('r', 't', 'item', ids.itemA, 'absent', 250, 'unknown');
+  const checkpoint = makeCheckpoint({ ...snapshot([], [], 300), deletionEvents: [event] });
+  const missing = buildIntervalReport({ ...snapshot([], [], 400), deletionEvents: [] }, checkpoint, { now: 400 });
+  assert.equal(missing.interval.checkpointComplete, false);
+  assert.equal(missing.deletions.history, 'retained_events_missing');
+  assert.equal(missing.deletions.unknownStockWarnings.length, 1);
+  const changed = buildIntervalReport({ ...snapshot([], [], 400), deletionEvents: [{ ...event, observedAt: 260 }] }, checkpoint, { now: 400 });
+  assert.equal(changed.interval.checkpointComplete, false);
+  assert.equal(changed.deletions.history, 'retained_events_changed');
+});
+
+test('database snapshot reads and validates deletion event metadata in the read-only transaction', async () => {
+  const event = deletionEvent('r', 't:1', 'item', ids.itemA, 'absent', 250, 'unknown');
+  const queries = [];
+  const client = { async query(sql, params) {
+    queries.push(sql);
+    if (sql.startsWith('BEGIN') || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+    if (sql.includes('cache_account_binding')) return { rows: [{ account_identity: 'salesbinder:example' }] };
+    if (sql.includes('SELECT key, value FROM cache_meta')) {
+      assert.ok(params.includes('official_v3_sync.deletion_event.v1:'));
+      return { rows: [{ key: 'official_v3_sync.deletion_event.v1:r:t:1', value: JSON.stringify(event) }] };
+    }
+    if (sql.includes('COUNT(*)::bigint')) return { rows: [{ count: '0' }] };
+    throw new Error('Unexpected query');
+  } };
+  const result = await snapshotDatabase(client, 300);
+  assert.deepEqual(result.deletionEvents, [event]);
+  assert.ok(queries[0].includes('READ ONLY'));
+  assert.equal(queries.at(-1), 'COMMIT');
+});
+
+test('document deletions may carry unknown stock history and a missing observation time is rejected', () => {
+  const document = deletionEvent('r', 't', 'invoice', ids.invoiceA, 'delete', 250, 'unknown');
+  const current = { ...snapshot([], [], 300), deletionEvents: [document] };
+  const checkpoint = makeCheckpoint(current);
+  assert.doesNotThrow(() => validateCheckpoint(checkpoint, 300));
+  const report = buildIntervalReport(current, null, { now: 300 });
+  assert.equal(report.deletions.unknownStockWarnings[0].resource, 'invoice');
+  assert.match(formatMarkdownReport(report), /invoice: confirmed delete/);
+  assert.throws(() => validateCheckpoint({ ...checkpoint, deletionEvents: [{ ...document, observedAt: undefined }] }, 300), /invalid/i);
+});
+
+test('since selection filters baseline observations but preserves unknown-stock warnings', () => {
+  const old = deletionEvent('r', 'old', 'item', ids.itemA, 'delete', 100, 'unknown');
+  const recent = deletionEvent('r', 'new', 'item', ids.itemB, 'absent', 250, 'unknown');
+  const current = { ...snapshot([], [], 300), deletionEvents: [old, recent] };
+  const report = buildIntervalReport(current, null, { now: 300, since: 200 });
+  assert.equal(report.deletions.events.length, 1);
+  assert.equal(report.deletions.events[0].observedAt, 250);
+  assert.equal(report.deletions.unknownStockWarnings.length, 2);
+});
+
+const sourceEvent = (id, recordId = 'source-record-secret') => ({
+  id: String(id), contextId: 5, recordId, created: '2026-10-20 12:00:00',
+});
+const sourceScan = (time, status, events = [], since = 1) => ({
+  scanStartedAt: time, since, contexts: [{ contextId: 5, resource: 'invoice', status, events }],
+});
+
+test('source baseline is disclosed, then overlap uses log IDs to avoid repeated notices', () => {
+  const scan = sourceScan(700_000, 'complete', [sourceEvent(1)]);
+  const current = { ...snapshot([], [], 700_000), deletedLog: scan };
+  const first = buildIntervalReport(current, null, { now: 700_000 });
+  const source = first.deletedLog.contexts.find((context) => context.resource === 'invoice');
+  assert.equal(source.baseline, true);
+  assert.equal(source.events.length, 1);
+  assert.match(formatMarkdownReport(first), /baseline records=1/);
+  assert.equal(formatMarkdownReport(first).includes('source-record-secret'), false);
+  assert.equal(JSON.stringify(formatCliReport(first)).includes('source-record-secret'), false);
+  const checkpoint = makeCheckpoint(current);
+  const nextScan = sourceScan(700_300, 'complete', [sourceEvent(1), sourceEvent(2)]);
+  const next = buildIntervalReport({ ...snapshot([], [], 700_300), deletedLog: nextScan }, checkpoint, { now: 700_300 });
+  const nextSource = next.deletedLog.contexts.find((context) => context.resource === 'invoice');
+  assert.equal(nextSource.baseline, false);
+  assert.equal(nextSource.events.length, 1);
+  assert.equal(deletedLogSince(checkpoint, 700_300), 1); // Other contexts have not completed their first scan.
+  const persisted = makeCheckpoint({ ...snapshot([], [], 700_300), deletedLog: nextScan }, checkpoint);
+  assert.equal(persisted.deletedLog.contexts[0].events.length, 2);
+  assert.equal(summarizeDeletedLog(nextScan, persisted.deletedLog).contexts[0].events.length, 0);
+});
+
+test('source context failure retains watermark and source evidence while another succeeds', () => {
+  const prior = mergeDeletedLog(sourceScan(700_000, 'complete', [sourceEvent(1)]));
+  const scan = { scanStartedAt: 700_300, since: 1, contexts: [
+    { contextId: 5, resource: 'invoice', status: 'unavailable', events: [] },
+    { contextId: 4, resource: 'estimate', status: 'complete', events: [] },
+  ] };
+  const next = mergeDeletedLog(scan, prior);
+  assert.equal(next.contexts.find((context) => context.resource === 'invoice').watermark, 700_000);
+  assert.equal(next.contexts.find((context) => context.resource === 'invoice').events.length, 1);
+  assert.equal(next.contexts.find((context) => context.resource === 'estimate').watermark, 700_300);
+  const summary = summarizeDeletedLog(scan, prior);
+  assert.equal(summary.contexts.find((context) => context.resource === 'invoice').status, 'unavailable');
+  assert.equal(summary.contexts.find((context) => context.resource === 'estimate').coverage, 'bounded_scan_complete');
+});
+
+test('inconsistent source event keeps prior evidence and never advances the context', () => {
+  const prior = mergeDeletedLog(sourceScan(700_000, 'complete', [sourceEvent(1)]));
+  const scan = sourceScan(700_300, 'complete', [sourceEvent(1, 'different-record')]);
+  assert.deepEqual(mergeDeletedLog(scan, prior), prior);
+  assert.equal(summarizeDeletedLog(scan, prior).contexts[0].status, 'incomplete');
+});
+
+test('failed initial source scan retains its original window through outages longer than a week', () => {
+  const legacy = { version: 1, observedAt: 1_000_000, accountBindingHash: 'a'.repeat(64), tasks: [] };
+  const firstSince = deletedLogSince(legacy, 1_000_100);
+  assert.equal(firstSince, 395_200);
+  const firstScan = sourceScan(1_000_100, 'unavailable', [], firstSince);
+  let checkpoint = makeCheckpoint({ ...snapshot([], [], 1_000_100), deletedLog: firstScan }, legacy);
+  assert.equal(validateCheckpoint(checkpoint, 1_000_100), checkpoint);
+  assert.equal(checkpoint.deletedLog.pending.find((context) => context.resource === 'invoice').since, firstSince);
+  for (const now of [1_700_000, 2_500_000]) {
+    const since = deletedLogSince(checkpoint, now);
+    assert.equal(since, firstSince);
+    checkpoint = makeCheckpoint({ ...snapshot([], [], now), deletedLog: sourceScan(now, 'unavailable', [], since) }, checkpoint);
+  }
+  const recoveryAt = 3_000_000;
+  const recovery = sourceScan(recoveryAt, 'complete', [sourceEvent(100)], deletedLogSince(checkpoint, recoveryAt));
+  const report = buildIntervalReport({ ...snapshot([], [], recoveryAt), deletedLog: recovery }, checkpoint, { now: recoveryAt });
+  const invoice = report.deletedLog.contexts.find((context) => context.resource === 'invoice');
+  assert.equal(invoice.baseline, true);
+  assert.equal(invoice.events.length, 1);
+  checkpoint = makeCheckpoint({ ...snapshot([], [], recoveryAt), deletedLog: recovery }, checkpoint);
+  assert.equal(checkpoint.deletedLog.contexts.find((context) => context.resource === 'invoice').watermark, recoveryAt);
+  assert.equal(checkpoint.deletedLog.pending.some((context) => context.resource === 'invoice'), false);
+  assert.equal(deletedLogSince(checkpoint, recoveryAt + 10), firstSince); // Other failed contexts retain the same original bound.
+});
+
+test('a source scan that skips a retained initial boundary cannot advance it', () => {
+  const first = sourceScan(1_000_000, 'unavailable', [], 395_000);
+  const prior = mergeDeletedLog(first);
+  const skipped = sourceScan(2_000_000, 'complete', [sourceEvent(1)], 1_000_000);
+  assert.deepEqual(mergeDeletedLog(skipped, prior), prior);
+  assert.equal(summarizeDeletedLog(skipped, prior).contexts[0].status, 'incomplete');
 });

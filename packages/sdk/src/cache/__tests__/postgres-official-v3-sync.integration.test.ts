@@ -100,6 +100,79 @@ describeIfPostgres('PostgresCacheService official V3 sync integration', () => {
     });
   });
 
+  it('resumes a missing-history invoice deletion and advances the applied cursor', async () => {
+    const ctx = await createContext('delete-missing-history-resume');
+    const store = ctx.service.getOfficialV3SyncStore();
+    const run = officialRun();
+    await store.beginRun(run);
+    await store.sealPage(
+      run.runId, run.entry, page(run.runId, 1, 'cursor-delete-resumed', false),
+      [{ resource: 'invoice', id: docId, operation: 'delete' }]
+    );
+    const task = (await store.listTasks(run.runId))[0]!;
+    await store.saveTaskFailure(run.runId, { ...task, attempts: 1 }, 'stock_history_missing');
+    await store.advanceAppliedPrefix(run.runId);
+    await expect(ctx.service.getOfficialV3SyncState()).resolves.not.toHaveProperty('appliedCursor');
+
+    const result = await serviceHarness(ctx, {}).service.sync({
+      accountIdentity: binding.accountIdentity, resume: true,
+    });
+
+    expect(result.run.status).toBe('success');
+    await expect(store.listTasks(run.runId)).resolves.toEqual([
+      expect.objectContaining({ taskId: task.taskId, status: 'done', attempts: 2 }),
+    ]);
+    await expect(ctx.service.getOfficialV3SyncState()).resolves.toMatchObject({
+      appliedCursor: 'cursor-delete-resumed', coverage: 'partial_catch_up',
+    });
+    const event = await readMeta(ctx.pool, deletionEventKey(task));
+    expect(event).not.toBeNull();
+    expect(JSON.parse(event!)).toMatchObject({
+      version: 1, runId: run.runId, taskId: task.taskId, resource: 'invoice', id: docId,
+      operation: 'delete', observedAt: expect.any(Number), stockHistory: 'unknown',
+      uncertainty: 'stock_history_missing',
+    });
+    await expect(readMeta(ctx.pool, officialLatestReceiptKey('invoice', docId))).resolves.not.toBeNull();
+  });
+
+  it('rolls back deletion completion and receipt when event insertion fails', async () => {
+    const ctx = await createContext('delete-event-rollback');
+    const store = ctx.service.getOfficialV3SyncStore();
+    const run = officialRun();
+    await store.beginRun(run);
+    await store.sealPage(
+      run.runId, run.entry, page(run.runId, 1, 'cursor-delete-rollback', false),
+      [{ resource: 'invoice', id: docId, operation: 'delete' }]
+    );
+    const task = (await store.listTasks(run.runId))[0]!;
+    await store.saveTaskFailure(run.runId, { ...task, attempts: 1 }, 'stock_history_missing');
+    await installDeletionEventFailure(ctx.pool, task);
+
+    await expect(store.applyDocumentDelete(run.runId, { ...task, attempts: 2 })).rejects.toThrow(
+      'fail_deletion_event'
+    );
+    await expect(store.listTasks(run.runId)).resolves.toEqual([
+      expect.objectContaining({ taskId: task.taskId, status: 'failed', attempts: 1,
+        errorCode: 'stock_history_missing' }),
+    ]);
+    await expect(readMeta(ctx.pool, deletionEventKey(task))).resolves.toBeNull();
+    await expect(readMeta(ctx.pool, officialLatestReceiptKey('invoice', docId))).resolves.toBeNull();
+    await store.advanceAppliedPrefix(run.runId);
+    await expect(ctx.service.getOfficialV3SyncState()).resolves.not.toHaveProperty('appliedCursor');
+
+    await ctx.pool.query('DROP TRIGGER fail_deletion_event ON cache_meta');
+    await ctx.pool.query('DROP FUNCTION fail_deletion_event_fn()');
+    await store.applyDocumentDelete(run.runId, { ...task, attempts: 2 });
+    await store.advanceAppliedPrefix(run.runId);
+    const event = await readMeta(ctx.pool, deletionEventKey(task));
+    expect(event).not.toBeNull();
+    await store.applyDocumentDelete(run.runId, { ...task, attempts: 3 });
+    await expect(readMeta(ctx.pool, deletionEventKey(task))).resolves.toBe(event);
+    await expect(ctx.service.getOfficialV3SyncState()).resolves.toMatchObject({
+      appliedCursor: 'cursor-delete-rollback',
+    });
+  });
+
   it('rolls back item writes when task receipt commit fails', async () => {
     const ctx = await createContext('receipt-rollback');
     const store = ctx.service.getOfficialV3SyncStore();
@@ -1171,6 +1244,29 @@ async function readMeta(pool: InstanceType<typeof Pool>, key: string): Promise<s
     [key]
   );
   return result.rows[0]?.value ?? null;
+}
+
+function deletionEventKey(task: OfficialV3SyncTask): string {
+  return `official_v3_sync.deletion_event.v1:${task.runId}:${task.taskId}`;
+}
+
+async function installDeletionEventFailure(
+  pool: InstanceType<typeof Pool>, task: OfficialV3SyncTask
+): Promise<void> {
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION fail_deletion_event_fn()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.key = ${quoteLiteral(deletionEventKey(task))} THEN
+        RAISE EXCEPTION 'fail_deletion_event';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER fail_deletion_event
+    BEFORE INSERT ON cache_meta
+    FOR EACH ROW EXECUTE FUNCTION fail_deletion_event_fn();
+  `);
 }
 
 async function putOfficialTask(

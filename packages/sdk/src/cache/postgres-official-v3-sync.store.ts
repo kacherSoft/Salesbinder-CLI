@@ -201,6 +201,7 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
   async applyItemDelete(runId: string, task: OfficialV3SyncTask): Promise<void> {
     await this.options.withVerifiedWrite(async (client) => {
       const persisted = await this.requireTask(client, runId, task);
+      if (persisted.status === 'done' || persisted.status === 'superseded') return;
       if (await this.completeIfStale(client, runId, persisted)) return;
       await this.options.deleteApiInventory(client, persisted.id);
       await this.complete(client, runId, persisted, 'done', task.attempts);
@@ -299,14 +300,13 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
   ): Promise<void> {
     await this.options.withVerifiedWrite(async (client) => {
       const persisted = await this.requireTask(client, runId, task);
+      if (persisted.status === 'done' || persisted.status === 'superseded' || persisted.status === 'waiting_children') return;
       if (await this.completeIfStale(client, runId, persisted)) return;
       const resolvedDocId = await this.options.resolveDocumentIdByApiId(client, persisted.id);
       const before = await this.readDocumentStockSignature(client, persisted.id);
       const stockItemIds = stockReconciliationItemIds(before.signature, null);
-      if (!before.signature && !resolvedDocId && persisted.resource !== 'estimate') {
-        await this.saveTaskFailureInTransaction(client, runId, persisted, 'stock_history_missing');
-        return;
-      }
+      const stockHistory = persisted.resource === 'estimate' ? 'not_applicable'
+        : before.signature ? 'known' : 'unknown';
       await clearOCShippingDeletedSource(client, persisted.id);
       if (persisted.resource === 'invoice') await deleteOCShippingWarning(client, 5, persisted.id);
       if (persisted.resource === 'estimate') await deleteOCShippingWarning(client, 4, persisted.id);
@@ -323,7 +323,7 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
           attempts: Math.max(persisted.attempts, task.attempts),
         });
       } else {
-        await this.complete(client, runId, persisted, 'done', task.attempts);
+        await this.complete(client, runId, persisted, 'done', task.attempts, undefined, stockHistory);
       }
     });
   }
@@ -507,19 +507,6 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     return true;
   }
 
-  private async saveTaskFailureInTransaction(
-    client: PoolClient,
-    runId: string,
-    task: OfficialV3SyncTask,
-    code: string
-  ): Promise<void> {
-    await putJson(client, officialTaskKey(runId, task.taskId), {
-      ...task,
-      status: 'failed',
-      errorCode: code,
-    });
-  }
-
   private async hasNewerReceipt(client: PoolClient, task: OfficialV3SyncTask): Promise<boolean> {
     const latest = await readJson(client, officialLatestReceiptKey(task.resource, task.id));
     if (!latest) return false;
@@ -645,7 +632,8 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
         children.length > 0 &&
         children.every((child) => child.status === 'done' || child.status === 'superseded')
       ) {
-        await this.complete(client, runId, parent, 'done', parent.attempts);
+        await this.complete(client, runId, parent, 'done', parent.attempts, undefined,
+          parent.operation === 'delete' ? 'known' : undefined);
       }
     }
   }
@@ -656,13 +644,25 @@ export class PostgresOfficialV3SyncStore implements OfficialV3SyncStore {
     task: OfficialV3SyncTask,
     status: 'done' | 'superseded',
     attempts = task.attempts,
-    receiptOperation?: 'absent'
+    receiptOperation?: 'absent',
+    stockHistory?: 'known' | 'unknown' | 'not_applicable'
   ): Promise<void> {
     const done = { ...task, status, attempts: Math.max(task.attempts, attempts) };
     delete done.errorCode;
     await putJson(client, officialTaskKey(runId, task.taskId), done);
     if (status === 'done') {
       await putLatestReceipt(client, runId, task, receiptOperation);
+      if (task.operation === 'delete' || receiptOperation === 'absent') {
+        const history = stockHistory ?? 'not_applicable';
+        await client.query(
+          'INSERT INTO cache_meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',
+          [`official_v3_sync.deletion_event.v1:${runId}:${task.taskId}`, JSON.stringify({
+            version: 1, runId, taskId: task.taskId, resource: task.resource, id: task.id,
+            operation: receiptOperation ?? 'delete', observedAt: nowSeconds(), stockHistory: history,
+            uncertainty: history === 'unknown' ? 'stock_history_missing' : null,
+          })]
+        );
+      }
     }
   }
 

@@ -33,6 +33,9 @@ describe('PostgresOfficialV3SyncStore', () => {
       operation: 'absent',
       sourceOperation: 'upsert',
     });
+    expect(h.event(upsert)).toMatchObject({ version: 1, runId: run.runId, taskId: upsert.taskId,
+      resource: 'item', id: itemId, operation: 'absent', observedAt: expect.any(Number),
+      stockHistory: 'not_applicable', uncertainty: null });
   });
 
   it.each([
@@ -81,6 +84,7 @@ describe('PostgresOfficialV3SyncStore', () => {
 
     expect(h.deletedItems).toEqual([]);
     expect(h.task(stale)).toMatchObject({ operation: 'upsert', status: 'superseded' });
+    expect(h.event(stale)).toBeNull();
   });
 
   it.each(['done', 'superseded'] as const)(
@@ -213,30 +217,97 @@ describe('PostgresOfficialV3SyncStore', () => {
     );
   });
 
-  it('records stock history missing when a document delete has no durable target proof', async () => {
+  it.each(['invoice', 'purchase_order'] as const)('resumes a failed %s deletion and preserves missing stock history', async (resource) => {
     const h = harness();
     const run = officialRun();
-    const deleteTask = task(run.runId, 'delete-doc', 1, 'delete', 'invoice', apiDocId);
-    h.apiDocuments.set(apiDocId, localDocId);
-    h.documentRefs.set(localDocId, [oldItemId]);
+    const deleteTask = task(run.runId, 'delete-doc', 1, 'delete', resource, apiDocId);
     h.seedRun(run);
-    h.seedTask(deleteTask);
-
-    await h.store.applyDocumentDelete(run.runId, deleteTask);
-
-    expect(h.deletedDocuments).toEqual([localDocId]);
-    expect(h.task(deleteTask)).toMatchObject({ status: 'done' });
+    h.seedTask(deleteTask, 'failed');
+    if (resource === 'invoice') h.apiDocuments.set(apiDocId, localDocId);
+    await h.store.applyDocumentDelete(run.runId, { ...deleteTask, attempts: 2 });
+    expect(h.task(deleteTask)).toMatchObject({ status: 'done', attempts: 2 });
+    expect(h.task(deleteTask).errorCode).toBeUndefined();
     expect(await h.store.listTasks(run.runId)).toHaveLength(1);
-    expect(h.client.query).not.toHaveBeenCalledWith(
-      'SELECT item_id FROM item_documents WHERE doc_id = $1',
-      expect.anything()
-    );
+    expect(h.event(deleteTask)).toMatchObject({ resource, id: apiDocId, operation: 'delete',
+      stockHistory: 'unknown', uncertainty: 'stock_history_missing' });
+    expect(h.deletedDocuments).toEqual(resource === 'invoice' ? [localDocId] : []);
+    const first = h.meta.get(eventKey(deleteTask));
+    await h.store.applyDocumentDelete(run.runId, { ...deleteTask, attempts: 3 });
+    expect(h.meta.get(eventKey(deleteTask))).toBe(first);
+  });
 
-    const missing = task(run.runId, 'missing-doc', 2, 'delete', 'invoice', localDocId);
-    h.seedTask(missing);
-    await h.store.applyDocumentDelete(run.runId, missing);
-    expect(h.deletedDocuments).toEqual([localDocId]);
-    expect(h.task(missing)).toMatchObject({ status: 'failed', errorCode: 'stock_history_missing' });
+  it('advances the applied cursor after an unknown-history deletion resumes', async () => {
+    const h = harness();
+    const run = officialRun();
+    const deletion = task(run.runId, 'stuck-delete', 1, 'delete', 'invoice', apiDocId);
+    h.seedRun(run);
+    h.seedTask(deletion, 'failed');
+    h.meta.set(`official_v3_sync.page.v1:${run.runId}:0000000001`, JSON.stringify({
+      runId: run.runId, page: 1, firstGeneration: 1, lastGeneration: 1,
+      request: run.entry, nextCursor: 'cursor-1', hasMore: false, markerCount: 1,
+      status: 'blocked', responseHash: `sha256:${'0'.repeat(64)}`,
+    }));
+    await h.store.applyDocumentDelete(run.runId, { ...deletion, attempts: 2 });
+    await expect(h.store.advanceAppliedPrefix(run.runId)).resolves.toMatchObject({
+      appliedCursor: 'cursor-1', appliedGeneration: 1, coverage: 'partial_catch_up',
+    });
+    expect(h.event(deletion)).toMatchObject({ stockHistory: 'unknown', uncertainty: 'stock_history_missing' });
+  });
+
+  it.each([['invoice', 5], ['purchase_order', 11]] as const)(
+    'waits for exact stock reconciliation before recording a known-history %s deletion', async (resource, contextId) => {
+      const h = harness();
+      const run = officialRun();
+      const deletion = task(run.runId, 'known-doc', 1, 'delete', resource, apiDocId);
+      h.seedRun(run);
+      h.seedTask(deletion);
+      h.meta.set(`official_v3_sync.document_stock.v1:${apiDocId}`, JSON.stringify({
+        version: 1, contextId, cancelled: false, stockState: 'active', dateSent: null,
+        lines: [{ itemId: oldItemId, quantity: 1, quantityReceived: null, quantityShipped: null,
+          itemLocation: null, locationId: null, variationLocationId: null }],
+      }));
+      await h.store.applyDocumentDelete(run.runId, deletion, 130);
+      expect(h.task(deletion).status).toBe('waiting_children');
+      expect(h.event(deletion)).toBeNull();
+      const child = (await h.store.listTasks(run.runId)).find((entry) => entry.parentTaskId === deletion.taskId)!;
+      expect(child).toMatchObject({ id: oldItemId, status: 'pending', notBefore: 130 });
+      await h.store.applyDocumentDelete(run.runId, deletion, 130);
+      expect((await h.store.listTasks(run.runId)).filter((entry) => entry.parentTaskId === deletion.taskId)).toHaveLength(1);
+      h.seedTask(child, 'done');
+      await h.store.completeTaskGroup(run.runId, deletion);
+      expect(h.task(deletion).status).toBe('done');
+      expect(h.event(deletion)).toMatchObject({ resource, stockHistory: 'known', uncertainty: null });
+    }
+  );
+
+  it.each(['item', 'estimate'] as const)('records an idempotent %s delete marker', async (resource) => {
+    const h = harness();
+    const run = officialRun();
+    const deletion = task(run.runId, 'simple-delete', 1, 'delete', resource, itemId);
+    h.seedRun(run);
+    h.seedTask(deletion);
+    const apply = () => resource === 'item' ? h.store.applyItemDelete(run.runId, deletion)
+      : h.store.applyDocumentDelete(run.runId, deletion);
+    await apply();
+    const event = h.meta.get(eventKey(deletion));
+    await apply();
+    expect(h.meta.get(eventKey(deletion))).toBe(event);
+    expect(h.event(deletion)).toMatchObject({ resource, operation: 'delete', stockHistory: 'not_applicable', uncertainty: null });
+    if (resource === 'item') expect(h.deletedItems).toEqual([itemId]);
+  });
+
+  it('rolls back deletion and completion when audit insertion fails', async () => {
+    const h = harness();
+    const run = officialRun();
+    const deletion = task(run.runId, 'rollback-delete', 1, 'delete');
+    h.seedRun(run);
+    h.seedTask(deletion);
+    h.failEventWrite = true;
+    await expect(h.store.applyItemDelete(run.runId, deletion)).rejects.toThrow('event write failed');
+    expect(h.deletedItems).toEqual([]);
+    expect(h.task(deletion).status).toBe('pending');
+    expect(h.event(deletion)).toBeNull();
+    expect(h.meta.has(officialLatestReceiptKey('item', itemId))).toBe(false);
   });
 
   it('retires unfinished legacy item refresh children without inventory writes or latest item receipts', async () => {
@@ -294,6 +365,7 @@ function harness() {
   const inventoryWrites: string[] = [];
   const documentWrites: { docId: string; itemIds: string[] }[] = [];
   let failInventoryWrite = false;
+  let failEventWrite = false;
   const client = {
     query: jest.fn(async (sql: string, params: unknown[] = []) => {
       if (sql === 'ROLLBACK') meta.clear();
@@ -309,6 +381,8 @@ function harness() {
         };
       }
       if (sql.startsWith('INSERT INTO cache_meta')) {
+        if (String(params[0]).startsWith('official_v3_sync.deletion_event.v1:') && failEventWrite) throw new Error('event write failed');
+        if (sql.includes('DO NOTHING') && meta.has(String(params[0]))) return { rows: [] };
         meta.set(String(params[0]), String(params[1]));
         return { rows: [] };
       }
@@ -323,11 +397,15 @@ function harness() {
     withReadOnlyTransaction: (run) => run(client as never),
     withVerifiedWrite: async (run) => {
       beforeMeta = new Map(meta);
+      const beforeDeletedItems = deletedItems.length;
+      const beforeDeletedDocuments = deletedDocuments.length;
       try {
         return await run(client as never);
       } catch (error) {
         meta.clear();
         for (const entry of beforeMeta) meta.set(...entry);
+        deletedItems.length = beforeDeletedItems;
+        deletedDocuments.length = beforeDeletedDocuments;
         throw error;
       }
     },
@@ -360,6 +438,11 @@ function harness() {
     documentWrites,
     get failInventoryWrite() { return failInventoryWrite; },
     set failInventoryWrite(value: boolean) { failInventoryWrite = value; },
+    set failEventWrite(value: boolean) { failEventWrite = value; },
+    event: (value: OfficialV3SyncTask) => {
+      const record = meta.get(eventKey(value));
+      return record ? JSON.parse(record) : null;
+    },
     seedRun: (run: OfficialV3SyncRun) => {
       meta.set('official_v3_sync.current_run.v1', JSON.stringify(run));
       meta.set(`official_v3_sync.run.v1:${run.runId}`, JSON.stringify(run));
@@ -380,6 +463,10 @@ function harness() {
     task: (value: OfficialV3SyncTask) =>
       JSON.parse(meta.get(officialTaskKey(value.runId, value.taskId))!) as OfficialV3SyncTask,
   };
+}
+
+function eventKey(value: OfficialV3SyncTask): string {
+  return `official_v3_sync.deletion_event.v1:${value.runId}:${value.taskId}`;
 }
 
 function officialRun(): OfficialV3SyncRun {
