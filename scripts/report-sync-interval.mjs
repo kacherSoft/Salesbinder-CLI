@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chmod, link, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { collectDeletedLog, DELETED_LOG_CONTEXTS } from './read-deleted-log.mjs';
 
 const { Pool } = pg;
 const CURRENT_STATE_KEY = 'official_v3_sync.state.v1';
@@ -11,6 +12,7 @@ const CURRENT_RUN_KEY = 'official_v3_sync.current_run.v1';
 const RUN_PREFIX = 'official_v3_sync.run.v1:';
 const TASK_PREFIX = 'official_v3_sync.task.v1:';
 const RECEIPT_PREFIX = 'official_v3_sync.latest_receipt.v1:';
+const DELETION_EVENT_PREFIX = 'official_v3_sync.deletion_event.v1:';
 const REFRESH_KEY = 'reference_refresh.v1';
 const DIRECTORY_KEY = 'salesperson_directory.v1';
 const LEGACY_STATE_KEY = 'state';
@@ -40,6 +42,19 @@ export function taskCheckpointKey(task) {
   return `${task.runId}:${task.taskId}`;
 }
 
+function deletionEventKey(event) {
+  return JSON.stringify([event.runId, event.taskId]);
+}
+
+function validateDeletionEvent(event) {
+  return isRecord(event) && event.version === 1 && typeof event.runId === 'string' && !!event.runId &&
+    typeof event.taskId === 'string' && !!event.taskId && RESOURCES.includes(event.resource) &&
+    typeof event.id === 'string' && !!event.id && ['delete', 'absent'].includes(event.operation) &&
+    (event.operation !== 'absent' || event.resource === 'item') && safeInteger(event.observedAt) &&
+    ['known', 'unknown', 'not_applicable'].includes(event.stockHistory) &&
+    (event.uncertainty === null || event.uncertainty === 'stock_history_missing');
+}
+
 export function validateCheckpoint(value, now = Math.floor(Date.now() / 1000)) {
   if (!isRecord(value) || value.version !== 1 || !safeInteger(value.observedAt) ||
     value.observedAt > now || !/^[0-9a-f]{64}$/.test(String(value.accountBindingHash)) ||
@@ -64,6 +79,17 @@ export function validateCheckpoint(value, now = Math.floor(Date.now() / 1000)) {
     }
     seenRuns.add(run.runId);
   }
+  if (value.deletionEvents !== undefined) {
+    if (!Array.isArray(value.deletionEvents)) throw new Error('Sync interval checkpoint is invalid.');
+    const seenEvents = new Set();
+    for (const event of value.deletionEvents) {
+      if (!validateDeletionEvent(event) || seenEvents.has(deletionEventKey(event))) {
+        throw new Error('Sync interval checkpoint deletion events are invalid.');
+      }
+      seenEvents.add(deletionEventKey(event));
+    }
+  }
+  if (value.deletedLog !== undefined) validateDeletedLogCheckpoint(value.deletedLog);
   return value;
 }
 
@@ -365,6 +391,32 @@ export function buildIntervalReport(snapshot, checkpoint = null, options = {}) {
   const missingCheckpointRuns = (checkpoint?.runs ?? []).filter(
     (run) => !currentRunKeys.has(run.runId)
   ).length;
+  const events = snapshot.deletionEvents ?? [];
+  const priorEvents = checkpoint?.deletionEvents;
+  const priorEventKeys = new Set((priorEvents ?? []).map(deletionEventKey));
+  const currentEventKeys = new Set(events.map(deletionEventKey));
+  const missingEvents = (priorEvents ?? []).filter((event) => !currentEventKeys.has(deletionEventKey(event))).length;
+  const priorEventMap = new Map((priorEvents ?? []).map((event) => [deletionEventKey(event), event]));
+  const changedEvents = events.filter((event) => priorEventMap.has(deletionEventKey(event)) &&
+    JSON.stringify(event) !== JSON.stringify(priorEventMap.get(deletionEventKey(event)))).length;
+  const newEvents = events.filter((event) => !checkpoint
+    ? options.since === undefined || event.observedAt >= options.since
+    : priorEvents === undefined || !priorEventKeys.has(deletionEventKey(event)));
+  const warningEvents = new Map((priorEvents ?? []).map((event) => [deletionEventKey(event), event]));
+  for (const event of events) if (!warningEvents.has(deletionEventKey(event))) {
+    warningEvents.set(deletionEventKey(event), event);
+  }
+  const sanitizeEvent = (event) => ({ resource: event.resource, operation: event.operation,
+    observedAt: event.observedAt, stockHistory: event.stockHistory });
+  const deletions = {
+    history: !checkpoint ? 'baseline_history_unavailable' : priorEvents === undefined
+      ? 'legacy_checkpoint_history_incomplete' : changedEvents ? 'retained_events_changed'
+      : missingEvents ? 'retained_events_missing' : 'tracked',
+    missingCheckpointEvents: missingEvents,
+    changedCheckpointEvents: changedEvents,
+    events: newEvents.map(sanitizeEvent),
+    unknownStockWarnings: [...warningEvents.values()].filter((event) => event.stockHistory === 'unknown').map(sanitizeEvent),
+  };
   const changed = [];
   let mode = 'baseline';
   let exact = Boolean(checkpoint) && missingCheckpointTasks === 0 && missingCheckpointRuns === 0;
@@ -410,7 +462,7 @@ export function buildIntervalReport(snapshot, checkpoint = null, options = {}) {
       exact,
       since: checkpoint ? checkpoint.observedAt : (options.since ?? null),
       historicalCountsAvailable: exact,
-      checkpointComplete: !checkpoint || (missingCheckpointTasks === 0 && missingCheckpointRuns === 0),
+      checkpointComplete: !checkpoint || (missingCheckpointTasks === 0 && missingCheckpointRuns === 0 && missingEvents === 0 && changedEvents === 0),
       missingCheckpointTasks,
       missingCheckpointRuns,
       runsChanged: changed.map(({ resources, ...run }) => ({
@@ -428,6 +480,8 @@ export function buildIntervalReport(snapshot, checkpoint = null, options = {}) {
         ...(mode === 'logical-run-cohort' ? ['cohort counts are current metadata estimates, not event-time counts'] : []),
       ],
     },
+    deletions,
+    deletedLog: summarizeDeletedLog(snapshot.deletedLog, checkpoint?.deletedLog),
     latestHealth: {
       official: sanitizeOfficialAuthority(snapshot.officialAuthority),
       officialRun: runFields(snapshot.currentRun),
@@ -474,13 +528,129 @@ export function makeCheckpoint(snapshot, previousCheckpoint = null) {
   });
   const runMap = new Map((previousCheckpoint?.runs ?? []).map((run) => [run.runId, run]));
   for (const run of snapshot.runs ?? []) runMap.set(run.runId, runState(run));
+  const eventMap = new Map((previousCheckpoint?.deletionEvents ?? []).map((event) => [deletionEventKey(event), event]));
+  for (const event of snapshot.deletionEvents ?? []) eventMap.set(deletionEventKey(event), event);
   return {
     version: 1,
     observedAt: snapshot.observedAt,
     accountBindingHash: snapshot.accountBindingHash,
     tasks: [...taskMap.values()],
     runs: [...runMap.values()],
+    deletionEvents: [...eventMap.values()],
+    deletedLog: mergeDeletedLog(snapshot.deletedLog, previousCheckpoint?.deletedLog),
   };
+}
+
+const DELETED_LOG_OVERLAP = 7 * 24 * 60 * 60;
+
+function validateDeletedLogCheckpoint(value) {
+  if (!isRecord(value) || !Array.isArray(value.contexts)) throw new Error('Deleted-log checkpoint is invalid.');
+  const seen = new Set();
+  for (const context of value.contexts) {
+    const mapping = DELETED_LOG_CONTEXTS.find((entry) => entry.contextId === context?.contextId);
+    if (!mapping || mapping.resource !== context.resource || seen.has(context.contextId) ||
+      !safeInteger(context.watermark) || !Array.isArray(context.events)) {
+      throw new Error('Deleted-log checkpoint is invalid.');
+    }
+    const ids = new Set();
+    for (const event of context.events) {
+      if (!isRecord(event) || typeof event.id !== 'string' || !/^[1-9]\d*$/.test(event.id) ||
+        event.contextId !== context.contextId || typeof event.recordId !== 'string' || !event.recordId ||
+        typeof event.created !== 'string' || !event.created || ids.has(event.id)) {
+        throw new Error('Deleted-log checkpoint is invalid.');
+      }
+      ids.add(event.id);
+    }
+    seen.add(context.contextId);
+  }
+  if (value.pending !== undefined) {
+    if (!Array.isArray(value.pending)) throw new Error('Deleted-log checkpoint is invalid.');
+    for (const context of value.pending) {
+      const mapping = DELETED_LOG_CONTEXTS.find((entry) => entry.contextId === context?.contextId);
+      if (!mapping || mapping.resource !== context.resource || seen.has(context.contextId) || !safeInteger(context.since)) {
+        throw new Error('Deleted-log checkpoint is invalid.');
+      }
+      seen.add(context.contextId);
+    }
+  }
+}
+
+export function deletedLogSince(checkpoint, now) {
+  const contexts = checkpoint?.deletedLog?.contexts ?? [];
+  const pending = checkpoint?.deletedLog?.pending ?? [];
+  const starts = contexts.map((context) => Math.max(0, context.watermark - DELETED_LOG_OVERLAP));
+  starts.push(...pending.map((context) => context.since));
+  const known = new Set([...contexts, ...pending].map((context) => context.contextId));
+  if (known.size < DELETED_LOG_CONTEXTS.length) {
+    starts.push(Math.max(0, (checkpoint?.observedAt ?? now) - DELETED_LOG_OVERLAP));
+  }
+  return Math.min(...starts, now);
+}
+
+function validCollectedContext(context, prior) {
+  if (context?.status !== 'complete' || !Array.isArray(context.events)) return false;
+  const priorById = new Map((prior?.events ?? []).map((event) => [event.id, event]));
+  const seen = new Set();
+  for (const event of context.events) {
+    if (!isRecord(event) || typeof event.id !== 'string' || !/^[1-9]\d*$/.test(event.id) ||
+      event.contextId !== context.contextId || typeof event.recordId !== 'string' || !event.recordId ||
+      typeof event.created !== 'string' || !event.created || seen.has(event.id)) return false;
+    const old = priorById.get(event.id);
+    if (old && (old.recordId !== event.recordId || old.created !== event.created)) return false;
+    seen.add(event.id);
+  }
+  return true;
+}
+
+export function mergeDeletedLog(scan, previous = { contexts: [] }) {
+  const byContext = new Map((previous?.contexts ?? []).map((context) => [context.contextId, context]));
+  const pending = new Map((previous?.pending ?? []).map((context) => [context.contextId, context]));
+  if (scan && safeInteger(scan.scanStartedAt) && safeInteger(scan.since) && scan.since <= scan.scanStartedAt) {
+    for (const mapping of DELETED_LOG_CONTEXTS) {
+      const result = scan.contexts?.find((context) => context.contextId === mapping.contextId && context.resource === mapping.resource);
+      const prior = byContext.get(mapping.contextId);
+      if (!prior && !pending.has(mapping.contextId)) pending.set(mapping.contextId, { ...mapping, since: scan.since });
+      const requiredSince = prior ? Math.max(0, prior.watermark - DELETED_LOG_OVERLAP) : pending.get(mapping.contextId)?.since;
+      if (!validCollectedContext(result, prior) || (prior && scan.scanStartedAt < prior.watermark) ||
+          (requiredSince !== undefined && scan.since > requiredSince)) continue;
+      const events = new Map((prior?.events ?? []).map((event) => [event.id, event]));
+      for (const event of result.events) events.set(event.id, event);
+      byContext.set(mapping.contextId, { ...mapping, watermark: scan.scanStartedAt, events: [...events.values()] });
+      pending.delete(mapping.contextId);
+    }
+  }
+  return { contexts: [...byContext.values()], pending: [...pending.values()] };
+}
+
+export function summarizeDeletedLog(scan, previous = { contexts: [] }) {
+  const previousByContext = new Map((previous?.contexts ?? []).map((context) => [context.contextId, context]));
+  const pendingByContext = new Map((previous?.pending ?? []).map((context) => [context.contextId, context]));
+  return { since: safeInteger(scan?.since) ? scan.since : null, contexts: DELETED_LOG_CONTEXTS.map((mapping) => {
+    const prior = previousByContext.get(mapping.contextId);
+    const result = scan?.contexts?.find((context) => context.contextId === mapping.contextId && context.resource === mapping.resource);
+    const requiredSince = prior ? Math.max(0, prior.watermark - DELETED_LOG_OVERLAP) : pendingByContext.get(mapping.contextId)?.since;
+    const complete = validCollectedContext(result, prior) && safeInteger(scan?.scanStartedAt) &&
+      safeInteger(scan?.since) && scan.since <= scan.scanStartedAt &&
+      (!prior || scan.scanStartedAt >= prior.watermark) && (requiredSince === undefined || scan.since <= requiredSince);
+    const ids = new Set((prior?.events ?? []).map((event) => event.id));
+    const events = complete ? result.events.filter((event) => !ids.has(event.id)).map((event) => ({ created: event.created })) : [];
+    return { ...mapping, status: complete ? 'complete' : result?.status === 'unavailable' || !result ? 'unavailable' : 'incomplete',
+      coverage: complete ? 'bounded_scan_complete' : 'not_established', baseline: !prior, events };
+  }) };
+}
+
+async function readDeletedLog(accountBindingHash, checkpoint) {
+  const now = Math.floor(Date.now() / 1000);
+  const since = deletedLogSince(checkpoint, now);
+  try {
+    const { SalesBinderClient, loadConfig, createSalesBinderAccountBinding } = await import('../packages/sdk/dist/index.js');
+    const account = loadConfig('phuthaitech');
+    if (hashBinding(createSalesBinderAccountBinding(account.subdomain).accountIdentity) !== accountBindingHash) throw new Error();
+    const client = new SalesBinderClient('phuthaitech', { signal: AbortSignal.timeout(20_000) });
+    return await collectDeletedLog(client, { since, now });
+  } catch {
+    return { since, scanStartedAt: now, contexts: DELETED_LOG_CONTEXTS.map((context) => ({ ...context, status: 'unavailable', events: [] })) };
+  }
 }
 
 function compactResource(value, transitionDone = false) {
@@ -520,6 +690,8 @@ export function formatCliReport(report) {
         [resource, compactResource(report.interval.totals[resource], report.interval.exact)])),
       unavailable: report.interval.unavailable,
     },
+    deletions: report.deletions,
+    deletedLog: report.deletedLog,
     latestHealth: {
       official: report.latestHealth.official,
       status: report.latestHealth.officialRun?.status ?? null,
@@ -568,6 +740,26 @@ export function formatMarkdownReport(report) {
     const counts = compact.interval.resources[resource];
     lines.push(`| ${resource} | ${counts.doneTasks ?? 0} | ${counts.doneUniqueIds ?? 0} | ${counts.failedTasks ?? 0} | ${counts.pendingTasks ?? 0} |`);
   }
+  lines.push('', '## Deletion observations', '', `Event history: ${compact.deletions.history}; missing retained events=${compact.deletions.missingCheckpointEvents}; changed retained events=${compact.deletions.changedCheckpointEvents}.`);
+  const confirmed = compact.deletions.events.filter((event) => event.operation === 'delete').length;
+  const absent = compact.deletions.events.filter((event) => event.operation === 'absent').length;
+  lines.push(`Displayed observations: confirmed deletes=${confirmed}; verified item absences=${absent}.`);
+  if (compact.deletions.history === 'legacy_checkpoint_history_incomplete' || compact.deletions.history === 'baseline_history_unavailable') {
+    lines.push('These observations are a baseline and may predate this reporting interval.');
+  }
+  if (compact.deletions.events.length === 0) lines.push('No deletion observations in this selection.');
+  for (const event of compact.deletions.events) {
+    const kind = event.operation === 'delete' ? 'confirmed delete' : 'verified item absence';
+    lines.push(`- ${event.resource}: ${kind}; observed ${formatTimestamp(event.observedAt)}; stock history=${event.stockHistory}.`);
+  }
+  lines.push(`Persistent unknown-stock warnings: ${compact.deletions.unknownStockWarnings.length}.`);
+  lines.push('Observation time is not the source deletion time; source IDs are omitted from this report.');
+  lines.push('', '## Source deleted-log history', '', `Bounded scan starts at ${formatTimestamp(compact.deletedLog.since)}; entries delayed beyond the seven-day overlap may be missed.`);
+  for (const context of compact.deletedLog.contexts) {
+    lines.push(`- ${context.resource}: ${context.status}; coverage=${context.coverage}; ${context.baseline ? 'baseline records' : 'new records'}=${context.events.length}.`);
+    for (const event of context.events) lines.push(`  - Source deletion log created: ${event.created} (source timezone as supplied).`);
+  }
+  lines.push('Source deleted-log entries are independent of cache observations; attribution and identity are not shown.');
   lines.push('', '## Current official run task state / Trạng thái run chính thức hiện tại', '');
   if (!compact.latestHealth.taskCounts) {
     lines.push('No current official run metadata.');
@@ -662,14 +854,15 @@ export async function snapshotDatabase(client, observedAt = Math.floor(Date.now(
     const rows = (await tx.query(
       `SELECT key, value FROM cache_meta
        WHERE key = ANY($1) OR starts_with(key, $2) OR starts_with(key, $3) OR starts_with(key, $4)
-         OR starts_with(key, $5)
+         OR starts_with(key, $5) OR starts_with(key, $6)
        ORDER BY key`,
       [[CURRENT_STATE_KEY, CURRENT_RUN_KEY, REFRESH_KEY, DIRECTORY_KEY, LEGACY_STATE_KEY,
         LEGACY_SYNC_STATUS_KEY, PAYMENT_SYNC_STATUS_KEY, OC_SHIPPING_STATUS_KEY],
-      RUN_PREFIX, TASK_PREFIX, RECEIPT_PREFIX, OC_SHIPPING_WARNING_PREFIX]
+      RUN_PREFIX, TASK_PREFIX, RECEIPT_PREFIX, OC_SHIPPING_WARNING_PREFIX, DELETION_EVENT_PREFIX]
     )).rows;
     const runs = new Map();
     const tasks = [];
+    const deletionEvents = [];
     const receiptCounts = Object.fromEntries(RESOURCES.map((resource) => [resource, 0]));
     let state = null;
     let currentRun = null;
@@ -715,6 +908,13 @@ export async function snapshotDatabase(client, observedAt = Math.floor(Date.now(
         }
         tasks.push(value);
       }
+      else if (key.startsWith(DELETION_EVENT_PREFIX)) {
+        const suffix = key.slice(DELETION_EVENT_PREFIX.length);
+        if (!validateDeletionEvent(value) || suffix !== `${value.runId}:${value.taskId}`) {
+          throw new Error('Official V3 deletion event metadata is invalid.');
+        }
+        deletionEvents.push(value);
+      }
       else if (key.startsWith(RECEIPT_PREFIX)) {
         const resource = key.slice(RECEIPT_PREFIX.length).split(':', 1)[0];
         if (Object.prototype.hasOwnProperty.call(receiptCounts, resource)) receiptCounts[resource] += 1;
@@ -735,6 +935,7 @@ export async function snapshotDatabase(client, observedAt = Math.floor(Date.now(
       currentRun,
       runs: [...runs.values()],
       tasks,
+      deletionEvents,
       receiptCounts,
       officialAuthority,
       ocShipping,
@@ -787,6 +988,7 @@ async function main() {
   const client = await pool.connect();
   try {
     const snapshot = await snapshotDatabase(client);
+    snapshot.deletedLog = await readDeletedLog(snapshot.accountBindingHash, checkpoint);
     const report = buildIntervalReport(snapshot, checkpoint, { since });
     const output = format === 'markdown'
       ? formatMarkdownReport(report)

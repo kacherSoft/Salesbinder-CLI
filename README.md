@@ -778,9 +778,9 @@ Verified official absence runs through the normal fenced PostgreSQL writer. It
 removes only API-owned item and stock rows, preserves CSV-owned rows, completes
 the original task without rewriting its source operation, and records the
 latest receipt as `operation: absent` with the original `sourceOperation`.
-This proves current source absence, not when, why, or by whom a historical
-deletion occurred. Resume uses the existing task and cursor chain; it never
-resets the cursor. This source-tree contract still requires the deployment
+This proves current source absence, not a confirmed source delete or when, why,
+or by whom a historical deletion occurred. Resume uses the existing task and
+cursor chain; it never resets the cursor. This source-tree contract still requires the deployment
 gates in [Deployment](docs/deployment.md) before it can be treated as live.
 
 Document markers hydrate their own document bundles first. The first
@@ -801,12 +801,13 @@ refresh referenced items. Stock-reconciliation children carry a durable
 waits for that delay only when no other runnable task remains. A parent
 document task waits for these children, and the applied cursor advances only
 after the parent and its stock reconciliation children are done or superseded.
-An invoice or purchase-order delete with no sidecar and no cached document
-history is retained as a `stock_history_missing` failed task for operator review
-instead of fabricating item IDs or deleting unknown inventory; the run remains
-partial catch-up coverage until that task is resolved. Stock-reconciliation
-children are not satisfied by earlier item upsert receipts; only a later
-item delete or verified-absence receipt can supersede them.
+Official confirmed deletion events are recorded durably. When an invoice or
+purchase-order delete has no sidecar or cached document history, the unknown
+stock impact remains a persistent `stock_history_missing` warning for review;
+the cursor can continue without inventing item IDs or deleting unknown
+inventory. Known affected items still undergo stock reconciliation.
+Stock-reconciliation children are not satisfied by earlier item upsert receipts;
+only a later item delete or verified-absence receipt can supersede them.
 
 When old durable state contains document-derived `item_refresh` children,
 resume supersedes unfinished children without an inventory write or new
@@ -960,6 +961,14 @@ Use a numeric interval (`60`–`604800`, `daily`, or `weekly`) to retain the
 previous `sync-references --if-stale <seconds>` freshness-throttled behavior,
 or `0`/`disabled` to turn reference refresh off. Numeric cadence uses durable
 last-attempt time while per-resource last-success times report freshness.
+
+Scheduled Codex reports count observed official deletions and report uncertainty,
+including persistent unknown-stock warnings, at their scheduled times; they do
+not promise an immediate push notification. The separate V2 deleted-log collector
+is read-only and distinguishes incomplete coverage from collection failure. It
+does not assume an actor, and categories are outside its verified log coverage.
+These reporting and deletion changes in the source tree require the release
+gates in [Deployment](docs/deployment.md) before they are treated as deployed.
 
 Scheduled V3 covers only items, invoices, estimates, and purchase orders. The
 reference job has separate authority/freshness, and payment-history completeness
